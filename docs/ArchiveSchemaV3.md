@@ -105,12 +105,70 @@ with read timestamp `h`: it yields each slot once, at its version `≤ h`.
 The cross-request state cache (`ARCHIVE_STATE_CACHE_MB`) works on v3 as on
 v2. A read only proves its span up to the read height, so a second miss on
 a key probes with a `Get` at the cache view's head: if the newest version
-there is the one just read, the value holds up to the head; otherwise that
-newer version bounds the key's next version from above, and a key whose
-bound is fewer than 64 blocks away is not probed again. A `Get` costs about
+there is the one just read (or, for a key never written, there is none),
+the value holds up to the head; otherwise that newer version bounds the
+key's next version from above, and a key whose bound is fewer than 64
+blocks away is not probed again. A probe that cannot extend the span is
+skipped: a read at the head already reaches it, and a key whose cache entry
+already knows a version above the one read (from an earlier probe or read)
+would only find that version again, since the archive only appends. A
+backfill reads a changing key at ever higher blocks, each time a version
+older than the head's, so only its first miss probes. A `Get` costs about
 what a cache lookup and insert do, so the cache saves little CPU on v3, but
 it halves the RocksDB reads per request (measured below). In production
 the version without it ran out of disk IOPS, see "Production, one pod".
+
+## Block infos by number (optional, any schema)
+
+Requests name historical blocks by hash, and `BlockHashToBlockInfo` (CF `2`)
+is keyed by hash, so a replay over consecutive blocks reads one CF `2` data
+block per block; on bsc that was a third to a half of the disk reads. An
+archive can instead keep its block infos in `BlockNumToBlockInfo` (CF `7`):
+block number (8 bytes BE) -> block hash ‖ the CF `2` value, in 16KB ZSTD
+blocks, so consecutive blocks share data blocks. It has one of the two CFs.
+
+A hash is resolved through an in-memory index of the canonical blocks, split
+into 256 shards by the hash's first byte. Within a shard the next bits of the
+hash pick a bucket of about 8 blocks on average, and the 8 bits after them are kept as a
+fingerprint next to the block number: 5 bytes per block and 4 per bucket
+(~0.7GB for bsc, ~2.7GB for arb; block numbers must fit in a `u32`). The
+record carries its hash, so a shared fingerprint only costs another candidate
+(~3% of lookups). Blocks committed later are indexed before their write, and
+merged into the shards, one shard at a time, every 2^20 blocks.
+
+The index is saved to `LEAFAGE_BLOCK_INDEX` in the database directory after
+each merge, in the background: a temporary file renamed over the old one,
+covered by a CRC32. An open loads it, checks that CF `3` still has its last
+block, and indexes the blocks of CF `3` after it. A missing, damaged or stale
+file (after a rewind, or with more than 16 blocks per bucket on average) is
+rebuilt from CF `3` by 8 threads and saved. A block written at or below the
+last one merged (after a head-only rewind, which keeps the higher blocks in
+CF `3`) deletes the file before its write. Merges keep the buckets of the
+open, at least 2^16 per shard, so a process that syncs past 2^28 blocks
+without restarting gets more candidates per lookup until its next open. Loading reads 5 bytes per block
+instead of scanning CF `3`'s ~48: about 6s against 70s for bsc at 125MB/s.
+
+With `ARCHIVE_BLOCK_INDEX=1`, a new database is created with CF `7`, and
+opening a database with CF `2` moves it before the open returns:
+
+1. Build the index from CF `3` and save it (a file left by a failed move is
+   not reused: the archive does not keep it up to date while on CF `2`).
+2. Scan CF `2`, keep the canonical blocks (archives only hold finalized
+   blocks; reorgs are resolved in the in-memory diff layers), sort them by
+   number in 1GB chunks written as SST files under `.block_index_tmp`.
+3. Fail unless every block of CF `3` was copied; ingest the files into CF `7`
+   and merge them with one compaction.
+4. Drop CF `2`.
+
+A move that is interrupted leaves both CFs; the next open drops the partial CF
+`7`, and moves again if the variable is set. Once moved, the variable is no
+longer needed. Nothing restores CF `2`, and a release without CF `7` support
+cannot open the database (RocksDB requires every CF to be opened).
+
+Cost on bsc: CF `7` ~78GB against CF `2` ~90GB. The move reads CF `2` (~90GB),
+writes and merges ~85GB of chunks, so it needs ~165GB free at its peak and
+takes about an hour at 125MB/s. `leafage_storage_read_block_by_number_latency`
+counts CF `7` reads.
 
 ## Writes
 
@@ -131,6 +189,9 @@ marker.
 - v2 and v3 sort versions identically, so each worker streams a key range
   straight into SST files: the key without its tail, `u64::MAX - tail` as the
   timestamp, storage values without leading zeros. Other CFs are copied.
+  With `ARCHIVE_BLOCK_INDEX=1`, block infos instead move from CF `2` to CF `7`
+  as at open (steps 1-3 above, run by one worker alongside the others) and the
+  index is saved; the result has no CF `2`.
 - Files roll only between keys, so no two files share a key; all of them
   ingest into the bottom level.
 - Files are written with the destination CFs' own options (filters,
@@ -276,3 +337,51 @@ and second). But it read the disk more per request than v2 (up to 1.55
 against 1.0 reads), and on a read-heavy stretch it hit the volume's 8000
 IOPS for 10 minutes: mean latency rose to 50–100 ms while v2 stayed near
 2 ms. That brought the state cache back on v3.
+
+### State cache probes that cannot pay
+
+On that traffic the head probe was mostly wasted: the backfills read keys
+far below the head, where a changing key's newest version is above the one
+read, so the probe finds it and cannot extend the span. With quick_cache
+(#280) that was 4.9 probes per request, 90 % of them finding a newer
+version. Skipping a probe when the cache entry already knows a version
+above the one read (or the read is at the head) leaves 0.6, with the same
+hit rate.
+
+Same capture and setup as above (8 cores, 9300 rps, 30 GiB, warm page
+cache), on a fresh v3 volume from the 10-29 snapshot, mean of passes 2–3:
+
+| | no state cache | #280 | probe skipping |
+|---|---|---|---|
+| CPU ms / request | 0.443 | 0.447 | 0.400 (−10 %) |
+| RocksDB `Get`s / request, probes included | 15.0 | 12.2 | 7.6 |
+| Storage hits | – | 60.6 % | 63.1 % |
+| p99 ms | 4.3–5.5 | 3.3–5.3 | 2.9–3.3 |
+
+The cache does not lower disk reads in a short run, though. With 12 GiB
+and the host page cache dropped before each run, all three read the disk
+about 2.7–2.8 times per request and stall at the volume's 8000 IOPS
+(~2950 rps, p50 ~42 ms); the cache's hits are hot keys whose blocks the
+8 GiB block cache holds anyway. Whether it saves disk reads in steady
+state, where the keys read again outnumber what the block cache holds, is
+left to a production canary.
+
+v2 reads the disk more than v3 for the same requests. Same setup (12 GiB,
+host page cache dropped before each run, 2 passes × 3 segments), the v2
+bench volume raised to the same 8000 IOPS / 1000 MB/s:
+
+| | v2, cache on | v2, cache off | v3, cache on | v3, cache off |
+|---|---|---|---|---|
+| Disk reads / request | 4.83 | 4.94 | 2.79 | 2.71 |
+| Throughput at the 8000 IOPS limit, rps | 1670 | 1630 | 2910 | 3000 |
+| p50 / p99 ms | 63 / 1670 | 63 / 1740 | 43 / 910 | 42 / 890 |
+| CPU ms / request | 0.85 | 0.98 | 0.57 | 0.60 |
+| RSS | 9.1 GiB | 8.9 GiB | 8.0 GiB | 7.8 GiB |
+
+Both use the same table format (4 KiB blocks, partitioned index and
+filters). A v2 seek positions every level that holds the key, down to the
+deepest, to merge them; a v3 `Get` stops at the first level holding a
+version at or below the read height, and its data is 14 % smaller. The v3
+canary pod reading more per request than v2 pods (above) is therefore not
+explained by the schema; likely causes, not yet checked: its volume was new
+from a snapshot, its page cache cold, and compaction reads count too.

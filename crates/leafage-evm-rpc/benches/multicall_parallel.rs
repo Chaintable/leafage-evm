@@ -3,11 +3,11 @@
 //! knob, so one run hosts both variants and compares directly:
 //!
 //! - `cold_miss`: rotating disjoint contract sets behind a 1MB block
-//!   cache with moka off — every read is a block-cache miss, calls are
+//!   cache with the CacheDiskLayer caches off — every read is a block-cache miss, calls are
 //!   read-bound.
-//! - `cpu_warm`: 20 calls into a ~8k-iteration loop contract with moka
+//! - `cpu_warm`: 20 calls into a ~8k-iteration loop contract with the CacheDiskLayer caches
 //!   on — calls are compute-bound, the shape parallelism is for.
-//! - `tiny_warm`: 20 `SLOAD(0); RETURN` calls with moka on — the worst
+//! - `tiny_warm`: 20 `SLOAD(0); RETURN` calls with the CacheDiskLayer caches on — the worst
 //!   case for parallelism, where per-call work is ~µs and scoped-thread
 //!   spawn overhead has nothing to hide behind.
 //!

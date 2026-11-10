@@ -49,7 +49,11 @@ impl DataBaseRef {
                 RewindTable::BlockNumbers => StorageTypeColumn::BlockNumToBlockHash,
                 RewindTable::Headers => StorageTypeColumn::BlockHashToBlockInfo,
             };
-            let cf = self.db.cf_handle(name.to_str()).unwrap();
+            // `BlockHashToBlockInfo` is dropped once `BlockNumToBlockInfo`
+            // replaced it.
+            let Some(cf) = self.db.cf_handle(name.to_str()) else {
+                continue;
+            };
             let mut read_options = ReadOptions::default();
             read_options.set_total_order_seek(true);
             read_options.set_verify_checksums(true);
@@ -75,6 +79,19 @@ impl DataBaseRef {
             }
             self.db.write_opt(batch, &options)?;
             info!(target: "rewind", ?table, deleted, "archive table truncated");
+        }
+
+        if let Some(cf) = self
+            .db
+            .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
+        {
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(
+                cf,
+                &block_index::key(target.header.number + 1)[..],
+                &[0xff; 9][..],
+            );
+            self.db.write_opt(batch, &options)?;
         }
 
         // Keep all content-addressed code. Only reachable account code hashes

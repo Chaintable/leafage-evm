@@ -31,7 +31,10 @@ FROM chef AS builder
 
 # lld 加速链接；force-frame-pointers 供 pprof 栈展开使用。
 # debuginfo 走 Cargo.toml 的 profile.release.debug=true，最终由下方 `strip --strip-debug` 去除。
+# CXXFLAGS：RocksDB 为每个 SST 缓存预处理好的 ZSTD 字典（ROCKSDB_ZSTD_DDICT），同 .cargo/config.toml。
+# cook 阶段还没有 .cargo/，所以这里也要设。
 ENV RUSTFLAGS="-C force-frame-pointers=yes -C link-arg=-fuse-ld=lld --cfg tokio_unstable" \
+    CXXFLAGS="-DZSTD_STATIC_LINKING_ONLY" \
     CARGO_INCREMENTAL=0 \
     CARGO_TERM_COLOR=never
 

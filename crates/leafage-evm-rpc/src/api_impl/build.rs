@@ -1,4 +1,5 @@
 use super::api_impl::NoneEvmCustomConfig;
+use super::arc::archive_replay::ArcPipeline;
 use super::bsc::trace::BscPipeline;
 use super::mainnet::trace::EthPipeline;
 use super::tempo::api::TempoEvmCustomConfig;
@@ -20,6 +21,7 @@ use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
     RpcModule,
 };
+use leafage_evm_chains::arc::ARC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
@@ -285,18 +287,16 @@ where
             }};
         }
 
-        // trace_debankBlock replays on the archive with the BSC or Ethereum
-        // mainnet fork schedule.
+        // trace_debankBlock uses the selected chain's mainnet replay.
         let mut trace_block_client = self.trace_block_client.take();
         let traced_chain = match &self.cfg {
+            MultiChainCfgEnv::Arc((env, _)) => env.chain_id == ARC_MAINNET_CHAIN_ID,
             MultiChainCfgEnv::Bsc(env) => env.chain_id == BSC_MAINNET_CHAIN_ID,
             MultiChainCfgEnv::Mainnet(env) => env.chain_id == ETH_MAINNET_CHAIN_ID,
             _ => false,
         };
         if trace_block_client.is_some() && !(is_archive && traced_chain) {
-            warn!(
-                "trace_debankBlock needs a BSC or Ethereum mainnet archive database, not serving it"
-            );
+            warn!("trace_debankBlock needs a supported mainnet archive database, not serving it");
             trace_block_client = None;
         }
 
@@ -313,7 +313,15 @@ where
                 })
             }
             MultiChainCfgEnv::Arc((env, custom_evm_cfg)) => {
-                run_chain_setup!(env, Some(custom_evm_cfg))
+                run_chain_setup!(env, Some(custom_evm_cfg), |api| {
+                    merge_trace(
+                        &mut rpc_module,
+                        api,
+                        ArcPipeline,
+                        trace_block_client.take(),
+                        self.trace_block_check_state,
+                    )?;
+                })
             }
             MultiChainCfgEnv::Arbitrum((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, custom_evm_cfg)

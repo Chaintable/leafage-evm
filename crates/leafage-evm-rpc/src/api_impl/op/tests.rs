@@ -339,3 +339,356 @@ fn p256_precompile_follows_op_fork_in_normal_and_trace_execution() {
         assert_eq!(results[1].gas_used() - results[0].gas_used(), 3450);
     }
 }
+
+/// On OP Mainnet a call runs the fork of its block through both execution paths:
+/// PUSH0 halts on the last pre-Canyon block and runs from the Canyon block on.
+#[test]
+fn op_mainnet_calls_run_the_block_fork() {
+    let mut cfg = cfg("{}");
+    cfg.chain_id = 10;
+    let api: ApiImpl<(), OpSpecId, NoneEvmCustomConfig> = ApiImpl::new(
+        (),
+        cfg,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+        String::new(),
+        0,
+        None,
+        None,
+        None,
+    );
+    let target = Address::repeat_byte(0x22);
+    let mut db = CacheDB::new(EmptyDB::default());
+    // PUSH0, PUSH0, MSTORE, PUSH1 32, PUSH0, RETURN
+    db.insert_account_info(
+        target,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            vec![0x5f, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3].into(),
+        )),
+    );
+    let at = |number: u64, timestamp: u64| BlockEnv {
+        number: U256::from(number),
+        timestamp: U256::from(timestamp),
+        ..Default::default()
+    };
+    for inspect in [false, true] {
+        for (block, canyon) in [
+            (at(114_696_811, 1_704_992_399), false),
+            (at(114_696_812, 1_704_992_401), true),
+        ] {
+            let req = CallRequest {
+                inner: TransactionRequest::default()
+                    .to(target)
+                    .from(Address::repeat_byte(0x11))
+                    .gas_limit(100_000),
+                ..Default::default()
+            };
+            let tx = api
+                .create_txn_env(&BlockInfo::default(), &block, req, &db, 10)
+                .unwrap();
+            let result = if inspect {
+                api.inspect_tx_commit(
+                    &block,
+                    &mut db,
+                    TracingInspectorConfig::default_parity(),
+                    |_| (),
+                    tx,
+                )
+                .unwrap()
+                .0
+            } else {
+                api.transact(&block, &db, tx).unwrap()
+            };
+            if canyon {
+                assert!(result.is_success(), "{result:?}");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        ExecutionResult::Halt {
+                            reason: OpHaltReason::Base(HaltReason::NotActivated),
+                            ..
+                        }
+                    ),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+}
+
+mod pre_bedrock {
+    //! OP Mainnet pre-Bedrock calls follow l2geth (OVM 2.0). Expected values were
+    //! measured against the legacy l2geth archive (op-pre-l2geth) on 2026-11-05.
+    use super::*;
+    use leafage_evm_chains::op::legacy::{
+        not_whitelisted_output, OVM_DEPLOYER_WHITELIST, OVM_FEE_WALLET,
+    };
+
+    const ISTANBUL_BLOCK: u64 = 1_000_000;
+    const BERLIN_BLOCK: u64 = 3_950_000;
+    const CALLER: Address = Address::repeat_byte(0x11);
+    const TARGET: Address = Address::repeat_byte(0x22);
+    // MSTORE(0, top); RETURN(0, 32)
+    const RET: [u8; 8] = [0x60, 0, 0x52, 0x60, 0x20, 0x60, 0, 0xf3];
+
+    fn api() -> ApiImpl<(), OpSpecId, NoneEvmCustomConfig> {
+        let mut cfg = cfg("{}");
+        cfg.chain_id = 10;
+        ApiImpl::new(
+            (),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            0,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A pre-Bedrock header as leafage stores it: difficulty 2, zero miner.
+    fn block(number: u64) -> BlockEnv {
+        BlockEnv {
+            number: U256::from(number),
+            timestamp: U256::from(1_639_128_595u64),
+            difficulty: U256::from(2),
+            gas_limit: 15_000_000,
+            ..Default::default()
+        }
+    }
+
+    fn with_code(code: &[u8]) -> CacheDB<EmptyDB> {
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            TARGET,
+            AccountInfo::default().with_code(Bytecode::new_raw(Bytes::copy_from_slice(code))),
+        );
+        db
+    }
+
+    fn whitelist_owned(db: &mut CacheDB<EmptyDB>) {
+        db.insert_account_info(OVM_DEPLOYER_WHITELIST, AccountInfo::default());
+        db.insert_account_storage(OVM_DEPLOYER_WHITELIST, U256::ZERO, U256::from(0xabc))
+            .unwrap();
+    }
+
+    fn whitelist(db: &mut CacheDB<EmptyDB>, deployer: Address) {
+        let mut preimage = [0u8; 64];
+        preimage[12..32].copy_from_slice(deployer.as_slice());
+        preimage[63] = 1;
+        let key: U256 = revm::primitives::keccak256(preimage).into();
+        db.insert_account_storage(OVM_DEPLOYER_WHITELIST, key, U256::ONE)
+            .unwrap();
+    }
+
+    fn run(
+        db: &mut CacheDB<EmptyDB>,
+        number: u64,
+        to: Option<Address>,
+        data: Vec<u8>,
+        inspect: bool,
+    ) -> ExecutionResult<OpHaltReason> {
+        let api = api();
+        let block = block(number);
+        let mut req = TransactionRequest::default()
+            .from(CALLER)
+            .gas_limit(1_000_000)
+            .input(TransactionInput::new(Bytes::from(data)));
+        if let Some(to) = to {
+            req = req.to(to);
+        }
+        let req = CallRequest {
+            inner: req,
+            ..Default::default()
+        };
+        let tx = api
+            .create_txn_env(&BlockInfo::default(), &block, req, &*db, 10)
+            .unwrap();
+        if inspect {
+            api.inspect_tx_commit(
+                &block,
+                db,
+                TracingInspectorConfig::default_parity(),
+                |_| (),
+                tx,
+            )
+            .unwrap()
+            .0
+        } else {
+            api.transact(&block, &*db, tx).unwrap()
+        }
+    }
+
+    fn word(result: &ExecutionResult<OpHaltReason>) -> U256 {
+        assert!(result.is_success(), "{result:?}");
+        U256::from_be_slice(result.output().unwrap())
+    }
+
+    fn probe(code: &[u8], number: u64, inspect: bool) -> ExecutionResult<OpHaltReason> {
+        let mut code = code.to_vec();
+        code.extend(RET);
+        run(&mut with_code(&code), number, Some(TARGET), vec![], inspect)
+    }
+
+    #[test]
+    fn block_context_is_the_ovm_one() {
+        for inspect in [false, true] {
+            for number in [ISTANBUL_BLOCK, BERLIN_BLOCK] {
+                // COINBASE is the OVM fee wallet, DIFFICULTY is zero.
+                assert_eq!(
+                    word(&probe(&[0x41], number, inspect)),
+                    U256::from_be_slice(OVM_FEE_WALLET.as_slice())
+                );
+                assert_eq!(word(&probe(&[0x44], number, inspect)), U256::ZERO);
+                // No London: BASEFEE is invalid.
+                assert!(
+                    matches!(
+                        probe(&[0x48], number, inspect),
+                        ExecutionResult::Halt {
+                            reason: OpHaltReason::Base(HaltReason::NotActivated),
+                            ..
+                        }
+                    ),
+                    "BASEFEE at {number}"
+                );
+            }
+        }
+        // Bedrock and later keep the OP path: COINBASE is the block's beneficiary.
+        assert_eq!(word(&probe(&[0x41], 105_235_063, false)), U256::ZERO);
+    }
+
+    #[test]
+    fn istanbul_blocks_pay_cold_costs_on_every_access() {
+        // GAS; PUSH1 0; SLOAD; POP; PUSH1 0; SLOAD; POP; GAS; SWAP1; SUB
+        let sload_twice = [
+            0x5a, 0x60, 0, 0x54, 0x50, 0x60, 0, 0x54, 0x50, 0x5a, 0x90, 0x03,
+        ];
+        // GAS; ADDRESS; BALANCE; POP; GAS; SWAP1; SUB
+        let balance_self = [0x5a, 0x30, 0x31, 0x50, 0x5a, 0x90, 0x03];
+        for inspect in [false, true] {
+            assert_eq!(
+                word(&probe(&sload_twice, ISTANBUL_BLOCK, inspect)),
+                U256::from(4212)
+            );
+            assert_eq!(
+                word(&probe(&sload_twice, BERLIN_BLOCK, inspect)),
+                U256::from(2212)
+            );
+            assert_eq!(
+                word(&probe(&balance_self, ISTANBUL_BLOCK, inspect)),
+                U256::from(2606)
+            );
+            assert_eq!(
+                word(&probe(&balance_self, BERLIN_BLOCK, inspect)),
+                U256::from(106)
+            );
+        }
+    }
+
+    #[test]
+    fn refunds_follow_l2geth() {
+        // Clear three set slots: PUSH1 0; PUSH1 i; SSTORE (x3); STOP.
+        let mut code = Vec::new();
+        for slot in 0..3u8 {
+            code.extend([0x60, 0, 0x60, slot, 0x55]);
+        }
+        code.push(0x00);
+        for (number, gas_used) in [
+            // EIP-2200 clears refund 15000 each, capped at half of 36018.
+            (ISTANBUL_BLOCK, 18_009),
+            // l2geth Berlin: EIP-3529 clears refund 4800 each, Berlin half cap.
+            (BERLIN_BLOCK, 21_618),
+        ] {
+            for inspect in [false, true] {
+                let mut db = with_code(&code);
+                for slot in 0..3u64 {
+                    db.insert_account_storage(TARGET, U256::from(slot), U256::ONE)
+                        .unwrap();
+                }
+                let result = run(&mut db, number, Some(TARGET), vec![], inspect);
+                assert!(result.is_success(), "{result:?}");
+                assert_eq!(result.tx_gas_used(), gas_used, "block {number}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_london_code_rules() {
+        // Deploy runtime code 0xEF (EIP-3541 is London).
+        let init = vec![0x60, 0xef, 0x60, 0, 0x53, 0x60, 1, 0x60, 0, 0xf3];
+        let result = run(
+            &mut CacheDB::new(EmptyDB::default()),
+            BERLIN_BLOCK,
+            None,
+            init,
+            false,
+        );
+        assert!(result.is_success(), "{result:?}");
+        assert_eq!(result.output().unwrap().as_ref(), &[0xef]);
+    }
+
+    #[test]
+    fn top_level_deployments_follow_the_whitelist() {
+        let init = vec![0x60, 1, 0x60, 0, 0x53, 0x60, 1, 0x60, 0, 0xf3];
+        for inspect in [false, true] {
+            let mut db = CacheDB::new(EmptyDB::default());
+            whitelist_owned(&mut db);
+            let rejected = run(&mut db, ISTANBUL_BLOCK, None, init.clone(), inspect);
+            match &rejected {
+                ExecutionResult::Revert { output, .. } => {
+                    assert_eq!(output, &not_whitelisted_output(CALLER))
+                }
+                other => panic!("expected a revert, got {other:?}"),
+            }
+            // Only the intrinsic gas is spent: 53000 + 8 non-zero * 16 + 2 zero * 4.
+            assert_eq!(rejected.tx_gas_used(), 53_136);
+
+            whitelist(&mut db, CALLER);
+            let allowed = run(&mut db, ISTANBUL_BLOCK, None, init.clone(), inspect);
+            assert!(allowed.is_success(), "{allowed:?}");
+        }
+        // Berlin blocks no longer check it.
+        let mut db = CacheDB::new(EmptyDB::default());
+        whitelist_owned(&mut db);
+        assert!(run(&mut db, BERLIN_BLOCK, None, init, false).is_success());
+    }
+
+    #[test]
+    fn create_opcode_follows_the_whitelist() {
+        // CREATE(0, 0, 0); MSTORE(0, address); MSTORE(32, RETURNDATASIZE); RETURN(0, 64)
+        let code = [
+            0x60, 0, 0x60, 0, 0x60, 0, 0xf0, 0x60, 0, 0x52, 0x3d, 0x60, 0x20, 0x52, 0x60, 0x40,
+            0x60, 0, 0xf3,
+        ];
+        for inspect in [false, true] {
+            let mut db = with_code(&code);
+            whitelist_owned(&mut db);
+            let rejected = run(&mut db, ISTANBUL_BLOCK, Some(TARGET), vec![], inspect);
+            assert!(rejected.is_success(), "{rejected:?}");
+            let out = rejected.output().unwrap();
+            assert_eq!(U256::from_be_slice(&out[..32]), U256::ZERO);
+            assert_eq!(
+                U256::from_be_slice(&out[32..]),
+                U256::from(not_whitelisted_output(TARGET).len())
+            );
+
+            let mut db = with_code(&code);
+            whitelist_owned(&mut db);
+            whitelist(&mut db, TARGET);
+            let allowed = run(&mut db, ISTANBUL_BLOCK, Some(TARGET), vec![], inspect);
+            let out = allowed.output().unwrap();
+            assert_ne!(U256::from_be_slice(&out[..32]), U256::ZERO);
+            assert_eq!(U256::from_be_slice(&out[32..]), U256::ZERO);
+        }
+    }
+}

@@ -73,7 +73,8 @@ pub struct Command {
 
     /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode
     /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
-    /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules)),
+    /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules);
+    /// OP Mainnet, chain 10, follows its fork schedule per block instead),
     /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
     /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
     ///
@@ -315,7 +316,7 @@ pub struct Command {
     historical_height: Option<u64>,
 
     /// Upstream RPC of the chain serving full block bodies. Enables
-    /// `trace_debankBlock` on BSC and Ethereum mainnet archive nodes, which
+    /// `trace_debankBlock` on BSC, Ethereum and Arc mainnet archive nodes, which
     /// replays a block on the archive state to regenerate its pipeline traces
     /// and events.
     #[arg(long, value_name = "URL")]
@@ -397,7 +398,8 @@ pub struct Command {
     /// ~3× cold-read decompression latency on deep-level reads. RocksDB
     /// records compression type per SST, so existing data remains readable
     /// regardless of this flag — toggling only affects newly written SSTs.
-    /// Archive-only (RocksDB archive mode).
+    /// Archive-only (RocksDB archive mode). Schema v3 archives always use
+    /// ZSTD, whatever this flag says.
     #[arg(long, default_value = "false")]
     archive_zstd_compression: bool,
 

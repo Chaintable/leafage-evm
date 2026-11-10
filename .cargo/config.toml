@@ -1,0 +1,5 @@
+[env]
+# RocksDB keeps a digested ZSTD dictionary per SST (ROCKSDB_ZSTD_DDICT) only
+# when built with this; otherwise every block read rebuilds the dictionary's
+# entropy tables, about 3us per 4KB block. The Dockerfile sets it too.
+CXXFLAGS = "-DZSTD_STATIC_LINKING_ONLY"

@@ -11,13 +11,15 @@
 //! schema in `<db>/LEAFAGE_ARCHIVE_SCHEMA` and is opened with the matching
 //! options; RocksDB itself refuses a comparator that does not match.
 
+use super::block_index::{self, copy_block_infos, BlockIndex};
 use super::{
     archive_cf_descriptors, archive_cf_options, decode_archive_header, decode_storage,
-    encode_block_num, fmt_hms, key_after_prefix, rocksdb_options, shard_bounds, DataBaseRef,
-    StorageTypeColumn, ARCHIVE_COLUMNS, ENCODING_MARKER_KEY,
+    encode_block_num, existing_columns, fmt_hms, key_after_prefix, rocksdb_options, shard_bounds,
+    DataBaseRef, StorageTypeColumn, ENCODING_MARKER_KEY,
 };
 use crate::db_impl::error::Error;
 use crate::db_impl::rocksdb_impl::sst::{ingest_external_file_options, SstSink};
+use crate::metrics::STORAGE_METRICS;
 use leafage_evm_types::{H256, U256};
 use librocksdb_sys as ffi;
 use rocksdb::{
@@ -41,6 +43,8 @@ const COMPARATOR: &str = "leveldb.BytewiseComparator.u64ts";
 const ROLL_BYTES: u64 = 128 << 20;
 /// Threads of the rewind trim's compactions (the serving archive uses 4).
 const TRIM_SUBCOMPACTIONS: u32 = 8;
+/// Batch only enough cache misses to amortize MultiGet's setup allocations.
+pub(super) const MIN_MULTIGET_KEYS: usize = 8;
 
 /// Whether the archive at `path` is schema v3.
 pub(crate) fn is_udt_archive(path: &Path) -> Result<bool, Error> {
@@ -216,26 +220,87 @@ impl UdtReader {
                 &mut err,
             )
         };
-        if !err.is_null() {
-            return Err(take_error(err));
-        }
-        // Found iff a timestamp came back: an empty value may come back as a
-        // null `malloc(0)`.
-        if ts_len == 0 {
-            return Ok(None);
-        }
-        // SAFETY: `ts` holds `ts_len` (8) bytes.
-        let block = unsafe {
-            let b = u64::from_le_bytes(
-                std::slice::from_raw_parts(ts as *const u8, 8)
-                    .try_into()
-                    .unwrap(),
-            );
-            ffi::rocksdb_free(ts as *mut c_void);
-            b
-        };
-        Ok(Some(Found { value, len, block }))
+        // SAFETY: these are the owned outputs of the C call above.
+        let found = unsafe { Found::take(value, len, ts, ts_len, err) };
+        count_gets(col, std::slice::from_ref(&found));
+        found
     }
+
+    /// Same versions and input order as `get`, including empty values.
+    pub(super) fn get_many(
+        &self,
+        db: &DB,
+        col: StorageTypeColumn,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Found>>, Error> {
+        if keys.len() < MIN_MULTIGET_KEYS {
+            return keys.iter().map(|key| self.get(db, col, key)).collect();
+        }
+        let cf = db.cf_handle(col.to_str()).unwrap();
+        let n = keys.len();
+        let cfs = vec![cf.inner() as *const ffi::rocksdb_column_family_handle_t; n];
+        let pointers: Vec<_> = keys
+            .iter()
+            .map(|key| key.as_ptr().cast::<c_char>())
+            .collect();
+        let lengths: Vec<_> = keys.iter().map(|key| key.len()).collect();
+        let mut values = vec![std::ptr::null_mut(); n];
+        let mut sizes = vec![0; n];
+        let mut timestamps = vec![std::ptr::null_mut(); n];
+        let mut timestamp_sizes = vec![0; n];
+        let mut errors = vec![std::ptr::null_mut(); n];
+        // SAFETY: all arrays have n entries; options and keys outlive the call.
+        unsafe {
+            ffi::rocksdb_multi_get_cf_with_ts(
+                db.as_raw_ptr(),
+                self.ro,
+                cfs.as_ptr(),
+                n,
+                pointers.as_ptr(),
+                lengths.as_ptr(),
+                values.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                timestamps.as_mut_ptr(),
+                timestamp_sizes.as_mut_ptr(),
+                errors.as_mut_ptr(),
+            );
+        }
+        // Own/free EVERY C result before propagating an error: collecting
+        // directly into Result would leak the outputs after the first error.
+        let owned: Vec<_> = (0..n)
+            .map(|i| unsafe {
+                Found::take(
+                    values[i],
+                    sizes[i],
+                    timestamps[i],
+                    timestamp_sizes[i],
+                    errors[i],
+                )
+            })
+            .collect();
+        count_gets(col, &owned);
+        owned.into_iter().collect()
+    }
+}
+
+/// Count the versioned reads that found a version at or below the read
+/// height, and those that found none.
+fn count_gets(col: StorageTypeColumn, results: &[Result<Option<Found>, Error>]) {
+    let m = &*STORAGE_METRICS;
+    let (found, missing) = match col {
+        StorageTypeColumn::AddressToAccount => (
+            &m.archive_account_gets_found,
+            &m.archive_account_gets_missing,
+        ),
+        _ => (
+            &m.archive_storage_gets_found,
+            &m.archive_storage_gets_missing,
+        ),
+    };
+    let hits = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    let misses = results.iter().filter(|r| matches!(r, Ok(None))).count();
+    found.increment(hits as u64);
+    missing.increment(misses as u64);
 }
 
 impl Drop for UdtReader {
@@ -254,6 +319,35 @@ pub(super) struct Found {
 }
 
 impl Found {
+    /// Take ownership of the malloc'ed outputs of a timestamped C read.
+    unsafe fn take(
+        value: *mut c_char,
+        len: usize,
+        ts: *mut c_char,
+        ts_len: usize,
+        err: *mut c_char,
+    ) -> Result<Option<Self>, Error> {
+        let mut found = Self {
+            value,
+            len,
+            block: 0,
+        };
+        if !err.is_null() {
+            ffi::rocksdb_free(ts.cast());
+            return Err(take_error(err));
+        }
+        // Found iff a timestamp came back: empty values can be null malloc(0).
+        if ts_len == 0 {
+            ffi::rocksdb_free(ts.cast());
+            return Ok(None);
+        }
+        // The versioned CF comparator always returns an eight-byte timestamp.
+        found.block =
+            u64::from_le_bytes(std::slice::from_raw_parts(ts.cast(), 8).try_into().unwrap());
+        ffi::rocksdb_free(ts.cast());
+        Ok(Some(found))
+    }
+
     pub(super) fn value(&self) -> &[u8] {
         if self.len == 0 {
             return &[];
@@ -315,17 +409,49 @@ pub(crate) fn check_rewind_target(path: &Path, number: u64) -> Result<(), Error>
     let get = |col: StorageTypeColumn, key: &[u8]| -> Result<Option<Vec<u8>>, Error> {
         Ok(db.get_cf(db.cf_handle(col.to_str()).unwrap(), key)?)
     };
-    let header_number = |hash: Option<Vec<u8>>| -> Result<Option<u64>, Error> {
-        let Some(hash) = hash else { return Ok(None) };
-        get(StorageTypeColumn::BlockHashToBlockInfo, &hash)?
-            .map(|raw| Ok(decode_archive_header(&mut &raw[..])?.number))
-            .transpose()
-    };
-    let head = header_number(get(StorageTypeColumn::LatestBlockHash, &[1u8])?)?;
-    let target = header_number(get(
+    let latest = get(StorageTypeColumn::LatestBlockHash, &[1u8])?;
+    let target_hash = get(
         StorageTypeColumn::BlockNumToBlockHash,
         &encode_block_num(number),
-    )?)?;
+    )?;
+    let (head, target) = if db
+        .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+        .is_some()
+    {
+        let header_number = |hash: Option<Vec<u8>>| -> Result<Option<u64>, Error> {
+            let Some(hash) = hash else { return Ok(None) };
+            get(StorageTypeColumn::BlockHashToBlockInfo, &hash)?
+                .map(|raw| Ok(decode_archive_header(&mut &raw[..])?.number))
+                .transpose()
+        };
+        (header_number(latest)?, header_number(target_hash)?)
+    } else {
+        // Block infos by number, each starting with its hash. The head is
+        // the latest one with the head's hash: a bulk load may have written
+        // blocks past it.
+        let cf = db
+            .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
+            .unwrap();
+        let mut head = None;
+        if let Some(latest) = &latest {
+            for item in db.iterator_cf(cf, IteratorMode::End) {
+                let (key, record) = item?;
+                if record.starts_with(latest) {
+                    head = Some(u64::from_be_bytes(key[..].try_into().unwrap()));
+                    break;
+                }
+            }
+        }
+        let record = get(
+            StorageTypeColumn::BlockNumToBlockInfo,
+            &number.to_be_bytes(),
+        )?;
+        let target = match (target_hash, record) {
+            (Some(hash), Some(record)) if record.starts_with(&hash) => Some(number),
+            _ => None,
+        };
+        (head, target)
+    };
     match (head, target) {
         (Some(head), Some(target)) if target == number && number <= head => Ok(()),
         _ => Err(Error::UnSupported(format!(
@@ -349,7 +475,7 @@ pub(crate) fn trim_history(path: &Path, number: u64) -> Result<(), Error> {
     // RocksDB opens every CF of the database, `default` included.
     let mut names = vec![CString::new("default").unwrap()];
     let mut cf_opts = vec![Options::default()];
-    for col in ARCHIVE_COLUMNS {
+    for col in existing_columns(path).unwrap_or_default() {
         names.push(CString::new(col.to_str()).unwrap());
         let mut opts = archive_cf_options(col, &cache, false, false, false, true);
         // The trim's bottommost pass skips files numbered after it started
@@ -413,6 +539,8 @@ pub struct UdtConvertReport {
 enum Task {
     /// Copy a non-versioned CF verbatim.
     Copy(StorageTypeColumn),
+    /// Move the block infos of `BlockHashToBlockInfo` into `BlockNumToBlockInfo`.
+    BlockInfos,
     /// Convert one key-range shard of a versioned CF.
     Versioned {
         col: StorageTypeColumn,
@@ -430,7 +558,8 @@ fn open_read_only(path: &Path, udt: bool) -> Result<DB, Error> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512),
     );
-    let descriptors = ARCHIVE_COLUMNS.iter().map(|&col| {
+    let cols = existing_columns(path).unwrap_or_default();
+    let descriptors = cols.into_iter().map(|col| {
         let versioned = matches!(
             col,
             StorageTypeColumn::AddressToAccount | StorageTypeColumn::AddressToStorage
@@ -475,7 +604,8 @@ impl DataBaseRef {
     /// without leading zeros. Files roll only between keys, so no two files
     /// share a key and all of them ingest into the bottom level. They are
     /// written with the CFs' own table options (filters, partitioned index),
-    /// so no compaction follows.
+    /// so no compaction follows. Block infos are copied as they are, or with
+    /// `ARCHIVE_BLOCK_INDEX=1` go to `BlockNumToBlockInfo`.
     pub fn convert_inverted_to_udt(
         src_path: &Path,
         dst_path: &Path,
@@ -503,19 +633,36 @@ impl DataBaseRef {
             ));
         }
 
+        let src_cols = existing_columns(src_path).unwrap_or_default();
+        // Block infos move from CF 2 to CF 7 only when asked for.
+        let move_infos =
+            block_index::enabled() && src_cols.contains(&StorageTypeColumn::BlockHashToBlockInfo);
+        let cols: Vec<StorageTypeColumn> = if move_infos {
+            src_cols
+                .iter()
+                .copied()
+                .filter(|&col| col != StorageTypeColumn::BlockHashToBlockInfo)
+                .chain(
+                    (!src_cols.contains(&StorageTypeColumn::BlockNumToBlockInfo))
+                        .then_some(StorageTypeColumn::BlockNumToBlockInfo),
+                )
+                .collect()
+        } else {
+            src_cols.clone()
+        };
         let cache = Cache::new_hyper_clock_cache(cache_size << 20, 8192);
         let mut db_opts = rocksdb_options(false);
         db_opts.set_error_if_exists(true);
         let dst = DB::open_cf_descriptors(
             &db_opts,
             dst_path,
-            archive_cf_descriptors(&cache, false, false, false, true),
+            archive_cf_descriptors(&cache, false, false, false, true, &cols),
         )?;
         let tmp_dir = dst_path.join(".udt_tmp");
         std::fs::create_dir_all(&tmp_dir)?;
         // SST writers use the destination CFs' options: same comparator,
         // filters, index and bottom-level compression.
-        let sst_opts: Vec<(StorageTypeColumn, Options)> = ARCHIVE_COLUMNS
+        let sst_opts: Vec<(StorageTypeColumn, Options)> = cols
             .iter()
             .map(|&col| {
                 (
@@ -526,8 +673,12 @@ impl DataBaseRef {
             .collect();
         let opts_of = |col: StorageTypeColumn| &sst_opts.iter().find(|(c, _)| *c == col).unwrap().1;
 
-        // Storage shards first: they are the bulk of the work.
+        // The block info move first, as it runs on one thread, then the
+        // storage shards: they are the bulk of the work.
         let mut tasks = Vec::new();
+        if move_infos {
+            tasks.push(Task::BlockInfos);
+        }
         for col in [
             StorageTypeColumn::AddressToStorage,
             StorageTypeColumn::AddressToAccount,
@@ -536,13 +687,16 @@ impl DataBaseRef {
                 tasks.push(Task::Versioned { col, shard, lo, hi });
             }
         }
-        for col in [
-            StorageTypeColumn::BlockHashToBlockInfo,
-            StorageTypeColumn::HashToCode,
-            StorageTypeColumn::BlockNumToBlockHash,
-            StorageTypeColumn::LatestBlockHash,
-        ] {
-            tasks.push(Task::Copy(col));
+        for &col in &src_cols {
+            let moved = move_infos && col == StorageTypeColumn::BlockHashToBlockInfo;
+            if !moved
+                && !matches!(
+                    col,
+                    StorageTypeColumn::AddressToStorage | StorageTypeColumn::AddressToAccount
+                )
+            {
+                tasks.push(Task::Copy(col));
+            }
         }
         let n_tasks = tasks.len();
         let queue = Mutex::new(tasks.into_iter());
@@ -584,6 +738,20 @@ impl DataBaseRef {
                                 return Ok(());
                             }
                             let (col, shard, paths) = match task {
+                                Task::BlockInfos => {
+                                    let index = BlockIndex::build(&src)?;
+                                    let n = copy_block_infos(
+                                        &src,
+                                        &dst,
+                                        &dst_path.join(".block_index_tmp"),
+                                        &index,
+                                    )?;
+                                    // Same blocks as the destination's CF 3.
+                                    index.save_to(&dst_path.join(block_index::FILE))?;
+                                    records[2].fetch_add(n as u64, Ordering::Relaxed);
+                                    done_tasks.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
                                 Task::Copy(col) => {
                                     let cf = src.cf_handle(col.to_str()).unwrap();
                                     let mut sink = SstSink::new(
@@ -687,7 +855,7 @@ impl DataBaseRef {
             other: records[2].load(Ordering::Relaxed),
             files: 0,
         };
-        for col in ARCHIVE_COLUMNS {
+        for &col in &cols {
             let paths: Vec<PathBuf> = outputs
                 .iter()
                 .filter(|(c, _, _)| *c == col)
@@ -879,14 +1047,19 @@ mod tests {
         }
     }
 
+    fn block_hash(number: u64) -> H256 {
+        let mut hash = H256::ZERO;
+        hash.0[24..].copy_from_slice(&number.to_be_bytes());
+        hash.0[0] = 0xb1;
+        hash
+    }
+
     fn block_info(number: u64) -> BlockInfo {
         let raw = RawHeader {
             number,
             ..Default::default()
         };
-        let mut hash = H256::ZERO;
-        hash.0[24..].copy_from_slice(&number.to_be_bytes());
-        hash.0[0] = 0xb1;
+        let hash = block_hash(number);
         BlockInfo::new(Block {
             header: Header {
                 hash,
@@ -967,14 +1140,36 @@ mod tests {
                 .db_at(BlockId::Number(BlockNumberOrTag::Number(h)))
                 .unwrap()
                 .unwrap();
-            out[h as usize] = addrs()
+            // Batch first so cold misses exercise MultiGet. The existing v2
+            // oracle also checks the spans learned by these reads on v3.
+            let mut addresses = addrs();
+            addresses.extend([addresses[0], H256::repeat_byte(0xff)]);
+            let keys: Vec<_> = addresses
+                .iter()
+                .flat_map(|a| slots().into_iter().map(|s| (*a, s)))
+                .collect();
+            let accounts = state.read_account_many(&addresses).unwrap();
+            let storage = state.read_storage_many(&keys).unwrap();
+            assert!(state.read_account_many(&[]).unwrap().is_empty());
+            assert!(state.read_storage_many(&[]).unwrap().is_empty());
+            assert!(
+                !state.supports_batched_reads(),
+                "archive must not enable eager prefetch"
+            );
+            out[h as usize] = addresses
                 .into_iter()
-                .map(|a| {
+                .enumerate()
+                .map(|(i, a)| {
                     let account = state.read_account(a).unwrap();
-                    let slots = slots()
+                    assert_eq!(accounts[i], account);
+                    let slots: Vec<_> = slots()
                         .into_iter()
                         .map(|s| state.read_storage_and_height(a, s).unwrap())
                         .collect();
+                    assert_eq!(
+                        storage[i * slots.len()..(i + 1) * slots.len()],
+                        slots.iter().map(|(value, _)| *value).collect::<Vec<_>>()
+                    );
                     let listed = state.read_storage_slots(a).unwrap().unwrap();
                     (account, slots, listed)
                 })
@@ -996,11 +1191,23 @@ mod tests {
 
     #[test]
     fn test_udt_archive_matches_v2() {
+        udt_archive_matches_v2(false);
+    }
+
+    #[test]
+    fn test_udt_archive_matches_v2_block_index() {
+        udt_archive_matches_v2(true);
+    }
+
+    /// Convert a v2 archive, with or without `ARCHIVE_BLOCK_INDEX=1`, and
+    /// check the result reads as the source, before and after appending.
+    fn udt_archive_matches_v2(by_number: bool) {
         let _g = ARCHIVE_DB_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         crate::db_impl::archive_encoding::set_inverted_block_encoding(true);
-        let base = std::env::temp_dir().join(format!("leafage-udt-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("leafage-udt-{by_number}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (v2_dir, v3_dir) = (base.join("v2"), base.join("v3"));
         let mut rng = Rng(0x5eed);
@@ -1015,11 +1222,33 @@ mod tests {
             db.write_encoding_marker(true).unwrap();
             append(&db, &diffs[..split]);
         }
-        let report = DataBaseRef::convert_inverted_to_udt(&v2_dir, &v3_dir, 64, 3).unwrap();
+        if by_number {
+            std::env::set_var("ARCHIVE_BLOCK_INDEX", "1");
+        }
+        let report = DataBaseRef::convert_inverted_to_udt(&v2_dir, &v3_dir, 64, 3);
+        std::env::remove_var("ARCHIVE_BLOCK_INDEX");
+        let report = report.unwrap();
         assert!(report.accounts > 0 && report.storage > 0, "{report:?}");
         let verify = verify_udt_against_v2(&v2_dir, &v3_dir, 300, 7).unwrap();
         assert_eq!(verify.mismatches, 0, "{verify:?}");
         assert!(verify.keys > 0 && verify.absent_keys > 0, "{verify:?}");
+        // Block infos move to `BlockNumToBlockInfo` only when asked for,
+        // with the index saved.
+        let cols = existing_columns(&v3_dir).unwrap();
+        assert_eq!(
+            cols.contains(&StorageTypeColumn::BlockNumToBlockInfo),
+            by_number
+        );
+        assert_eq!(
+            cols.contains(&StorageTypeColumn::BlockHashToBlockInfo),
+            !by_number
+        );
+        assert_eq!(v3_dir.join(block_index::FILE).exists(), by_number);
+        let infos = |db: &DataBaseRef| -> Vec<Option<BlockInfo>> {
+            (1..=head + 1)
+                .map(|n| db.read_block_info(block_hash(n)).unwrap())
+                .collect()
+        };
 
         // Serve v3, then append above the converted head through the v3
         // write path.
@@ -1027,29 +1256,42 @@ mod tests {
             let db = Arc::new(DataBaseRef::open(&v3_dir, 64, false, false));
             assert!(db.udt);
             assert!(db.state_cache.is_some());
+            assert_eq!(db.block_index.is_some(), by_number);
+            let converted_infos = infos(&db);
             let converted_reads = read_all(&db, converted, &mut rng);
             append(&db, &diffs[split..]);
+            let appended_reads = read_all(&db, head, &mut rng);
+            db.flush().unwrap();
+            db.compact().unwrap();
             (
                 converted_reads,
+                appended_reads,
                 read_all(&db, head, &mut rng),
-                read_all(&db, head, &mut rng),
+                converted_infos,
+                infos(&db),
             )
         };
         let v2 = {
             let db = Arc::new(DataBaseRef::open(&v2_dir, 64, false, false));
             assert!(!db.udt);
+            let converted_infos = infos(&db);
             append(&db, &diffs[split..]);
-            read_all(&db, head, &mut rng)
+            (read_all(&db, head, &mut rng), converted_infos, infos(&db))
         };
+        assert!(v2.1[..split].iter().all(Option::is_some));
+        assert_eq!(v2.1, v3.3, "converted block infos");
+        assert_eq!(v2.2, v3.4, "appended block infos");
+        let v2 = v2.0;
         assert_eq!(&v2[..=split], &v3.0[..], "converted");
         assert_eq!(v2, v3.1, "converted + appended");
-        assert_eq!(v2, v3.2, "converted + appended, read again");
+        assert_eq!(v2, v3.2, "converted + appended, compacted");
         let _ = std::fs::remove_dir_all(&base);
         crate::db_impl::archive_encoding::set_inverted_block_encoding(false);
     }
 
-    /// State cache probes on v3: a slot unchanged up to the head is cached up
-    /// to the head; a slot with a newer version keeps the span it read.
+    /// State cache probes on v3: a slot unchanged up to the head, written or
+    /// not, is cached up to the head; a slot with a newer version keeps the
+    /// span it read.
     #[test]
     fn test_udt_state_cache_probe() {
         let _g = ARCHIVE_DB_TEST_LOCK
@@ -1101,11 +1343,13 @@ mod tests {
                 k[32..].copy_from_slice(slot.as_slice());
                 k
             };
+            let never = H256::repeat_byte(0x23);
             // The first read caches [10, 15]; the second, a miss at 16 on a
             // key read before, probes.
             for n in [15, 16] {
                 assert_eq!(read(n, stable), (U256::from(1), Some(10)));
                 assert_eq!(read(n, changing), (U256::from(2), Some(10)));
+                assert_eq!(read(n, never), (U256::ZERO, None));
             }
             let cache = db.state_cache.as_ref().unwrap();
             assert!(matches!(
@@ -1113,12 +1357,23 @@ mod tests {
                 Lookup::Hit(_)
             ));
             assert!(matches!(
+                cache.storage.lookup(&key(never), 120),
+                Lookup::Hit(Span { found: false, .. })
+            ));
+            assert!(matches!(
                 cache.storage.lookup(&key(changing), 16),
-                Lookup::Hit(_)
+                Lookup::Hit(Span { lo: 10, hi: 16, .. })
             ));
             assert!(matches!(
                 cache.storage.lookup(&key(changing), 17),
                 Lookup::Miss(_)
+            ));
+            // A later miss on that version extends the span by the read
+            // alone: the probe found version 100.
+            assert_eq!(read(50, changing), (U256::from(2), Some(10)));
+            assert!(matches!(
+                cache.storage.lookup(&key(changing), 50),
+                Lookup::Hit(Span { lo: 10, hi: 50, .. })
             ));
             assert_eq!(read(99, changing), (U256::from(2), Some(10)));
             assert_eq!(read(100, changing), (U256::from(3), Some(100)));
@@ -1139,8 +1394,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let mut rng = Rng(0xab1e);
         let head = 40u64;
-        let diffs: Vec<(u64, BlockStorageDiff)> =
+        let mut diffs: Vec<(u64, BlockStorageDiff)> =
             (1..=head).map(|n| (n, random_diff(&mut rng, n))).collect();
+        let codes: Vec<_> = (0..12u8)
+            .map(|i| leafage_evm_types::NewCode {
+                code_hash: H256::repeat_byte(0x80 + i),
+                code: Bytes::from(vec![i; 40]),
+            })
+            .collect();
+        diffs[0].1.new_codes = codes.clone();
         let mut answers = Vec::new();
         for schema in [ArchiveSchema::V2, ArchiveSchema::V3] {
             let dir = base.join(schema.to_string());
@@ -1155,8 +1417,29 @@ mod tests {
             // Reopened, whatever schema is asked for.
             assert!(!init_archive_schema(&dir, ArchiveSchema::V1).unwrap());
             assert_eq!(is_udt_archive(&dir).unwrap(), schema == ArchiveSchema::V3);
-            let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let mut db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+            let mut hashes: Vec<_> = codes.iter().rev().map(|code| code.code_hash).collect();
+            hashes.extend([hashes[0], H256::repeat_byte(0xff)]);
+            let expected: Vec<_> = hashes
+                .iter()
+                .map(|hash| {
+                    codes
+                        .iter()
+                        .find(|code| code.code_hash == *hash)
+                        .map(|code| code.code.clone())
+                })
+                .collect();
+            db.read_code(hashes[0]).unwrap(); // Mixed cache hits and batch misses.
+            for _ in 0..2 {
+                assert_eq!(db.read_code_many(&hashes).unwrap(), expected);
+            }
+            assert!(db.read_code_many(&[]).unwrap().is_empty());
             answers.push(read_all(&db, head, &mut rng));
+            let uncached = Arc::get_mut(&mut db).unwrap();
+            uncached.state_cache = None;
+            uncached.code_cache = None;
+            assert_eq!(db.read_code_many(&hashes).unwrap(), expected);
+            assert_eq!(answers.last().unwrap(), &read_all(&db, head, &mut rng));
         }
         assert_eq!(answers[0], answers[1]);
 

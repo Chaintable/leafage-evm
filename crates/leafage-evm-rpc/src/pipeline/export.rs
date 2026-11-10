@@ -24,6 +24,7 @@ use super::blocks::{fetch_raw_blocks, FetchedBlock};
 use super::bundle::{BundleObjects, BundleWriter, Resource, BUNDLE_SIZE};
 use super::chain::{Chain, ChainReplay, PipelineChain, ReplayOptions};
 use super::s3::{MultipartUpload, S3Target};
+use crate::api_impl::arc::archive_replay::ArcPipeline;
 use crate::api_impl::bsc::trace::BscPipeline;
 use crate::api_impl::mainnet::trace::EthPipeline;
 use anyhow::{anyhow, Context as _, Result};
@@ -117,6 +118,7 @@ where
     DB::StateDB: Send + 'static,
 {
     match chain {
+        Chain::Arc => export_chain(db, Arc::new(ArcPipeline), config).await,
         Chain::Bsc => export_chain(db, Arc::new(BscPipeline), config).await,
         Chain::Eth => export_chain(db, Arc::new(EthPipeline), config).await,
     }

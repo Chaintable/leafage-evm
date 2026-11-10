@@ -165,6 +165,28 @@ fn is_constrained_tip20_selector(selector: [u8; 4]) -> bool {
     )
 }
 
+/// The binding gained `SignatureType::ConfigurableAccount` (3), which the writer accepts only
+/// from T14. From T11 it must revert as the strict ABI decoder does for an unknown type.
+fn is_configurable_account_authorization(
+    spec: crate::tempo::hardfork::TempoHardfork,
+    calldata: &[u8],
+) -> bool {
+    spec.is_t11()
+        && calldata.first_chunk::<4>().is_some_and(|selector| {
+            matches!(
+                *selector,
+                IAccountKeychain::authorizeKey_0Call::SELECTOR
+                    | IAccountKeychain::authorizeKey_1Call::SELECTOR
+                    | IAccountKeychain::authorizeKey_2Call::SELECTOR
+                    | IAccountKeychain::authorizeAdminKeyCall::SELECTOR
+            )
+        })
+        && calldata.get(36..68).is_some_and(|word| {
+            U256::from_be_slice(word)
+                == U256::from(IAccountKeychain::SignatureType::ConfigurableAccount as u8)
+        })
+}
+
 fn selector_is_disabled(spec: crate::tempo::hardfork::TempoHardfork, selector: [u8; 4]) -> bool {
     (selector == IAccountKeychain::authorizeKey_1Call::SELECTOR && !spec.is_t3())
         || (selector == IAccountKeychain::authorizeKey_2Call::SELECTOR
@@ -1867,6 +1889,11 @@ impl Precompile for AccountKeychain {
             calldata,
             IAccountKeychain::IAccountKeychainCalls::valid_selector,
             |data| {
+                if is_configurable_account_authorization(StorageCtx.spec(), data) {
+                    return Err(alloy::sol_types::Error::custom(
+                        "ConfigurableAccount signature type before T14",
+                    ));
+                }
                 crate::tempo::precompile::decode_precompile_call::<
                     IAccountKeychain::IAccountKeychainCalls,
                 >(data, StorageCtx.spec())
@@ -2494,6 +2521,80 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+            }
+        }
+    }
+
+    /// ConfigurableAccount (3) must behave exactly like an unknown signature type (4) before T14:
+    /// strict-decode revert from T11, InvalidSignatureType at the same point before T11.
+    #[test]
+    fn configurable_account_signature_type_matches_unknown_type_before_t14() {
+        let key_id = Address::repeat_byte(0x61);
+        let config = unrestricted_restrictions();
+        let calls = [
+            IAccountKeychain::authorizeKey_0Call {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                expiry: 100,
+                enforceLimits: false,
+                limits: Vec::new(),
+            }
+            .abi_encode(),
+            IAccountKeychain::authorizeKey_1Call {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                config: config.clone(),
+            }
+            .abi_encode(),
+            IAccountKeychain::authorizeKey_2Call {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                config,
+                witness: B256::ZERO,
+            }
+            .abi_encode(),
+            IAccountKeychain::authorizeAdminKeyCall {
+                keyId: key_id,
+                signatureType: IAccountKeychain::SignatureType::Secp256k1,
+                witness: B256::ZERO,
+            }
+            .abi_encode(),
+        ];
+
+        let account = Address::repeat_byte(0x62);
+        let run = |spec, calldata: &[u8]| {
+            let mut provider = TestStorageProvider::new(spec);
+            let output = StorageCtx::enter(&mut provider, || -> Result<_> {
+                let mut keychain = AccountKeychain::new();
+                keychain.set_tx_origin(account)?;
+                Ok(keychain.call(calldata, account).unwrap())
+            })
+            .unwrap();
+            (
+                output.status,
+                output.bytes,
+                output.gas_used,
+                provider.storage_len(),
+            )
+        };
+        for spec in [
+            TempoHardfork::T6,
+            TempoHardfork::T10,
+            TempoHardfork::T11,
+            TempoHardfork::T13,
+        ] {
+            for (index, calldata) in calls.iter().enumerate() {
+                let with_type = |signature_type: u8| {
+                    let mut calldata = calldata.clone();
+                    calldata[67] = signature_type;
+                    calldata
+                };
+                let configurable = run(spec, &with_type(3));
+                assert_eq!(configurable, run(spec, &with_type(4)), "{spec:?}: {index}");
+                assert!(configurable.0.is_revert(), "{spec:?}: {index}");
+                if spec.is_t11() {
+                    assert!(configurable.1.is_empty(), "{spec:?}: {index}");
+                }
             }
         }
     }

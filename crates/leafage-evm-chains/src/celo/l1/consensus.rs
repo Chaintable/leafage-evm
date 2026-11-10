@@ -253,13 +253,13 @@ struct Validator {
     address: Address,
     key: Bytes,
 }
-static VALIDATORS: OnceLock<moka::sync::Cache<B256, Arc<Vec<Validator>>>> = OnceLock::new();
+static VALIDATORS: OnceLock<quick_cache::sync::Cache<B256, Arc<Vec<Validator>>>> = OnceLock::new();
 
 fn validators(chain: &dyn CeloChainData, requested: u64) -> Result<Arc<Vec<Validator>>, Failure> {
     if requested == 0 {
         return Ok(Arc::new(Vec::new()));
     }
-    let cache = VALIDATORS.get_or_init(|| moka::sync::Cache::new(4096));
+    let cache = VALIDATORS.get_or_init(|| quick_cache::sync::Cache::new(4096));
     let mut boundary = (requested - 1) / EPOCH_SIZE * EPOCH_SIZE;
     let mut pending = Vec::new();
     let mut current = loop {
