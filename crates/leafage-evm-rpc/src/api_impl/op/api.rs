@@ -7,7 +7,7 @@ use crate::api_impl::op::legacy;
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::core::RpcResult;
-use leafage_evm_chains::op::mainnet::{op_mainnet_spec_at, OP_MAINNET_CHAIN_ID};
+use leafage_evm_chains::op::schedule::op_stack_spec_at;
 use leafage_evm_types::{BlockInfo, CallRequest, CfgEnv, DebankErrorCode, OpSpecId};
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction};
@@ -21,17 +21,18 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 
 type OpApiImpl<DB> = ApiImpl<DB, OpSpecId, NoneEvmCustomConfig>;
 
-/// The configured cfg with the fork of the executing block. On OP Mainnet the spec
-/// (and its gas params) follow the mainnet fork schedule, so a historical height runs
-/// the rules it was produced under; the many other OP-stack chains served by this
-/// evm-type keep the configured spec.
+/// The configured cfg with the fork of the executing block. On a chain with a built-in
+/// fork schedule (`op::schedule`) the spec and its gas params follow that schedule, so a
+/// historical height runs the rules it was produced under; the other OP-stack chains
+/// served by this evm-type keep the configured spec.
 fn block_cfg(cfg: &CfgEnv<OpSpecId>, block_env: &BlockEnv) -> CfgEnv<OpSpecId> {
     let mut cfg = cfg.clone();
-    if cfg.chain_id == OP_MAINNET_CHAIN_ID {
-        cfg.set_spec_and_mainnet_gas_params(op_mainnet_spec_at(
-            block_env.number.saturating_to(),
-            block_env.timestamp.saturating_to(),
-        ));
+    if let Some(spec) = op_stack_spec_at(
+        cfg.chain_id,
+        block_env.number.saturating_to(),
+        block_env.timestamp.saturating_to(),
+    ) {
+        cfg.set_spec_and_mainnet_gas_params(spec);
     }
     cfg
 }
@@ -175,6 +176,8 @@ impl<DB> ApiCore for OpApiImpl<DB> where DB: Sync + Send + 'static {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leafage_evm_chains::op::mainnet::OP_MAINNET_CHAIN_ID;
+    use leafage_evm_chains::op::schedule::SONEIUM_CHAIN_ID;
     use leafage_evm_types::U256;
 
     fn block(number: u64, timestamp: u64) -> BlockEnv {
@@ -229,6 +232,24 @@ mod tests {
             assert_eq!(actual.chain_id, cfg.chain_id);
             assert_eq!(actual.tx_gas_limit_cap, cfg.tx_gas_limit_cap);
             assert!(actual.disable_base_fee);
+        }
+    }
+
+    #[test]
+    fn soneium_follows_its_own_forks() {
+        let mut cfg = op_mainnet_cfg();
+        cfg.chain_id = SONEIUM_CHAIN_ID;
+        for (block_env, spec) in [
+            // OP Mainnet reached Holocene at 1_736_445_601; Soneium was still on Granite.
+            (block(1_932_625, 1_737_000_001), OpSpecId::GRANITE),
+            (block(2_719_225, 1_738_573_201), OpSpecId::HOLOCENE),
+            (block(6_835_824, 1_746_806_399), OpSpecId::HOLOCENE),
+            (block(6_835_825, 1_746_806_401), OpSpecId::ISTHMUS),
+            (block(25_195_825, 1_783_526_401), OpSpecId::KARST),
+        ] {
+            let actual = block_cfg(&cfg, &block_env);
+            assert_eq!(actual.spec, spec);
+            assert_eq!(actual.gas_params, CfgEnv::new_with_spec(spec).gas_params);
         }
     }
 
