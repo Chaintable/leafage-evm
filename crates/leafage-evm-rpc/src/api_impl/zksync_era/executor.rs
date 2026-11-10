@@ -792,6 +792,8 @@ pub fn simulate_era_transaction<DB: DatabaseRef>(
     let root_trace = to_debank_trace(&first_call, tx_hash, vec![]);
     let mut traces = Vec::new();
     let mut error_traces = Vec::new();
+    let mut events = Vec::new();
+    let mut error_events = Vec::new();
     if effective_failed(&first_call) {
         error_traces.push(root_trace);
     } else {
@@ -802,16 +804,22 @@ pub fn simulate_era_transaction<DB: DatabaseRef>(
         tx_hash,
         &mut traces,
         &mut error_traces,
+        &mut events,
+        &mut error_events,
         vec![],
         &mut first_call,
     );
 
+    for (idx, event) in events.iter_mut().enumerate() {
+        event.log_index = Some(idx as u32);
+    }
+
     Ok(SimulateEraTransactionResult {
         single_result: leafage_evm_types::DebankSingleSimulateResult {
             traces,
-            events: Vec::new(),
+            events,
             error_traces: Some(error_traces),
-            error_events: Some(Vec::new()),
+            error_events: Some(error_events),
             code: 0,
             err: String::new(),
             gas_used: computational_gas_used,

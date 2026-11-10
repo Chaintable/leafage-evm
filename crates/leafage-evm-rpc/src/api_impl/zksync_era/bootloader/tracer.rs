@@ -7,10 +7,18 @@ use zksync_vm2::interface::{
 };
 use zksync_vm2::FatPointer;
 
-use super::constants::CONTRACT_DEPLOYER_ADDRESS;
+use super::constants::{CONTRACT_DEPLOYER_ADDRESS, EVENT_WRITER_ADDRESS};
 use leafage_evm_types::{DebankEvent, DebankTrace};
 
 pub const PARENT_CALL_FAILED_ERROR: &str = "parent call failed";
+
+#[derive(Debug, Clone, Default)]
+pub struct VmEvent {
+    pub address: H160,
+    pub indexed_topics: Vec<B256>,
+    pub value: Vec<u8>,
+    pub position: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallType {
@@ -33,6 +41,7 @@ pub struct Call {
     pub error: Option<String>,
     pub revert_reason: Option<String>,
     pub calls: Vec<Call>,
+    pub events: Vec<VmEvent>,
     pub trace_id: String,
     pub parent_trace_id: Option<String>,
     pub pos_in_parent_trace: usize,
@@ -56,6 +65,7 @@ impl Default for Call {
             error: None,
             revert_reason: None,
             calls: Vec::new(),
+            events: Vec::new(),
             trace_id: String::new(),
             parent_trace_id: None,
             pos_in_parent_trace: 0,
@@ -189,6 +199,8 @@ pub fn add_trace_log(
     tx_hash: B256,
     outtraces: &mut Vec<DebankTrace>,
     outerrtraces: &mut Vec<DebankTrace>,
+    outevents: &mut Vec<DebankEvent>,
+    outerrevents: &mut Vec<DebankEvent>,
     trace_addresses: Vec<u32>,
     cf: &mut Call,
 ) {
@@ -203,9 +215,41 @@ pub fn add_trace_log(
             tx_hash,
             outtraces,
             outerrtraces,
+            outevents,
+            outerrevents,
             child_trace_address(&trace_addresses, i as u32),
             subcall,
         );
+    }
+
+    for vm_event in &cf.events {
+        let pos_in_parent_trace = vm_event.position;
+        let e = DebankEvent {
+            id: to_hash(&[&cf.trace_id, &pos_in_parent_trace.to_string()]),
+            contract_id: alloy::primitives::Address::from_slice(vm_event.address.as_bytes()),
+            selector: vm_event
+                .indexed_topics
+                .first()
+                .map(|t| format!("{:#x}", t))
+                .unwrap_or_default(),
+            topics: vm_event
+                .indexed_topics
+                .iter()
+                .skip(1)
+                .map(|t| format!("{:#x}", t))
+                .collect(),
+            data: alloy::primitives::Bytes::from(vm_event.value.clone()),
+            tx_id: tx_hash,
+            parent_trace_id: cf.trace_id.clone(),
+            pos_in_parent_trace,
+            log_index: None,
+        };
+
+        if effective_failed(cf) {
+            outerrevents.push(e);
+        } else {
+            outevents.push(e);
+        }
     }
 
     for (i, subcall) in cf.calls.iter().enumerate() {
@@ -222,10 +266,113 @@ pub fn add_trace_log(
     }
 }
 
+pub fn merge_events_to_vm_event(events: &[zksync_vm2::interface::Event]) -> Vec<VmEvent> {
+    let mut result = Vec::new();
+    let mut current: Option<(usize, u32, Vec<[u8; 32]>, Vec<u8>)> = None;
+
+    for message in events {
+        if !message.is_first {
+            if let Some((mut remaining_data_length, mut remaining_topics, mut topics, mut data)) =
+                current.take()
+            {
+                let mut data_0 = [0u8; 32];
+                let mut data_1 = [0u8; 32];
+                message.key.to_big_endian(&mut data_0);
+                message.value.to_big_endian(&mut data_1);
+                for el in [&data_0, &data_1] {
+                    if remaining_topics != 0 {
+                        topics.push(*el);
+                        remaining_topics -= 1;
+                    } else if remaining_data_length != 0 {
+                        if remaining_data_length >= 32 {
+                            data.extend_from_slice(el);
+                            remaining_data_length -= 32;
+                        } else {
+                            data.extend_from_slice(&el[..remaining_data_length]);
+                            remaining_data_length = 0;
+                        }
+                    }
+                }
+
+                if remaining_data_length != 0 || remaining_topics != 0 {
+                    current = Some((remaining_data_length, remaining_topics, topics, data));
+                } else if !topics.is_empty() {
+                    let address = H160::from_slice(&topics[0][12..32]);
+                    let indexed_topics = topics.into_iter().skip(1).map(B256::from).collect();
+                    result.push(VmEvent {
+                        address,
+                        indexed_topics,
+                        value: data,
+                        position: 0,
+                    });
+                }
+            }
+        } else {
+            if let Some((remaining_data_length, remaining_topics, topics, data)) = current.take() {
+                if remaining_data_length == 0 && remaining_topics == 0 && !topics.is_empty() {
+                    let address = H160::from_slice(&topics[0][12..32]);
+                    let indexed_topics = topics.into_iter().skip(1).map(B256::from).collect();
+                    result.push(VmEvent {
+                        address,
+                        indexed_topics,
+                        value: data,
+                        position: 0,
+                    });
+                }
+            }
+
+            let num_topics = message.key.low_u64() as u32;
+            let data_length = (message.key.low_u64() >> 32) as usize;
+
+            let mut buffer = [0u8; 32];
+            message.value.to_big_endian(&mut buffer);
+
+            let (topics, data, remaining_topics, remaining_data_length) =
+                if num_topics == 0 && data_length == 0 {
+                    (vec![], vec![], 0, 0)
+                } else if num_topics == 0 {
+                    let take_len = 32.min(data_length);
+                    (vec![], buffer[..take_len].to_vec(), 0, data_length - take_len)
+                } else {
+                    (vec![buffer], vec![], num_topics - 1, data_length)
+                };
+
+            if remaining_data_length == 0 && remaining_topics == 0 && !topics.is_empty() {
+                let address = H160::from_slice(&topics[0][12..32]);
+                let indexed_topics = topics.into_iter().skip(1).map(B256::from).collect();
+                result.push(VmEvent {
+                    address,
+                    indexed_topics,
+                    value: data,
+                    position: 0,
+                });
+            } else {
+                current = Some((remaining_data_length, remaining_topics, topics, data));
+            }
+        }
+    }
+
+    if let Some((remaining_data_length, remaining_topics, topics, data)) = current.take() {
+        if remaining_data_length == 0 && remaining_topics == 0 && !topics.is_empty() {
+            let address = H160::from_slice(&topics[0][12..32]);
+            let indexed_topics = topics.into_iter().skip(1).map(B256::from).collect();
+            result.push(VmEvent {
+                address,
+                indexed_topics,
+                value: data,
+                position: 0,
+            });
+        }
+    }
+
+    result
+}
+
 #[derive(Debug, Clone)]
 struct FarcallAndNearCallCount {
     farcall: Call,
     near_calls_after: usize,
+    events_at_call_start: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -274,6 +421,8 @@ impl Tracer for EraCallTracer {
                     }
                 };
 
+                let events_at_call_start = state.events().count();
+
                 self.stack.push(FarcallAndNearCallCount {
                     farcall: Call {
                         r#type: call_type,
@@ -286,6 +435,7 @@ impl Tracer for EraCallTracer {
                         ..Default::default()
                     },
                     near_calls_after: 0,
+                    events_at_call_start,
                 });
             }
             Opcode::NearCall => {
@@ -325,6 +475,13 @@ impl Tracer for EraCallTracer {
                     match variant {
                         ReturnType::Normal => {
                             current_call.farcall.output = output.unwrap_or_default();
+                            if current_call.farcall.to == EVENT_WRITER_ADDRESS {
+                                let new_events: Vec<_> = state
+                                    .events()
+                                    .skip(current_call.events_at_call_start)
+                                    .collect();
+                                current_call.farcall.events = merge_events_to_vm_event(&new_events);
+                            }
                         }
                         ReturnType::Revert => {
                             current_call.farcall.revert_reason = Some(if let Some(output) = &output {
@@ -342,8 +499,10 @@ impl Tracer for EraCallTracer {
                         if current_call.farcall.storage_change {
                             parent_call.farcall.storage_change = true;
                         }
+                        current_call.farcall.pos_in_parent_trace = parent_call.farcall.calls.len();
                         parent_call.farcall.calls.push(current_call.farcall);
                     } else {
+                        current_call.farcall.pos_in_parent_trace = self.finished_calls.len();
                         self.finished_calls.push(current_call.farcall);
                     }
                 } else {
