@@ -58,8 +58,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
 pub(crate) trait ApiCore:
     ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
 {
-    /// Chain-specific omissions in the public Ethereum block response.
-    fn format_block_response(&self, _block: &BlockInfo, _value: &mut serde_json::Value) {}
 }
 
 pub(crate) trait ApiBase: Sync + Send + 'static {
@@ -80,9 +78,6 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 
 pub(crate) trait GasFeeHandler: Sync + Send + 'static {
     type Tx: TxSetter + TransactionTrait + Clone;
-
-    /// Apply native RPC estimation semantics before constructing the message.
-    fn prepare_estimate_request(&self, _request: &mut CallRequest) {}
 
     /// Resolve the chain's per-transaction gas cap at the requested execution
     /// block. Chains whose forks map to the same Ethereum spec can select their

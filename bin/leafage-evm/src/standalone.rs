@@ -1227,24 +1227,6 @@ mod chain_config_tests {
         assert!(parse(&[]).is_err());
         assert!(parse(&["--chain-cfg=42220", "--spec-id=18"]).is_err());
         assert!(parse(&["--chain-cfg=42220", "--evm-custom-config={}"]).is_ok());
-        assert!(matches!(
-            parse(&[
-                "--chain-cfg=42220",
-                r#"--evm-custom-config={"execution_mode":"l1"}"#
-            ])
-            .unwrap(),
-            MultiChainCfgEnv::Celo(CeloCfgEnv::L1(_))
-        ));
-        assert!(parse(&[
-            "--chain-cfg=42220",
-            r#"--evm-custom-config={"execution_mode":"classic"}"#
-        ])
-        .is_err());
-        assert!(parse(&[
-            "--chain-cfg=42220",
-            r#"--evm-custom-config={"execution_mod":"l1"}"#
-        ])
-        .is_err());
     }
 
     #[test]

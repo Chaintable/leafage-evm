@@ -97,13 +97,12 @@ where
             .into();
         match res {
             ExecutionResult::Success { output, .. } => Ok(output.into_data().0.into()),
-            ExecutionResult::Revert { output, .. } => Err(crate::error::rpc_err(
+            ExecutionResult::Revert { output, .. } => Err(rpc_error_with_code(
                 DebankErrorCode::EvmRevert as i32,
                 format!(
                     "Reverted: {:?}",
                     decode_revert_reason(&output).unwrap_or("execution revert".to_string())
                 ),
-                Some(&output),
             )),
             ExecutionResult::Halt { reason, gas, .. } => Err(rpc_error_with_code(
                 DebankErrorCode::from(reason.clone()) as i32,
@@ -400,9 +399,7 @@ where
             .get_block_by_id_arc(block_id)
             .map_err(|e| block_lookup_err(block_id, e))?
             .ok_or_else(|| self.block_unavailable_err(block_id))?;
-        let mut value =
-            serde_json::to_value(&block).map_err(|e| internal_rpc_err(e.to_string()))?;
-        self.inner.format_block_response(&block, &mut value);
+        let value = serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?;
         Ok(Some(value))
     }
 

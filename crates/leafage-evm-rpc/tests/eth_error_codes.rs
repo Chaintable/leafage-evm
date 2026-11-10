@@ -5,7 +5,7 @@
 
 use alloy::primitives::keccak256;
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
-use jsonrpsee::core::{client::ClientT, ClientError};
+use jsonrpsee::core::ClientError;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::server::ServerHandle;
 use leafage_evm_rpc::{ApiBuilder, EthApiClient, MultiChainCfgEnv};
@@ -23,10 +23,6 @@ use std::time::Duration;
 
 /// `PUSH1 0; PUSH1 0; REVERT`
 const REVERTER: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
-/// Return an arbitrary custom-error selector, without an ABI string reason.
-const CUSTOM_REVERTER: [u8; 13] = [
-    0x63, 0xde, 0xad, 0xbe, 0xef, 0x60, 0x00, 0x52, 0x60, 0x04, 0x60, 0x1c, 0xfd,
-];
 /// `INVALID`
 const INVALID: [u8; 1] = [0xfe];
 /// `JUMPDEST; PUSH1 0; JUMP`: loops until gas runs out.
@@ -59,7 +55,6 @@ fn open_tree(db_path: &PathBuf) -> Arc<StateTree<MultiStorage>> {
         (0x01, &REVERTER[..]),
         (0x02, &INVALID[..]),
         (0x03, &LOOP[..]),
-        (0x04, &CUSTOM_REVERTER[..]),
     ] {
         let code = Bytes::copy_from_slice(code);
         diff.new_codes.push(NewCode {
@@ -91,27 +86,14 @@ fn open_tree(db_path: &PathBuf) -> Arc<StateTree<MultiStorage>> {
 }
 
 async fn serve(tree: Arc<StateTree<MultiStorage>>, is_archive: bool) -> (ServerHandle, HttpClient) {
-    serve_chain(tree, is_archive, false).await
-}
-
-async fn serve_chain(
-    tree: Arc<StateTree<MultiStorage>>,
-    is_archive: bool,
-    celo: bool,
-) -> (ServerHandle, HttpClient) {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
     drop(socket);
     let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
     cfg.disable_balance_check = true;
     cfg.disable_base_fee = true;
-    cfg.chain_id = if celo { 42220 } else { 1 };
-    let config = if celo {
-        MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L1(cfg))
-    } else {
-        MultiChainCfgEnv::Mainnet(cfg)
-    };
-    let handle = ApiBuilder::new(tree, config)
+    cfg.chain_id = 1;
+    let handle = ApiBuilder::new(tree, MultiChainCfgEnv::Mainnet(cfg))
         .build_and_run(
             &addr.to_string(),
             100,
@@ -119,7 +101,7 @@ async fn serve_chain(
             is_archive,
             false,
             "eth-error-codes-test".to_string(),
-            if celo { 130 } else { 100 },
+            100,
             1024,
         )
         .await
@@ -128,48 +110,6 @@ async fn serve_chain(
         .build(format!("http://{addr}"))
         .unwrap();
     (handle, client)
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn legacy_celo_block_response_omits_ethereum_only_fields() {
-    let path =
-        std::env::temp_dir().join(format!("leafage-celo-block-fields-{}", std::process::id()));
-    let tree = open_tree(&path);
-    for celo in [false, true] {
-        let (handle, client) = serve_chain(tree.clone(), true, celo).await;
-        let value: serde_json::Value = client
-            .request("eth_getBlockByNumber", jsonrpsee::rpc_params!["0x1", false])
-            .await
-            .unwrap();
-        for key in ["nonce", "sha3Uncles", "mixHash", "uncles"] {
-            assert_eq!(value.get(key).is_none(), celo, "{key}: {value}");
-        }
-        assert_eq!(
-            value["hash"],
-            serde_json::to_value(H256::repeat_byte(0xbb)).unwrap()
-        );
-        if celo {
-            // Native estimation clears prices before converting the message,
-            // ignores gas below 21000, and applies its configured 1.3 padding.
-            let gas: U256 = client
-                .request(
-                    "estimateGas",
-                    jsonrpsee::rpc_params![
-                        serde_json::json!({
-                            "to":Address::repeat_byte(0x44),"gas":"0x1","gasPrice":"0x1",
-                            "maxFeePerGas":"0x2","maxPriorityFeePerGas":"0x3"
-                        }),
-                        serde_json::json!({"block_id":"0x1","type":"Equals"})
-                    ],
-                )
-                .await
-                .unwrap();
-            assert_eq!(gas, U256::from(27300));
-        }
-        handle.stop().unwrap();
-    }
-    drop(tree);
-    let _ = std::fs::remove_dir_all(path);
 }
 
 fn call_to(n: u8) -> CallRequest {
@@ -203,31 +143,10 @@ async fn eth_methods_use_debank_error_codes() {
     // eth_call execution failures.
     let revert = EthApiClient::call(&state, call_to(0x01), latest, None, None).await;
     match &revert {
-        Err(ClientError::Call(err)) => {
-            assert_eq!(err.message(), "Reverted: \"\"");
-            assert_eq!(err.data().map(|v| v.get()), Some("\"0x\""));
-        }
+        Err(ClientError::Call(err)) => assert_eq!(err.message(), "Reverted: \"\""),
         other => panic!("expected a revert error, got {other:?}"),
     }
     assert_eq!(error_code(revert), -39000);
-    // Preserve opaque revert bytes on both public call and custom estimateGas.
-    for method in ["eth_call", "estimateGas"] {
-        let context = if method == "eth_call" {
-            serde_json::json!("latest")
-        } else {
-            serde_json::json!({"block_id":"latest","type":"Equals"})
-        };
-        let result: Result<serde_json::Value, _> = state
-            .request(method, jsonrpsee::rpc_params![call_to(0x04), context])
-            .await;
-        match result {
-            Err(ClientError::Call(err)) => {
-                assert_eq!(err.code(), -39000);
-                assert_eq!(err.data().map(|v| v.get()), Some("\"0xdeadbeef\""));
-            }
-            other => panic!("expected custom revert bytes from {method}, got {other:?}"),
-        }
-    }
     let invalid = EthApiClient::call(&state, call_to(0x02), latest, None, None).await;
     assert_eq!(error_code(invalid), -39004);
     let out_of_gas = EthApiClient::call(&state, call_to(0x03), latest, None, None).await;

@@ -43,10 +43,6 @@ fn estimate_gas_limit_cap(
     consensus_cap.min(rpc_cap).min(block_gas_limit)
 }
 
-fn buffered_gas(gas: u64, percent: u64) -> u64 {
-    (u128::from(gas) * u128::from(percent.max(100)) / 100).min(u128::from(u64::MAX)) as u64
-}
-
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 
 pub const CALL_STIPEND_GAS: u64 = 2_300;
@@ -743,7 +739,11 @@ where
                 continue;
             }
             let res = self.debank_single_call_from_state_impl_inner(
-                &state, &block, &block_env, &db, request,
+                &state,
+                &block,
+                &block_env,
+                &db,
+                request,
             )?;
             if res.code != 0 {
                 stats.success = false;
@@ -1157,7 +1157,6 @@ where
         })?;
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
-        self.inner.prepare_estimate_request(&mut request);
         let mut block_env = block_env_from_block(&block);
         let mut cache_db = CacheDB::new(EvmStorageWrapper {
             db: state,
@@ -1226,11 +1225,7 @@ where
                                     .inner
                                     .estimate_l1_overhead(&block, &block_env, tx, &memory_db);
                                 return Ok(U256::from(
-                                    buffered_gas(
-                                        MIN_TRANSACTION_GAS,
-                                        self.inner.evm_cfg().estimate_gas_buffer,
-                                    )
-                                    .saturating_add(l1_overhead),
+                                    MIN_TRANSACTION_GAS.saturating_add(l1_overhead),
                                 ));
                             }
                         }
@@ -1263,10 +1258,9 @@ where
             ExecutionResult::Revert { output, .. } => {
                 let reason =
                     decode_revert_reason(&output).unwrap_or("execution revert".to_string());
-                return Err(crate::error::rpc_err(
+                return Err(rpc_error_with_code(
                     DebankErrorCode::EvmRevert as i32,
                     reason,
-                    Some(&output),
                 ));
             }
         };
@@ -1353,7 +1347,13 @@ where
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
-        let final_gas = buffered_gas(highest_gas_limit, self.inner.evm_cfg().estimate_gas_buffer);
+        let buffer = self.inner.evm_cfg().estimate_gas_buffer;
+        let final_gas = if buffer > 100 {
+            let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
+            buffered.min(u64::MAX as u128) as u64
+        } else {
+            highest_gas_limit
+        };
 
         tx.set_gas_limit(final_gas);
         let l1_overhead =

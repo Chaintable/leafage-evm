@@ -1,13 +1,16 @@
 //! Mainnet Celo before the L2 migration. The protocol reference is
 //! celo-blockchain/core/vm and celo-bls-snark-rs@eca15ffed3984601cb441600ba3002d12f339e5f.
 
+pub mod call;
 pub mod consensus;
 mod crypto;
+pub mod estimate;
 pub mod evm;
+mod fees;
 mod precompile;
 mod pure;
-#[cfg(test)]
-mod tests;
+mod system;
+pub mod tx;
 
 use super::{CELO_CHAIN_ID, L2_MIGRATION_BLOCK, MAX_CODE_SIZE};
 use leafage_evm_types::{BlockEnv, CfgEnv, MainnetSpecId};

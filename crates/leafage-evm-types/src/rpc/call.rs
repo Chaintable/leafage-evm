@@ -56,26 +56,6 @@ impl DerefMut for CallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn celo_fields_survive_rpc_round_trip_including_malformed_values() {
-        let input = serde_json::json!({
-            "feeCurrency":"0x1111111111111111111111111111111111111111",
-            "gatewayFeeRecipient":"0x2222222222222222222222222222222222222222",
-            "gatewayFee":"0x123", "maxFeeInFeeCurrency":"0x456", "ethCompatible":true,
-            "feeToken":"0x3333333333333333333333333333333333333333"
-        });
-        let request: CallRequest = serde_json::from_value(input.clone()).unwrap();
-        let output = serde_json::to_value(request).unwrap();
-        for (key, value) in input.as_object().unwrap() {
-            assert_eq!(&output[key], value, "{key}");
-        }
-        let input = serde_json::json!({"feeCurrency":"malformed"});
-        let request: CallRequest = serde_json::from_value(input).unwrap();
-        assert_eq!(
-            serde_json::to_value(request).unwrap()["feeCurrency"],
-            "malformed"
-        );
-    }
     use alloy::primitives::{Address, Bytes, U256};
 
     /// Parses a request, which never fails on Tempo fields, and returns the
@@ -171,16 +151,22 @@ mod tests {
         });
 
         let req: CallRequest = serde_json::from_value(json).expect("should deserialize");
-        let t = req
-            .tempo
-            .as_ref()
-            .expect("tempo extension should be present");
+        let t = req.tempo.as_ref().expect("tempo extension should be present");
         assert_eq!(t.nonce_key, Some(U256::from(1)));
         assert_eq!(t.key_type, Some("p256".to_string()));
         assert_eq!(t.key_data, Some(Bytes::from(vec![0xab, 0xcd])));
-        assert_eq!(t.key_id, Some(Address::with_last_byte(0x03)));
-        assert_eq!(t.fee_token, Some(Address::with_last_byte(0x04)));
-        assert_eq!(t.fee_payer, Some(Address::with_last_byte(0x05)));
+        assert_eq!(
+            t.key_id,
+            Some(Address::with_last_byte(0x03))
+        );
+        assert_eq!(
+            t.fee_token,
+            Some(Address::with_last_byte(0x04))
+        );
+        assert_eq!(
+            t.fee_payer,
+            Some(Address::with_last_byte(0x05))
+        );
         assert_eq!(t.valid_after, Some(1000));
         assert_eq!(t.valid_before, Some(2000));
         assert!(t.tempo_calls.is_some());
@@ -189,8 +175,14 @@ mod tests {
         let auth_list = t.tempo_authorization_list.as_ref().unwrap();
         assert_eq!(auth_list.len(), 1);
         assert!(auth_list[0].is_keychain);
-        assert_eq!(auth_list[0].authority, Some(Address::with_last_byte(0x06)));
-        assert_eq!(auth_list[0].address, Some(Address::with_last_byte(0x07)));
+        assert_eq!(
+            auth_list[0].authority,
+            Some(Address::with_last_byte(0x06))
+        );
+        assert_eq!(
+            auth_list[0].address,
+            Some(Address::with_last_byte(0x07))
+        );
         assert_eq!(auth_list[0].chain_id, Some(U256::from(1)));
     }
 
@@ -206,8 +198,7 @@ mod tests {
             "input": "0x"
         });
 
-        let req: CallRequest =
-            serde_json::from_value(json).expect("should deserialize standard request");
+        let req: CallRequest = serde_json::from_value(json).expect("should deserialize standard request");
         let t = req.tempo.unwrap_or_default();
         assert!(t.tempo_calls.is_none());
         assert!(t.nonce_key.is_none());

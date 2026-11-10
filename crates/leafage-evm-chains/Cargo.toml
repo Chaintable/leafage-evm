@@ -20,7 +20,7 @@ tempo-contracts.workspace = true
 tempo-hardfork.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-revm.workspace = true
+revm = { workspace = true, features = ["optional_fee_charge"] }
 op-revm.workspace = true
 leafage-evm-types.workspace = true
 once_cell.workspace = true
@@ -75,4 +75,3 @@ blake2s_simd = "1"
 
 [dev-dependencies]
 elliptic-curve.workspace = true
-flate2.workspace = true

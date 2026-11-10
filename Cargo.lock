@@ -5054,7 +5054,6 @@ dependencies = [
  "cometbft-proto",
  "ed25519-consensus",
  "elliptic-curve 0.13.8",
- "flate2",
  "k256",
  "leafage-evm-types",
  "libloading",

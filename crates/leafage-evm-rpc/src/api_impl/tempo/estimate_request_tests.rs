@@ -131,14 +131,11 @@ async fn formal_t11_rpc_uses_requested_timestamp_for_strict_abi() {
                     if must_revert {
                         // Both report -39000; the message formats still differ.
                         if method == "estimateGas" {
-                            assert_eq!(
-                                response["error"],
-                                json!({"code": -39000, "message": "", "data":"0x"})
-                            );
+                            assert_eq!(response["error"], json!({"code": -39000, "message": ""}));
                         } else {
                             assert_eq!(
                                 response["error"],
-                                json!({"code": -39000, "message": "Reverted: \"\"", "data":"0x"})
+                                json!({"code": -39000, "message": "Reverted: \"\""})
                             );
                         }
                     }

@@ -1,11 +1,11 @@
 //! Native Celo configuration and fee contract calls. Configuration queries use
 //! a separate journal after Espresso; fee debit/credit use the caller's journal.
-use alloy::primitives::{address, keccak256, Address, Bytes, U256, U512};
-use leafage_evm_chains::celo::l1::{
+use super::{
     consensus::CeloChainData,
     evm::{system_call_result, CeloL1Context},
     L1Fork,
 };
+use alloy::primitives::{address, keccak256, Address, Bytes, U256, U512};
 use revm::{interpreter::InterpreterResult, Database};
 
 pub(super) fn abi(method: &str, args: &[U256]) -> Bytes {

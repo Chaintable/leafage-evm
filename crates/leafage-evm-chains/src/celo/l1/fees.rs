@@ -1,12 +1,12 @@
 use super::{
+    evm::{CeloL1Context, CeloL1Evm},
+    L1Fork,
+};
+use super::{
     system::{abi, word, System},
     tx::CeloCallTx,
 };
 use alloy::primitives::U256;
-use leafage_evm_chains::celo::l1::{
-    evm::{CeloL1Context, CeloL1Evm},
-    L1Fork,
-};
 use revm::primitives::{AddressMap, HashSet};
 use revm::{
     context_interface::{
