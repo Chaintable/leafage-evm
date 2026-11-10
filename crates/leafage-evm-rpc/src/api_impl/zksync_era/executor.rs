@@ -69,7 +69,6 @@ pub struct EraStorageWorld<DB> {
     program_cache: HashMap<U256, Program<(), Self>>,
     precompiles: EraPrecompiles,
     expected_caller: Option<H160>,
-    system_context_overrides: HashMap<U256, U256>,
 }
 
 impl<DB: DatabaseRef> EraStorageWorld<DB> {
@@ -79,17 +78,12 @@ impl<DB: DatabaseRef> EraStorageWorld<DB> {
             program_cache: HashMap::new(),
             precompiles: EraPrecompiles::default(),
             expected_caller: None,
-            system_context_overrides: HashMap::new(),
         }
     }
 
     pub fn set_expected_caller(&mut self, caller: H160) {
         self.expected_caller = Some(caller);
         self.precompiles.expected_caller = Some(caller);
-    }
-
-    pub fn set_system_context_override(&mut self, key: U256, value: U256) {
-        self.system_context_overrides.insert(key, value);
     }
 }
 
@@ -102,13 +96,7 @@ impl<DB: DatabaseRef> StorageInterface for EraStorageWorld<DB> {
     }
 
     fn read_storage_value(&mut self, contract: H160, key: U256) -> U256 {
-        use super::bootloader::constants::{L2_BASE_TOKEN_ADDRESS, SYSTEM_CONTEXT_ADDRESS};
-        if contract == SYSTEM_CONTEXT_ADDRESS {
-            if let Some(val) = self.system_context_overrides.get(&key) {
-                return *val;
-            }
-        }
-
+        use super::bootloader::constants::L2_BASE_TOKEN_ADDRESS;
         let address = Address::from_slice(contract.as_bytes());
         let mut key_bytes = [0u8; 32];
         key.to_big_endian(&mut key_bytes);
@@ -289,7 +277,7 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     value: AlloyU256,
     block_number: u64,
     block_timestamp: u64,
-    _block_hash: Option<alloy::primitives::B256>,
+    block_hash: Option<alloy::primitives::B256>,
     base_fee: u64,
     gas_per_pubdata_byte: u64,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -334,25 +322,13 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
             ]),
         )
     } else {
-        use tiny_keccak::{Hasher, Keccak};
-        let prev_num = (block_number - 1) as u128;
-        let prev_ts = (block_timestamp.saturating_sub(1)) as u128;
-
-        let mut digest = [0u8; 128];
-        primitive_types::U256::from(prev_num).to_big_endian(&mut digest[0..32]);
-        primitive_types::U256::from(prev_ts).to_big_endian(&mut digest[32..64]);
-        // digest[64..96] is 0 (prev_l2_hash)
-        // digest[96..128] is 0 (rolling_hash)
-
-        let mut hasher = Keccak::v256();
-        hasher.update(&digest);
-        let mut expected_hash = [0u8; 32];
-        hasher.finalize(&mut expected_hash);
-
+        let prev_hash = block_hash
+            .map(|h| primitive_types::H256::from_slice(h.as_slice()))
+            .unwrap_or(primitive_types::H256::zero());
         (
-            block_number,
-            block_timestamp,
-            primitive_types::H256(expected_hash),
+            block_number + 1,
+            block_timestamp + 1,
+            prev_hash,
         )
     };
 
@@ -976,20 +952,21 @@ mod tests {
 
         // Also test with SystemContext slots populated
         let sys_ctx = address!("000000000000000000000000000000000000800b");
-        let s9_num: u128 = 72824372;
-        let s9_ts: u128 = 1794283702;
+        let s9_num: u128 = 72824832;
+        let s9_ts: u128 = 1794287363;
         let mut s9_bytes = [0u8; 32];
         s9_bytes[0..16].copy_from_slice(&s9_num.to_be_bytes());
         s9_bytes[16..32].copy_from_slice(&s9_ts.to_be_bytes());
         db.insert_account_storage(sys_ctx, AlloyU256::from(9), AlloyU256::from_be_bytes(s9_bytes)).unwrap();
 
-        let rolling_bytes: [u8; 32] = hex::decode("6ebb9d437ddaf610f297836e7ce5d32006f93a9e8d39003a589c806b1c4f42d6").unwrap().try_into().unwrap();
+        let rolling_bytes: [u8; 32] = hex::decode("742e22f5e6d6372604862a24a41cdabc64d805026a931e1d7d719034155cd05e").unwrap().try_into().unwrap();
         db.insert_account_storage(sys_ctx, AlloyU256::from(10), AlloyU256::from_be_bytes(rolling_bytes)).unwrap();
 
-        let prev_hash_bytes: [u8; 32] = hex::decode("75bf8b3b007b9089629d773691c559e6c870fa0d0775ccd1ef7cd1b79ec5eca6").unwrap().try_into().unwrap();
+        let prev_hash_bytes: [u8; 32] = hex::decode("398bd317b9b323edcb68748d800b855e2e5f5fc323621ebfd7a257490d0f8a25").unwrap().try_into().unwrap();
         let prev_slot = 11 + (s9_num - 1) % 257;
         db.insert_account_storage(sys_ctx, AlloyU256::from(prev_slot), AlloyU256::from_be_bytes(prev_hash_bytes)).unwrap();
 
+        let prev_block_hash = b256!("f953da6fb9bb8a31f816c4f6ff1e52d7cc3dbf58e2a6706a6fd4c515db8af858");
         let gas_estimate_with_ctx = estimate_era_gas(
             &db,
             caller,
@@ -998,7 +975,7 @@ mod tests {
             AlloyU256::ZERO,
             72824832,
             1794287363,
-            None,
+            Some(prev_block_hash),
             250_000_000,
             800,
             cancel_token,
