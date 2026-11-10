@@ -91,9 +91,10 @@ impl<DB: DatabaseRef> EraStorageWorld<DB> {
 
 impl<DB: DatabaseRef> StorageInterface for EraStorageWorld<DB> {
     fn read_storage(&mut self, contract: H160, key: U256) -> StorageSlot {
+        let value = self.read_storage_value(contract, key);
         StorageSlot {
-            value: self.read_storage_value(contract, key),
-            is_write_initial: false,
+            value,
+            is_write_initial: value.is_zero(),
         }
     }
 
@@ -408,18 +409,29 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
         _ => U256::zero(),
     };
 
+    let should_deploy_contract = if to_h160.is_none() {
+        U256::one()
+    } else {
+        U256::zero()
+    };
+
     let tx = TransactionData {
-        tx_type: EIP_712_TX_TYPE,
+        tx_type: 0,
         from: caller_h160,
         to: to_h160,
         gas_limit: U256::from(MAX_L2_TX_GAS_LIMIT),
         pubdata_price_limit: U256::from(MAX_GAS_PER_PUBDATA_BYTE),
         max_fee_per_gas: U256::from(base_fee),
-        max_priority_fee_per_gas: U256::zero(),
+        max_priority_fee_per_gas: U256::from(base_fee),
         paymaster: H160::zero(),
         nonce,
         value: value_u256,
-        reserved: [U256::zero(); 4],
+        reserved: [
+            U256::zero(),
+            should_deploy_contract,
+            U256::zero(),
+            U256::zero(),
+        ],
         data: data.to_vec(),
         signature,
         factory_deps: Vec::new(),
