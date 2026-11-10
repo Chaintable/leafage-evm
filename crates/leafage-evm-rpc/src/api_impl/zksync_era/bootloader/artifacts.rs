@@ -1,6 +1,7 @@
 use primitive_types::U256;
 
 pub const FEE_ESTIMATE_BYTECODE: &[u8] = include_bytes!("artifacts/fee_estimate.yul.zbin");
+pub const PLAYGROUND_BATCH_BYTECODE: &[u8] = include_bytes!("artifacts/playground_batch.yul.zbin");
 pub const DEFAULT_AA_BYTECODE: &[u8] = include_bytes!("artifacts/default_aa.bin");
 pub const EVM_EMULATOR_BYTECODE: &[u8] = include_bytes!("artifacts/evm_emulator.bin");
 
@@ -22,6 +23,12 @@ pub const FEE_ESTIMATE_CODE_HASH: [u8; 32] = [
     0x24, 0x2a,
 ];
 
+pub const PLAYGROUND_BATCH_CODE_HASH: [u8; 32] = [
+    0x01, 0x01, 0x0a, 0x31, 0xde, 0x8d, 0x26, 0x23, 0x29, 0x70, 0xdf, 0x6c, 0x93, 0xf0, 0x65,
+    0x9d, 0xf5, 0xa9, 0x17, 0xb8, 0xc8, 0x9c, 0x18, 0x12, 0x39, 0x6b, 0xaa, 0x80, 0xfc, 0x44,
+    0xe9, 0x46,
+];
+
 pub fn default_aa_hash_u256() -> U256 {
     U256::from_big_endian(&DEFAULT_AA_CODE_HASH)
 }
@@ -32,6 +39,10 @@ pub fn evm_emulator_hash_u256() -> U256 {
 
 pub fn fee_estimate_hash_u256() -> U256 {
     U256::from_big_endian(&FEE_ESTIMATE_CODE_HASH)
+}
+
+pub fn playground_batch_hash_u256() -> U256 {
+    U256::from_big_endian(&PLAYGROUND_BATCH_CODE_HASH)
 }
 
 pub fn compute_bytecode_hash(code: &[u8], is_constructor: bool) -> [u8; 32] {
@@ -62,6 +73,9 @@ mod tests {
 
         let computed_bootloader = compute_bytecode_hash(FEE_ESTIMATE_BYTECODE, true);
         assert_eq!(computed_bootloader, FEE_ESTIMATE_CODE_HASH);
+
+        let computed_playground = compute_bytecode_hash(PLAYGROUND_BATCH_BYTECODE, true);
+        assert_eq!(computed_playground, PLAYGROUND_BATCH_CODE_HASH);
 
         let computed_evm_emulator = compute_bytecode_hash(EVM_EMULATOR_BYTECODE, false);
         assert_eq!(computed_evm_emulator, EVM_EMULATOR_CODE_HASH);

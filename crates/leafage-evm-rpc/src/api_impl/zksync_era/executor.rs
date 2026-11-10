@@ -66,20 +66,22 @@ impl Precompiles for EraPrecompiles {
     }
 }
 
-pub struct EraStorageWorld<DB> {
+pub struct EraStorageWorld<DB, T = ()> {
     db: DB,
-    program_cache: HashMap<U256, Program<(), Self>>,
+    program_cache: HashMap<U256, Program<T, Self>>,
     precompiles: EraPrecompiles,
     expected_caller: Option<H160>,
+    add_caller_balance: bool,
 }
 
-impl<DB: DatabaseRef> EraStorageWorld<DB> {
+impl<DB: DatabaseRef, T> EraStorageWorld<DB, T> {
     pub fn new(db: DB) -> Self {
         Self {
             db,
             program_cache: HashMap::new(),
             precompiles: EraPrecompiles::default(),
             expected_caller: None,
+            add_caller_balance: true,
         }
     }
 
@@ -87,9 +89,13 @@ impl<DB: DatabaseRef> EraStorageWorld<DB> {
         self.expected_caller = Some(caller);
         self.precompiles.expected_caller = Some(caller);
     }
+
+    pub fn set_add_caller_balance(&mut self, add: bool) {
+        self.add_caller_balance = add;
+    }
 }
 
-impl<DB: DatabaseRef> StorageInterface for EraStorageWorld<DB> {
+impl<DB: DatabaseRef, T> StorageInterface for EraStorageWorld<DB, T> {
     fn read_storage(&mut self, contract: H160, key: U256) -> StorageSlot {
         let value = self.read_storage_value(contract, key);
         StorageSlot {
@@ -113,7 +119,7 @@ impl<DB: DatabaseRef> StorageInterface for EraStorageWorld<DB> {
             Err(_) => U256::zero(),
         };
 
-        if contract == L2_BASE_TOKEN_ADDRESS {
+        if contract == L2_BASE_TOKEN_ADDRESS && self.add_caller_balance {
             if let Some(caller) = self.expected_caller {
                 if key == super::bootloader::constants::eth_balance_storage_key(caller) {
                     return val.saturating_add(U256::from(10u128.pow(25)));
@@ -146,8 +152,8 @@ impl<DB: DatabaseRef> StorageInterface for EraStorageWorld<DB> {
     }
 }
 
-impl<DB: DatabaseRef> World<()> for EraStorageWorld<DB> {
-    fn decommit(&mut self, hash: U256) -> Program<(), Self> {
+impl<DB: DatabaseRef, T: zksync_vm2::interface::Tracer> World<T> for EraStorageWorld<DB, T> {
+    fn decommit(&mut self, hash: U256) -> Program<T, Self> {
         if let Some(prog) = self.program_cache.get(&hash) {
             return prog.clone();
         }
@@ -160,10 +166,14 @@ impl<DB: DatabaseRef> World<()> for EraStorageWorld<DB> {
     fn decommit_code(&mut self, hash: U256) -> Vec<u8> {
         use super::bootloader::artifacts::{
             default_aa_hash_u256, evm_emulator_hash_u256, fee_estimate_hash_u256,
-            DEFAULT_AA_BYTECODE, EVM_EMULATOR_BYTECODE, FEE_ESTIMATE_BYTECODE,
+            playground_batch_hash_u256, DEFAULT_AA_BYTECODE, EVM_EMULATOR_BYTECODE,
+            FEE_ESTIMATE_BYTECODE, PLAYGROUND_BATCH_BYTECODE,
         };
         if hash == fee_estimate_hash_u256() {
             return FEE_ESTIMATE_BYTECODE.to_vec();
+        }
+        if hash == playground_batch_hash_u256() {
+            return PLAYGROUND_BATCH_BYTECODE.to_vec();
         }
         if hash == default_aa_hash_u256() {
             return DEFAULT_AA_BYTECODE.to_vec();
@@ -450,6 +460,364 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     );
 
     estimator.estimate()
+}
+
+pub struct SimulateEraTransactionResult {
+    pub single_result: leafage_evm_types::DebankSingleSimulateResult,
+    pub storage_changes: Vec<((H160, U256), U256)>,
+}
+
+pub fn simulate_era_transaction<DB: DatabaseRef>(
+    db: DB,
+    caller: Address,
+    to: Option<Address>,
+    data: &[u8],
+    value: AlloyU256,
+    gas_limit: Option<u64>,
+    nonce: Option<u64>,
+    transaction_type: Option<u8>,
+    max_fee_per_gas: Option<u128>,
+    gas_price: Option<u128>,
+    block_number: u64,
+    block_timestamp: u64,
+    prev_block_hash: primitive_types::H256,
+    base_fee: u64,
+    gas_per_pubdata_byte: u64,
+    settlement_layer: u64,
+    tx_hash: alloy::primitives::B256,
+    _cancel_token: tokio_util::sync::CancellationToken,
+) -> Result<SimulateEraTransactionResult, String> {
+    use super::bootloader::{
+        artifacts,
+        constants::{
+            BATCH_COMPUTATIONAL_GAS_LIMIT, BOOTLOADER_ADDRESS, INITIAL_FRAME_FORMAL_EH_LOCATION,
+            MAX_GAS_PER_PUBDATA_BYTE, MAX_L2_TX_GAS_LIMIT, VM_HOOK_ADDRESS,
+            RESULT_SUCCESS_FIRST_SLOT, VM_HOOK_PARAMS_START_POSITION,
+        },
+        hook::VmHook,
+        layout::{self, BootloaderEnv, TxExecutionMode},
+        tracer::{
+            add_trace_log, decode_vm_revert_reason, effective_failed, set_parent_failed,
+            to_debank_trace, to_hash, Call, CallType, EraCallTracer,
+        },
+        TransactionData,
+    };
+    use zksync_vm2::interface::{CallframeInterface, CallingMode, HeapId, StateInterface};
+    use zksync_vm2::{ExecutionEnd, FatPointer, Program, Settings, VirtualMachine};
+
+    let caller_h160 = H160::from_slice(caller.as_slice());
+    let to_h160 = to.map(|a| H160::from_slice(a.as_slice()));
+    let val_bytes = value.to_be_bytes::<32>();
+    let value_u256 = U256::from_big_endian(&val_bytes);
+
+    let fair_l2_gas_price = base_fee;
+    let fair_pubdata_price = gas_per_pubdata_byte * fair_l2_gas_price;
+
+    let enforced_base_fee = max_fee_per_gas
+        .or(gas_price)
+        .and_then(|f| if f == 0 { None } else { Some(f as u64) })
+        .unwrap_or(base_fee);
+
+    let env = BootloaderEnv {
+        block_number,
+        block_timestamp,
+        prev_block_hash,
+        fee_account: BOOTLOADER_ADDRESS,
+        fair_pubdata_price,
+        fair_l2_gas_price,
+        base_fee: enforced_base_fee,
+        execution_mode: TxExecutionMode::EthCall,
+    };
+
+    let tx_type = match transaction_type {
+        Some(113) => 113,
+        Some(2) => 2,
+        Some(1) => 1,
+        _ => 0,
+    };
+
+    let fee_per_gas_u256 = max_fee_per_gas
+        .or(gas_price)
+        .map(U256::from)
+        .unwrap_or_else(|| U256::from(base_fee));
+
+    let gas_limit_u256 = gas_limit
+        .map(U256::from)
+        .unwrap_or_else(|| U256::from(1u64 << 50));
+
+    let trusted_gas_limit = U256::from(MAX_L2_TX_GAS_LIMIT).min(gas_limit_u256);
+
+    let nonce_u256 = nonce
+        .map(U256::from)
+        .unwrap_or_else(|| match db.basic_ref(caller) {
+            Ok(Some(account)) => U256::from(account.nonce),
+            _ => U256::zero(),
+        });
+
+    let should_deploy_contract = if to_h160.is_none() {
+        U256::one()
+    } else {
+        U256::zero()
+    };
+
+    let signature = {
+        let mut sig = vec![0u8; 65];
+        sig[64] = 27;
+        sig
+    };
+
+    let tx = TransactionData {
+        tx_type,
+        from: caller_h160,
+        to: to_h160,
+        gas_limit: gas_limit_u256,
+        pubdata_price_limit: U256::from(MAX_GAS_PER_PUBDATA_BYTE),
+        max_fee_per_gas: fee_per_gas_u256,
+        max_priority_fee_per_gas: fee_per_gas_u256,
+        paymaster: H160::zero(),
+        nonce: nonce_u256,
+        value: value_u256,
+        reserved: [
+            U256::zero(),
+            should_deploy_contract,
+            U256::zero(),
+            U256::zero(),
+        ],
+        data: data.to_vec(),
+        signature,
+        factory_deps: Vec::new(),
+        paymaster_input: Vec::new(),
+        reserved_dynamic: Vec::new(),
+    };
+
+    let mut world = EraStorageWorld::new(db);
+    world.set_expected_caller(caller_h160);
+    world.set_add_caller_balance(false);
+
+    let bootloader_code = artifacts::PLAYGROUND_BATCH_BYTECODE;
+    let bootloader_program = Program::new(bootloader_code, true);
+    let bootloader_gas = BATCH_COMPUTATIONAL_GAS_LIMIT;
+
+    let settings = Settings {
+        default_aa_code_hash: artifacts::DEFAULT_AA_CODE_HASH,
+        evm_interpreter_code_hash: artifacts::EVM_EMULATOR_CODE_HASH,
+        hook_address: VM_HOOK_ADDRESS,
+    };
+
+    let mut vm = VirtualMachine::new(
+        BOOTLOADER_ADDRESS,
+        bootloader_program,
+        H160::zero(),
+        &[],
+        bootloader_gas,
+        settings,
+    );
+
+    vm.current_frame().set_stack_pointer(0);
+    vm.current_frame().set_heap_bound(u32::MAX);
+    vm.current_frame().set_aux_heap_bound(u32::MAX);
+    vm.current_frame().set_exception_handler(INITIAL_FRAME_FORMAL_EH_LOCATION);
+
+    let memory = layout::build_playground_bootloader_memory(
+        &tx,
+        &env,
+        trusted_gas_limit,
+        settlement_layer,
+    );
+    for (slot, val) in memory {
+        let start_addr = (slot as u32) * 32;
+        vm.write_heap_u256(HeapId::FIRST, start_addr, val);
+    }
+
+    let bootloader_hash = artifacts::playground_batch_hash_u256();
+    let mut tracer = EraCallTracer::default();
+    vm.manually_decommit(&mut world, &mut tracer, bootloader_hash);
+
+    let mut last_tx_result: Option<ExecutionResult<HaltReason>> = None;
+
+    let read_heap_word = |vm: &VirtualMachine<_, _>, slot: usize| -> U256 {
+        vm.read_heap_u256(HeapId::FIRST, (slot as u32) * 32)
+    };
+
+    let read_bytes_from_heap = |vm: &VirtualMachine<_, _>, fp: FatPointer| -> Vec<u8> {
+        if fp.offset > fp.length {
+            return Vec::new();
+        }
+        (fp.start + fp.offset..fp.start + fp.length)
+            .map(|addr| vm.read_heap_byte(fp.memory_page, addr))
+            .collect()
+    };
+
+    let execution_result = loop {
+        match vm.run(&mut world, &mut tracer) {
+            ExecutionEnd::SuspendedOnHook(raw_hook) => {
+                let hook = VmHook::from_raw(raw_hook);
+                match hook {
+                    VmHook::PostResult => {
+                        let result_param =
+                            read_heap_word(&vm, VM_HOOK_PARAMS_START_POSITION as usize);
+                        let result_success = !result_param.is_zero();
+                        let value =
+                            read_heap_word(&vm, (VM_HOOK_PARAMS_START_POSITION + 1) as usize);
+                        let fp = FatPointer::from(value);
+                        let return_data = read_bytes_from_heap(&vm, fp);
+
+                        last_tx_result = Some(if result_success {
+                            ExecutionResult::Success {
+                                reason: SuccessReason::Return,
+                                gas: ResultGas::default(),
+                                logs: vec![],
+                                output: Output::Call(Bytes::from(return_data)),
+                            }
+                        } else {
+                            ExecutionResult::Revert {
+                                gas: ResultGas::default(),
+                                logs: vec![],
+                                output: Bytes::from(return_data),
+                            }
+                        });
+                    }
+                    VmHook::TxHasEnded => {
+                        let res = last_tx_result.take().unwrap_or_else(|| {
+                            let tx_success =
+                                !read_heap_word(&vm, RESULT_SUCCESS_FIRST_SLOT as usize).is_zero();
+                            if tx_success {
+                                ExecutionResult::Success {
+                                    reason: SuccessReason::Return,
+                                    gas: ResultGas::default(),
+                                    logs: vec![],
+                                    output: Output::Call(Bytes::new()),
+                                }
+                            } else {
+                                ExecutionResult::Revert {
+                                    gas: ResultGas::default(),
+                                    logs: vec![],
+                                    output: Bytes::new(),
+                                }
+                            }
+                        });
+                        break res;
+                    }
+                    _ => {}
+                }
+            }
+            ExecutionEnd::ProgramFinished(out) => {
+                break ExecutionResult::Success {
+                    reason: SuccessReason::Return,
+                    gas: ResultGas::default(),
+                    logs: vec![],
+                    output: Output::Call(Bytes::from(out)),
+                };
+            }
+            ExecutionEnd::Reverted(out) => {
+                break ExecutionResult::Revert {
+                    gas: ResultGas::default(),
+                    logs: vec![],
+                    output: Bytes::from(out),
+                };
+            }
+            ExecutionEnd::Panicked => {
+                break ExecutionResult::Halt {
+                    reason: HaltReason::OpcodeNotFound,
+                    gas: ResultGas::default().with_total_gas_spent(gas_limit_u256.as_u64()),
+                    logs: vec![],
+                };
+            }
+            ExecutionEnd::StoppedByTracer => {
+                break ExecutionResult::Halt {
+                    reason: HaltReason::PrecompileError,
+                    gas: ResultGas::default().with_total_gas_spent(gas_limit_u256.as_u64()),
+                    logs: vec![],
+                };
+            }
+        }
+    };
+
+    let gas_remaining = vm.current_frame().gas();
+    let computational_gas_used = (bootloader_gas as u64).saturating_sub(gas_remaining as u64);
+
+    let (output_bytes, revert_reason, error_info) = match &execution_result {
+        ExecutionResult::Success { output, .. } => (output.clone().into_data().to_vec(), None, None),
+        ExecutionResult::Revert { output, .. } => {
+            let msg = decode_vm_revert_reason(output.as_ref());
+            (vec![], Some(msg.clone()), Some((1002, msg)))
+        }
+        ExecutionResult::Halt { reason, .. } => {
+            (vec![], None, Some((1000, format!("{:?}", reason))))
+        }
+    };
+
+    if let Some((code, err)) = error_info {
+        return Ok(SimulateEraTransactionResult {
+            single_result: leafage_evm_types::DebankSingleSimulateResult {
+                traces: Vec::new(),
+                events: Vec::new(),
+                error_traces: Some(Vec::new()),
+                error_events: Some(Vec::new()),
+                code,
+                err,
+                gas_used: computational_gas_used,
+            },
+            storage_changes: Vec::new(),
+        });
+    }
+
+    let storage_changes: Vec<((H160, U256), U256)> = vm
+        .world_diff()
+        .get_storage_changes()
+        .map(|(k, v)| (k, v.after))
+        .collect();
+
+    let mut first_call = Call {
+        r#type: CallType::Call(CallingMode::Normal),
+        from: H160::zero(),
+        to: BOOTLOADER_ADDRESS,
+        gas: tx.gas_limit.as_u64(),
+        gas_used: computational_gas_used,
+        value: tx.value,
+        input: tx.data.clone(),
+        output: output_bytes,
+        revert_reason,
+        calls: tracer.finished_calls,
+        ..Default::default()
+    };
+
+    first_call.trace_id = to_hash(&[&tx_hash.to_string(), "", "0"]);
+    for (idx, subcall) in first_call.calls.iter_mut().enumerate() {
+        subcall.pos_in_parent_trace = idx;
+    }
+
+    set_parent_failed(&mut first_call, false);
+
+    let root_trace = to_debank_trace(&first_call, tx_hash, vec![]);
+    let mut traces = Vec::new();
+    let mut error_traces = Vec::new();
+    if effective_failed(&first_call) {
+        error_traces.push(root_trace);
+    } else {
+        traces.push(root_trace);
+    }
+
+    add_trace_log(
+        tx_hash,
+        &mut traces,
+        &mut error_traces,
+        vec![],
+        &mut first_call,
+    );
+
+    Ok(SimulateEraTransactionResult {
+        single_result: leafage_evm_types::DebankSingleSimulateResult {
+            traces,
+            events: Vec::new(),
+            error_traces: Some(error_traces),
+            error_events: Some(Vec::new()),
+            code: 0,
+            err: String::new(),
+            gas_used: computational_gas_used,
+        },
+        storage_changes,
+    })
 }
 
 #[cfg(test)]

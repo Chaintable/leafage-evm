@@ -1058,6 +1058,240 @@ where
         }
         let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
+
+        if self.inner.evm_cfg().zksync_era {
+            let sys_ctx = Address::from_slice(
+                super::zksync_era::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes(),
+            );
+            let s271: u64 = memory_db
+                .storage_ref(sys_ctx, alloy::primitives::U256::from(271))
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(0);
+            let gas_per_pubdata_byte = if s271 > 0 {
+                s271
+            } else {
+                super::zksync_era::bootloader::constants::DEFAULT_GAS_PER_PUBDATA
+            };
+
+            let s6: u64 = memory_db
+                .storage_ref(sys_ctx, alloy::primitives::U256::from(6))
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(0);
+            let base_fee = if s6 > 0 {
+                s6
+            } else {
+                super::zksync_era::bootloader::constants::DEFAULT_L2_BASE_FEE
+            };
+
+            let s273: u64 = memory_db
+                .storage_ref(sys_ctx, alloy::primitives::U256::from(273))
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(1);
+            let settlement_layer = if s273 > 0 { s273 } else { 1 };
+
+            // Determine previous block values for resetting 0x800b slots 9 and 10
+            let prev_block_state = if block.header.number > 0 {
+                self.inner
+                    .db()
+                    .state_at(BlockId::Number(BlockNumberOrTag::Number(
+                        block.header.number - 1,
+                    )))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            let (reset_slot9, reset_slot10, sim_block_num, sim_block_ts, prev_block_hash) =
+                if let Some(prev_state) = prev_block_state {
+                    let prev_wrap = self.inner.wrap_storage(prev_state);
+                    let p_slot9 = prev_wrap
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(9))
+                        .unwrap_or_default();
+                    let p_slot10 = prev_wrap
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(10))
+                        .unwrap_or_default();
+
+                    let p9_bytes = p_slot9.to_be_bytes::<32>();
+                    let p_num = u128::from_be_bytes(p9_bytes[0..16].try_into().unwrap());
+                    let p_ts = u128::from_be_bytes(p9_bytes[16..32].try_into().unwrap());
+
+                    let p_slot = 11 + (p_num.saturating_sub(1) % 257);
+                    let p_l2_hash = prev_wrap
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(p_slot))
+                        .unwrap_or_default();
+
+                    use tiny_keccak::{Hasher, Keccak};
+                    let mut digest = [0u8; 128];
+                    primitive_types::U256::from(p_num).to_big_endian(&mut digest[0..32]);
+                    primitive_types::U256::from(p_ts).to_big_endian(&mut digest[32..64]);
+                    digest[64..96].copy_from_slice(&p_l2_hash.to_be_bytes::<32>());
+                    digest[96..128].copy_from_slice(&p_slot10.to_be_bytes::<32>());
+
+                    let mut hasher = Keccak::v256();
+                    hasher.update(&digest);
+                    let mut expected_hash = [0u8; 32];
+                    hasher.finalize(&mut expected_hash);
+
+                    (
+                        p_slot9,
+                        p_slot10,
+                        block.header.number,
+                        block.header.timestamp,
+                        primitive_types::H256(expected_hash),
+                    )
+                } else {
+                    // Fallback if previous block state is not available
+                    let cur_slot9 = memory_db
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(9))
+                        .unwrap_or_default();
+                    let cur_s9_bytes = cur_slot9.to_be_bytes::<32>();
+                    let c_num = u128::from_be_bytes(cur_s9_bytes[0..16].try_into().unwrap());
+                    let c_ts = u128::from_be_bytes(cur_s9_bytes[16..32].try_into().unwrap());
+
+                    let (b_num, b_ts, p_hash) = if c_num > 0 {
+                        use tiny_keccak::{Hasher, Keccak};
+                        let rolling_hash = memory_db
+                            .storage_ref(sys_ctx, alloy::primitives::U256::from(10))
+                            .unwrap_or_default();
+                        let prev_slot = 11 + (c_num.saturating_sub(1) % 257);
+                        let prev_l2_hash = memory_db
+                            .storage_ref(sys_ctx, alloy::primitives::U256::from(prev_slot))
+                            .unwrap_or_default();
+
+                        let mut digest = [0u8; 128];
+                        primitive_types::U256::from(c_num).to_big_endian(&mut digest[0..32]);
+                        primitive_types::U256::from(c_ts).to_big_endian(&mut digest[32..64]);
+                        digest[64..96].copy_from_slice(&prev_l2_hash.to_be_bytes::<32>());
+                        digest[96..128].copy_from_slice(&rolling_hash.to_be_bytes::<32>());
+
+                        let mut hasher = Keccak::v256();
+                        hasher.update(&digest);
+                        let mut expected_hash = [0u8; 32];
+                        hasher.finalize(&mut expected_hash);
+
+                        (
+                            (c_num + 1) as u64,
+                            (c_ts + 1) as u64,
+                            primitive_types::H256(expected_hash),
+                        )
+                    } else {
+                        (
+                            block.header.number,
+                            block.header.timestamp,
+                            primitive_types::H256::zero(),
+                        )
+                    };
+                    (
+                        cur_slot9,
+                        memory_db
+                            .storage_ref(sys_ctx, alloy::primitives::U256::from(10))
+                            .unwrap_or_default(),
+                        b_num,
+                        b_ts,
+                        p_hash,
+                    )
+                };
+
+            for req in txs {
+                if cancel_token.is_cancelled() {
+                    return Err(internal_rpc_err(
+                        "simulate transactions cancelled by caller".to_string(),
+                    ));
+                }
+
+                if let Some(last_res) = results.last() {
+                    if last_res.code != 0 {
+                        results.push(last_res.clone());
+                        continue;
+                    }
+                }
+
+                // Reset SystemContext slots 9 and 10 in memory_db
+                let _ = memory_db.insert_account_storage(
+                    sys_ctx,
+                    alloy::primitives::U256::from(9),
+                    reset_slot9,
+                );
+                let _ = memory_db.insert_account_storage(
+                    sys_ctx,
+                    alloy::primitives::U256::from(10),
+                    reset_slot10,
+                );
+
+                let caller = req.from.unwrap_or_else(|| Address::repeat_byte(0x11));
+                let to = match req.to {
+                    Some(alloy::primitives::TxKind::Call(addr)) => Some(addr),
+                    _ => None,
+                };
+                let data = req.input.clone().into_input().unwrap_or_default();
+                let value = req.value.unwrap_or_default();
+                let gas_limit = req.gas;
+                let nonce = req.nonce;
+                let transaction_type = req.transaction_type;
+                let max_fee_per_gas = req.max_fee_per_gas;
+                let gas_price = req.gas_price;
+                let tx_hash = alloy::primitives::B256::random();
+
+                let sim_res = super::zksync_era::simulate_era_transaction(
+                    &memory_db,
+                    caller,
+                    to,
+                    &data,
+                    value,
+                    gas_limit,
+                    nonce,
+                    transaction_type,
+                    max_fee_per_gas,
+                    gas_price,
+                    sim_block_num,
+                    sim_block_ts,
+                    prev_block_hash,
+                    base_fee,
+                    gas_per_pubdata_byte,
+                    settlement_layer,
+                    tx_hash,
+                    cancel_token.clone(),
+                );
+
+                match sim_res {
+                    Ok(out) => {
+                        if out.single_result.code != 0 {
+                            stats.success = false;
+                        } else {
+                            // Apply storage changes to memory_db for subsequent transactions
+                            for ((contract, key), val) in out.storage_changes {
+                                let c_addr = Address::from_slice(contract.as_bytes());
+                                let mut k_b = [0u8; 32];
+                                key.to_big_endian(&mut k_b);
+                                let k_u256 = alloy::primitives::U256::from_be_bytes(k_b);
+                                let mut v_b = [0u8; 32];
+                                val.to_big_endian(&mut v_b);
+                                let v_u256 = alloy::primitives::U256::from_be_bytes(v_b);
+                                let _ = memory_db.insert_account_storage(c_addr, k_u256, v_u256);
+                            }
+                        }
+                        results.push(out.single_result);
+                    }
+                    Err(e) => {
+                        stats.success = false;
+                        results.push(DebankSingleSimulateResult {
+                            code: 1000,
+                            err: format!("Simulation error: {e}"),
+                            error_traces: Some(Vec::new()),
+                            error_events: Some(Vec::new()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+
+            return Ok(DebankSimulateResp { stats, results });
+        }
+
         for tx in txs {
             if cancel_token.is_cancelled() {
                 return Err(internal_rpc_err(

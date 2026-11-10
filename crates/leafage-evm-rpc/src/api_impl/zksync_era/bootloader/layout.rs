@@ -115,6 +115,71 @@ pub fn build_bootloader_memory(
     memory
 }
 
+/// Builds the bootloader heap memory layout for playground_batch.yul.zbin (MediumInterop) in eth_call mode.
+pub fn build_playground_bootloader_memory(
+    tx: &TransactionData,
+    env: &BootloaderEnv,
+    trusted_gas_limit: U256,
+    settlement_layer: u64,
+) -> Vec<(usize, U256)> {
+    let mut memory = Vec::new();
+
+    // 1. Initial environment header
+    memory.push((OPERATOR_ADDRESS_SLOT, address_to_u256(env.fee_account)));
+    memory.push((PREV_BLOCK_HASH_SLOT, h256_to_u256(env.prev_block_hash)));
+    memory.push((NEW_BLOCK_TIMESTAMP_SLOT, U256::from(env.block_timestamp)));
+    memory.push((NEW_BLOCK_NUMBER_SLOT, U256::from(env.block_number)));
+    memory.push((FAIR_PUBDATA_PRICE_SLOT, U256::from(env.fair_pubdata_price)));
+    memory.push((FAIR_L2_GAS_PRICE_SLOT, U256::from(env.fair_l2_gas_price)));
+    memory.push((EXPECTED_BASE_FEE_SLOT, U256::from(env.base_fee)));
+    memory.push((SHOULD_SET_NEW_BLOCK_SLOT, U256::zero()));
+
+    // 2. L2 block info for transaction 0
+    let block_pos = MEDIUM_INTEROP_TX_OPERATOR_L2_BLOCK_INFO_OFFSET;
+    memory.push((block_pos, U256::from(env.block_number)));
+    memory.push((block_pos + 1, U256::from(env.block_timestamp)));
+    memory.push((block_pos + 2, h256_to_u256(env.prev_block_hash)));
+    memory.push((block_pos + 3, U256::one())); // max_virtual_blocks_to_create
+
+    // 3. Interop blocks and settlement layer
+    memory.push((MEDIUM_INTEROP_INTEROP_BLOCKS_BEGIN_OFFSET, U256::one())); // number_of_interop_roots + 1
+    memory.push((
+        MEDIUM_INTEROP_SETTLEMENT_LAYER_OFFSET,
+        U256::from(settlement_layer),
+    ));
+    memory.push((MEDIUM_INTEROP_INTEROP_FEE_OFFSET, U256::zero()));
+
+    // 4. Tx minor description and parameters (tx_index = 0)
+    let bootloader_desc_offset = MEDIUM_INTEROP_BOOTLOADER_TX_DESCRIPTION_OFFSET;
+    let tx_desc_offset = MEDIUM_INTEROP_TX_DESCRIPTION_OFFSET;
+
+    memory.push((
+        bootloader_desc_offset,
+        assemble_tx_meta(env.execution_mode, true),
+    ));
+    memory.push((
+        bootloader_desc_offset + 1,
+        U256::from((32 * tx_desc_offset) as u64),
+    ));
+
+    let refund_offset = MEDIUM_INTEROP_OPERATOR_REFUNDS_OFFSET;
+    memory.push((refund_offset, U256::zero()));
+
+    let overhead_offset = MEDIUM_INTEROP_TX_OVERHEAD_OFFSET;
+    memory.push((overhead_offset, U256::from(tx.overhead_gas())));
+
+    let trusted_gas_limit_offset = MEDIUM_INTEROP_TX_TRUSTED_GAS_LIMIT_OFFSET;
+    memory.push((trusted_gas_limit_offset, trusted_gas_limit));
+
+    // 5. Encoded transaction tokens at tx_description_offset
+    let tokens = tx.into_tokens();
+    for (i, token) in tokens.into_iter().enumerate() {
+        memory.push((tx_desc_offset + i, token));
+    }
+
+    memory
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
