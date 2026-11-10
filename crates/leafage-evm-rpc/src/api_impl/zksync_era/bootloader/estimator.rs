@@ -70,7 +70,15 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
 
         let operator_overhead = self.tx_overhead();
         let gas_charged_for_pubdata = initial_output.pubdata_published * self.gas_per_pubdata_byte;
-        let total_gas_bound = initial_output.computational_gas_used + gas_charged_for_pubdata;
+        let total_gas_charged = (initial_output.gas_refunded > 0
+            && initial_output.gas_refunded <= MAX_L2_TX_GAS_LIMIT)
+            .then(|| MAX_L2_TX_GAS_LIMIT - initial_output.gas_refunded);
+
+        let mut total_gas_bound = initial_output.computational_gas_used + gas_charged_for_pubdata;
+        if let Some(gas_charged) = total_gas_charged {
+            let safety_margin = (gas_charged / 64).max(1_000);
+            total_gas_bound = total_gas_bound.min(gas_charged.saturating_sub(safety_margin));
+        }
 
         let lower_bound = total_gas_bound
             .saturating_sub(operator_overhead)
@@ -81,7 +89,10 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
         let mut upper = upper_bound;
 
         // Step 2: Optimistic search pivot
-        let optimistic_gas_limit = lower_bound.saturating_mul(21) / 20;
+        let optimistic_gas_limit = total_gas_charged
+            .and_then(|gc| gc.checked_sub(operator_overhead))
+            .map(|gc_no_ovh| gc_no_ovh.saturating_mul(21) / 20)
+            .unwrap_or_else(|| lower_bound.saturating_mul(21) / 20);
         if optimistic_gas_limit > lower && optimistic_gas_limit < (lower + upper) / 2 {
             if self.cancel_token.is_cancelled() {
                 return Err("Gas estimation cancelled".to_string());
@@ -110,8 +121,10 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
             }
         }
 
+        const ESTIMATE_GAS_SCALE_FACTOR: f64 = 1.3;
         let unscaled_gas_limit = upper;
-        let final_gas_limit = unscaled_gas_limit.saturating_add(operator_overhead);
+        let suggested_gas_limit = (unscaled_gas_limit as f64 * ESTIMATE_GAS_SCALE_FACTOR) as u64;
+        let final_gas_limit = suggested_gas_limit.saturating_add(operator_overhead);
         Ok(final_gas_limit)
     }
 }
