@@ -84,6 +84,17 @@ pub fn execute_bootloader<DB: DatabaseRef>(
 ) -> Result<BootloaderExecutionOutput, EVMError<DB::Error, InvalidTransaction>> {
     let mut world = EraStorageWorld::new(db);
     world.set_expected_caller(tx.from);
+
+    if env.block_number > 1 {
+        let prev_num = (env.block_number - 1) as u128;
+        let prev_ts = (env.block_timestamp.saturating_sub(1)) as u128;
+        let slot9_val = (U256::from(prev_num) << 128) | U256::from(prev_ts);
+        world.set_system_context_override(U256::from(9), slot9_val);
+        world.set_system_context_override(U256::from(10), U256::zero());
+        let prev_hash_slot = 11 + ((prev_num.saturating_sub(1)) % 257);
+        world.set_system_context_override(U256::from(prev_hash_slot), U256::zero());
+    }
+
     let bootloader_code = artifacts::FEE_ESTIMATE_BYTECODE;
     let bootloader_program = Program::new(bootloader_code, true);
 
