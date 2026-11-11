@@ -15,6 +15,9 @@ pub struct ApiImpl<DB, SpecId, CustomCfg> {
     pub evm_cfg: EvmCfg<SpecId, CustomCfg>,
     pub historical_client: Option<HttpClient>,
     pub historical_height: Option<u64>,
+    pub upstream_client: Option<HttpClient>,
+    pub forward_simulate: bool,
+    pub forward_estimategas: bool,
     pub token_collector: Option<TokenCollector>,
 }
 
@@ -39,7 +42,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
             evm_cfg: EvmCfg {
                 is_archive,
                 normalize_state_key,
-                zksync_era: cfg.chain_id == 324 || cfg.chain_id == 300,
+                zksync: false,
                 cfg,
                 ovm_address: ovm_address.map(|addr| keccak256(addr.as_slice())),
                 version,
@@ -51,6 +54,9 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
             },
             historical_client,
             historical_height,
+            upstream_client: None,
+            forward_simulate: false,
+            forward_estimategas: false,
             token_collector,
         }
     }
@@ -80,6 +86,18 @@ where
 
     fn historical_height(&self) -> Option<u64> {
         self.historical_height
+    }
+
+    fn upstream_client(&self) -> Option<&HttpClient> {
+        self.upstream_client.as_ref()
+    }
+
+    fn forward_simulate(&self) -> bool {
+        self.forward_simulate
+    }
+
+    fn forward_estimategas(&self) -> bool {
+        self.forward_estimategas
     }
 
     fn token_collector(&self) -> Option<&TokenCollector> {

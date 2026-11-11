@@ -97,6 +97,9 @@ async fn formal_t11_rpc_uses_requested_timestamp_for_strict_abi() {
                 evm_cfg: tests::review_api().evm_cfg,
                 historical_client: None,
                 historical_height: None,
+                upstream_client: None,
+                forward_simulate: false,
+                forward_estimategas: false,
                 token_collector: None,
             };
             let api = Api::new(core);
@@ -246,6 +249,9 @@ async fn review_signed_sponsor_estimate_dispatch_uses_state_nonce_without_fallba
                     .unwrap()
             }),
             historical_height: Some(101),
+            upstream_client: None,
+            forward_simulate: false,
+            forward_estimategas: false,
             token_collector: None,
         };
         let module = DebankApiServer::into_rpc(Api::new(core));
@@ -299,6 +305,87 @@ async fn review_signed_sponsor_estimate_dispatch_uses_state_nonce_without_fallba
                 .contains("fee payer signature recovery failed"));
         }
     }
+    handle.stop().unwrap();
+    handle.stopped().await;
+}
+
+#[tokio::test]
+async fn upstream_forwarding_simulate_and_estimate_gas() {
+    let simulate_calls = Arc::new(AtomicUsize::new(0));
+    let estimate_calls = Arc::new(AtomicUsize::new(0));
+
+    let server = jsonrpsee::server::ServerBuilder::default()
+        .build("127.0.0.1:0")
+        .await
+        .unwrap();
+    let url = format!("http://{}", server.local_addr().unwrap());
+    let mut upstream = jsonrpsee::RpcModule::new((simulate_calls.clone(), estimate_calls.clone()));
+    upstream
+        .register_method("simulateTransactions", |_, (sim_calls, _), _| {
+            sim_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(leafage_evm_types::DebankSimulateResp {
+                results: vec![],
+                stats: leafage_evm_types::DebankSimulateStats {
+                    block_num: 777,
+                    block_hash: leafage_evm_types::H256::ZERO,
+                    block_time: 1234,
+                    success: true,
+                },
+            })
+        })
+        .unwrap();
+    upstream
+        .register_method("estimateGas", |_, (_, est_calls), _| {
+            est_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(U256::from(888_888))
+        })
+        .unwrap();
+    let handle = server.start(upstream);
+
+    let upstream_client = jsonrpsee::http_client::HttpClientBuilder::default()
+        .build(&url)
+        .unwrap();
+
+    let db = EstimateState::default();
+    let core = ApiImpl {
+        db: db.clone(),
+        evm_cfg: tests::review_api().evm_cfg,
+        historical_client: None,
+        historical_height: None,
+        upstream_client: Some(upstream_client),
+        forward_simulate: true,
+        forward_estimategas: true,
+        token_collector: None,
+    };
+    let module = DebankApiServer::into_rpc(Api::new(core));
+
+    let raw_sim = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "simulateTransactions",
+        "params": [[]]
+    })
+    .to_string();
+    let (response, _) = module.raw_json_request(&raw_sim, 1).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result"]["stats"]["block_num"], 777);
+    assert_eq!(simulate_calls.load(Ordering::SeqCst), 1);
+
+    let raw_est = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "estimateGas",
+        "params": [{"from": Address::repeat_byte(0x11), "gas": "0xf4240"}]
+    })
+    .to_string();
+    let (response, _) = module.raw_json_request(&raw_est, 1).await.unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(
+        serde_json::from_value::<U256>(response["result"].clone()).unwrap(),
+        U256::from(888_888)
+    );
+    assert_eq!(estimate_calls.load(Ordering::SeqCst), 1);
+
     handle.stop().unwrap();
     handle.stopped().await;
 }

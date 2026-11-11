@@ -117,7 +117,7 @@ pub struct EvmStorageWrapper<T> {
     pub db: T,
     pub ovm_address: Option<H256>,
     pub normalize_state_key: bool,
-    pub zksync_era: bool,
+    pub zksync: bool,
 }
 
 impl<T> EvmStorageWrapper<T> {
@@ -126,7 +126,7 @@ impl<T> EvmStorageWrapper<T> {
             db,
             ovm_address: None,
             normalize_state_key: false,
-            zksync_era: false,
+            zksync: false,
         }
     }
 
@@ -134,13 +134,13 @@ impl<T> EvmStorageWrapper<T> {
         db: T,
         ovm_address: Option<H256>,
         normalize_state_key: bool,
-        zksync_era: bool,
+        zksync: bool,
     ) -> Self {
         Self {
             db,
             ovm_address,
             normalize_state_key,
-            zksync_era,
+            zksync,
         }
     }
 }
@@ -219,7 +219,7 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
                 return Ok(Some(account));
             }
         }
-        if self.zksync_era {
+        if self.zksync {
             let balance_slot = get_era_balance_key(address);
             let balance = self
                 .db
@@ -297,7 +297,7 @@ impl<T: StateDB> EvmStorageWrapper<T> {
         &self,
         addresses: &[Address],
     ) -> Result<Vec<Option<AccountInfo>>, T::Error> {
-        if self.ovm_address.is_some() || self.zksync_era {
+        if self.ovm_address.is_some() || self.zksync {
             return addresses
                 .iter()
                 .map(|address| self.basic_ref(*address))
@@ -338,7 +338,7 @@ impl<T: StateDB> EvmStorageWrapper<T> {
     /// Whether eager batched prefetch is recommended: the backend must
     /// opt in, and OVM balance overrides must not force scalar account reads.
     pub fn supports_batched_reads(&self) -> bool {
-        self.ovm_address.is_none() && !self.zksync_era && self.db.supports_batched_reads()
+        self.ovm_address.is_none() && !self.zksync && self.db.supports_batched_reads()
     }
 }
 
@@ -462,7 +462,7 @@ mod tests {
                 db: RecordingDB::default(),
                 ovm_address: None,
                 normalize_state_key: normalize,
-                zksync_era: false,
+                zksync: false,
             };
             let address = Address::repeat_byte(0x11);
             let index = U256::from(0x8000_0001u64) << 248usize;
@@ -491,7 +491,7 @@ mod tests {
             db: RecordingDB::default(),
             ovm_address: Some(ovm_address),
             normalize_state_key: true,
-            zksync_era: false,
+            zksync: false,
         };
         let address = Address::repeat_byte(0x11);
 
@@ -514,7 +514,7 @@ mod tests {
             db: RecordingDB::default(),
             ovm_address: None,
             normalize_state_key: false,
-            zksync_era: true,
+            zksync: true,
         };
         let address = Address::repeat_byte(0x22);
 

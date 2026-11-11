@@ -49,6 +49,7 @@ pub struct Command {
         long,
         value_parser = [
             "mainnet",
+            "zksync",
             "arc",
             "arbitrum",
             "op",
@@ -315,6 +316,18 @@ pub struct Command {
     /// Fork height threshold for historical RPC forwarding
     #[arg(long)]
     historical_height: Option<u64>,
+
+    /// Upstream RPC URL for forwarding requests
+    #[arg(long, value_name = "URL")]
+    upstream_url: Option<String>,
+
+    /// Whether to forward simulateTransactions requests to the upstream RPC
+    #[arg(long, default_value_t = false)]
+    forward_simulate: bool,
+
+    /// Whether to forward estimateGas requests to the upstream RPC
+    #[arg(long, default_value_t = false)]
+    forward_estimategas: bool,
 
     /// Upstream RPC of the chain serving full block bodies. Enables
     /// `trace_debankBlock` on BSC, Ethereum and Arc mainnet archive nodes, which
@@ -611,6 +624,17 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "zksync" => {
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "zksync")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Zksync(chain_cfg))
             }
             "arc" => {
                 let arc_config = ArcChainConfig::mainnet();
@@ -1042,9 +1066,18 @@ impl Command {
             ),
         )?);
 
+        if (self.forward_simulate || self.forward_estimategas) && self.upstream_url.is_none() {
+            bail!("--upstream-url must be provided when --forward-simulate or --forward-estimategas is enabled");
+        }
+
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+            .with_upstream_config(
+                self.upstream_url.clone(),
+                self.forward_simulate,
+                self.forward_estimategas,
+            )
             .with_trace_block_rpc(
                 self.trace_block_rpc.clone(),
                 !self.trace_block_skip_state_check,
@@ -1321,6 +1354,37 @@ mod tests {
             .await
             .expect_err("invalid metrics address should stop startup");
         assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
+    }
+
+    #[test]
+    fn zksync_evm_type_builds_zksync_config() {
+        let command = parse_command(&["--evm-type", "zksync", "--chain-cfg", "324"]);
+        let chain_cfg = command
+            .build_chain_cfg_env()
+            .expect("ZKsync config should build");
+
+        let MultiChainCfgEnv::Zksync(cfg) = chain_cfg else {
+            panic!("expected Zksync chain config");
+        };
+        assert_eq!(cfg.chain_id, 324);
+        assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+        assert!(cfg.disable_balance_check);
+        assert!(cfg.disable_eip3607);
+        assert!(cfg.disable_block_gas_limit);
+        assert!(cfg.disable_base_fee);
+    }
+
+    #[test]
+    fn upstream_url_and_forwarding_options() {
+        let command = parse_command(&[
+            "--upstream-url",
+            "http://127.0.0.1:8545",
+            "--forward-simulate",
+            "--forward-estimategas",
+        ]);
+        assert_eq!(command.upstream_url.as_deref(), Some("http://127.0.0.1:8545"));
+        assert!(command.forward_simulate);
+        assert!(command.forward_estimategas);
     }
 
     #[test]

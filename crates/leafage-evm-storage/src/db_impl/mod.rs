@@ -557,7 +557,7 @@ mod tests {
                 db: &wrapped,
                 ovm_address: None,
                 normalize_state_key: false,
-                zksync_era: false,
+                zksync: false,
             }
             .supports_batched_reads());
             // The OVM balance override forces the scalar account path,
@@ -566,7 +566,7 @@ mod tests {
                 db: &wrapped,
                 ovm_address: Some(H256::repeat_byte(1)),
                 normalize_state_key: false,
-                zksync_era: false,
+                zksync: false,
             }
             .supports_batched_reads());
             // ZKsync Era system contracts also force the scalar account path.
@@ -574,7 +574,7 @@ mod tests {
                 db: &wrapped,
                 ovm_address: None,
                 normalize_state_key: false,
-                zksync_era: true,
+                zksync: true,
             }
             .supports_batched_reads());
         }

@@ -1059,7 +1059,7 @@ where
         let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
 
-        if self.inner.evm_cfg().zksync_era {
+        if self.inner.evm_cfg().zksync {
             let sys_ctx = Address::from_slice(
                 super::zksync_era::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes(),
             );
@@ -1374,7 +1374,7 @@ where
         // its state from memory instead of re-walking the layered state.
         let memory_db = utils::RequestCacheDB::new(cache_db);
 
-        if self.inner.evm_cfg().zksync_era {
+        if self.inner.evm_cfg().zksync {
             let caller = request.from.unwrap_or_else(|| Address::repeat_byte(0x11));
             let to = match request.to {
                 Some(alloy::primitives::TxKind::Call(addr)) => Some(addr),
@@ -1760,6 +1760,21 @@ fn map_historical_error(
     }
 }
 
+#[inline]
+fn map_upstream_error(err: jsonrpsee::core::ClientError) -> jsonrpsee::types::ErrorObjectOwned {
+    if is_historical_rpc_overloaded(&err) {
+        return historical_rpc_overloaded_error();
+    }
+
+    match err {
+        jsonrpsee::core::ClientError::Call(err_obj) => err_obj,
+        other => rpc_error_with_code(
+            DebankErrorCode::InternalError as i32,
+            format!("Upstream RPC error: {}", other),
+        ),
+    }
+}
+
 #[async_trait::async_trait]
 impl<C> DebankApiServer for Api<C>
 where
@@ -1925,6 +1940,14 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
+        if self.inner.forward_simulate() {
+            if let Some(upstream_client) = self.inner.upstream_client() {
+                return upstream_client
+                    .simulate_transactions(requests, block_ctx, block_overrides)
+                    .await
+                    .map_err(map_upstream_error);
+            }
+        }
         match self
             .debank_simulate_transactions_impl(
                 requests.clone(),
@@ -2017,6 +2040,14 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
+        if self.inner.forward_estimategas() {
+            if let Some(upstream_client) = self.inner.upstream_client() {
+                return upstream_client
+                    .estimate_gas(request, block_ctx, block_overrides)
+                    .await
+                    .map_err(map_upstream_error);
+            }
+        }
         match self
             .debank_estimate_gas_impl(request.clone(), block_ctx.clone(), block_overrides.clone())
             .await

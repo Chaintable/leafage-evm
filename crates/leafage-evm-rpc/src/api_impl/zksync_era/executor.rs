@@ -1598,7 +1598,7 @@ mod tests {
             db: disk,
             ovm_address: None,
             normalize_state_key: false,
-            zksync_era: true,
+            zksync: true,
         };
 
         let cache_db = CacheDB::new(wrapper);

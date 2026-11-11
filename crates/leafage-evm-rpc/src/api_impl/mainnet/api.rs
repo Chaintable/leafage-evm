@@ -100,7 +100,7 @@ where
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
-        if self.evm_cfg.zksync_era {
+        if self.evm_cfg.zksync {
             let caller = tx.caller;
             let to = tx.kind.to().copied();
             let data = tx.data;

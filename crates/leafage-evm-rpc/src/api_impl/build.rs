@@ -37,6 +37,9 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
+    upstream_client: Option<HttpClient>,
+    forward_simulate: bool,
+    forward_estimategas: bool,
     trace_block_client: Option<HttpClient>,
     trace_block_check_state: bool,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
@@ -60,6 +63,9 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
+            upstream_client: None,
+            forward_simulate: false,
+            forward_estimategas: false,
             trace_block_client: None,
             trace_block_check_state: true,
             replay_blocks: None,
@@ -97,6 +103,26 @@ where
             }
         }
         self.historical_height = historical_height;
+        self
+    }
+
+    pub fn with_upstream_config(
+        mut self,
+        upstream_url: Option<String>,
+        forward_simulate: bool,
+        forward_estimategas: bool,
+    ) -> Self {
+        if let Some(url) = upstream_url {
+            if let Ok(http_client) = HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(30))
+                .max_response_size(u32::MAX)
+                .build(&url)
+            {
+                self.upstream_client = Some(http_client);
+            }
+        }
+        self.forward_simulate = forward_simulate;
+        self.forward_estimategas = forward_estimategas;
         self
     }
 
@@ -273,6 +299,10 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.zksync = self.cfg.is_zksync();
+                api_impl.upstream_client = self.upstream_client.clone();
+                api_impl.forward_simulate = self.forward_simulate;
+                api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -312,6 +342,9 @@ where
                     )?;
                 })
             }
+            MultiChainCfgEnv::Zksync(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Arc((env, custom_evm_cfg)) => {
                 run_chain_setup!(env, Some(custom_evm_cfg), |api| {
                     merge_trace(
@@ -346,6 +379,10 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.zksync = self.cfg.is_zksync();
+                api_impl.upstream_client = self.upstream_client.clone();
+                api_impl.forward_simulate = self.forward_simulate;
+                api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
                 let api = Api::new(api_impl);
                 warmup_api(
@@ -407,6 +444,10 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.zksync = self.cfg.is_zksync();
+                api_impl.upstream_client = self.upstream_client.clone();
+                api_impl.forward_simulate = self.forward_simulate;
+                api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
                 let api = Api::new(api_impl);
                 warmup_api(
