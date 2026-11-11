@@ -104,6 +104,7 @@ pub struct ArbitrumExecutionContext {
     stylus_pages_ever: u16,
     open_contract_frames: HashMap<Address, u32>,
     scheduled_retryables: VecDeque<ArbitrumRetryTx>,
+    ape_yield: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -194,6 +195,15 @@ impl ArbitrumExecutionContext {
 
     pub(crate) fn current_arbos_version(&self) -> u64 {
         self.current_arbos_version
+    }
+
+    pub(crate) fn set_ape_yield(&mut self, ape_yield: bool) {
+        self.ape_yield = ape_yield;
+    }
+
+    /// ApeChain native yield is enabled for this execution.
+    pub fn ape_yield(&self) -> bool {
+        self.ape_yield
     }
 
     pub(crate) fn begin_multi_gas(&mut self, arbos_version: u64, intrinsic: ArbMultiGas) {

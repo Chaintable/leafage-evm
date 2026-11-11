@@ -831,6 +831,10 @@ where
         for retryable in scheduled {
             evm.ctx_mut().chain_mut().schedule_retryable(retryable);
         }
+        if evm.ctx().chain().ape_yield() {
+            crate::arbitrum::precompile::ape_on_tx_end(evm.ctx_mut())
+                .map_err(EVMError::Database)?;
+        }
         evm.ctx_mut().journal_mut().commit_tx();
         evm.ctx_mut().chain_mut().clear_tx_fee_context();
         evm.ctx_mut().local_mut().clear();

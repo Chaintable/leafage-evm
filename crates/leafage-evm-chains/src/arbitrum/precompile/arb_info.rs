@@ -17,6 +17,11 @@ impl ArbInfo {
     pub(super) fn run<DB: Database>(
         input: ArbPrecompileInput<'_, ArbitrumContext<DB>>,
     ) -> PrecompileResult {
+        if input.context.chain().ape_yield()
+            && super::ape::is_call::<super::ape::IApeArbInfo::IApeArbInfoCalls>(input.data)
+        {
+            return super::ape::run_arb_info(input);
+        }
         let gas_limit = input.gas;
         let data = input.data;
         let context = input.context;

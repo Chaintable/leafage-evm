@@ -65,6 +65,12 @@ pub struct ArbitrumEvmConfig {
     #[serde(default, alias = "AllowDebugPrecompiles")]
     pub allow_debug_precompiles: bool,
 
+    /// ApeChain native yield: account balances come from the yield fields the
+    /// Chaintable writer stores under `ape_yield::APE_YIELD_ADDRESS`, and the
+    /// ApeChain precompile methods are enabled.
+    #[serde(default)]
+    pub ape_yield: bool,
+
     /// Optional override for Nitro's
     /// `ChainConfig.ArbitrumChainParams.GenesisBlockNum`.
     ///

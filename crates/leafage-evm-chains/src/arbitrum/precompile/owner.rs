@@ -61,6 +61,30 @@ impl ArbOwner {
             return Self::finish_owner_call(gas_limit, empty_revert(gas_limit, gas_limit));
         }
 
+        if context.chain().ape_yield()
+            && super::ape::is_call::<super::ape::IApeArbOwner::IApeArbOwnerCalls>(data)
+        {
+            let result = dispatch::<super::ape::IApeArbOwner::IApeArbOwnerCalls>(
+                data,
+                gas_limit,
+                |call, initial_gas| {
+                    let mut storage =
+                        ArbStorage::new_with_initial_gas(context, gas_limit, initial_gas);
+                    if is_static || !super::ape::run_owner_write(&mut storage, call)? {
+                        return empty_revert(gas_limit, storage.gas_used);
+                    }
+                    Self::finish_write::<super::ape::IApeArbOwner::setApyCall, DB>(
+                        &mut storage,
+                        gas_limit,
+                        data,
+                        caller,
+                        ().into(),
+                    )
+                },
+            );
+            return Self::finish_owner_call(gas_limit, result);
+        }
+
         let result = dispatch::<IArbOwner::IArbOwnerCalls>(data, gas_limit, |call, initial_gas| {
             if !Self::method_is_available(current_arbos_version, &call) {
                 return empty_revert(gas_limit, gas_limit);
