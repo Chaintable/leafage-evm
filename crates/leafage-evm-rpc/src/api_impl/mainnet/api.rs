@@ -100,6 +100,20 @@ where
         ExecutionResult<Self::EvmHaltReason>,
         EVMError<StateDB::Error, Self::TransactionError>,
     > {
+        if self.evm_cfg.zksync {
+            let caller = tx.caller;
+            let to = tx.kind.to().copied();
+            let data = tx.data;
+            let gas_limit = tx.gas_limit;
+            return crate::api_impl::zksync_era::execute_era_call(
+                state,
+                caller,
+                to,
+                data.as_ref(),
+                gas_limit,
+            );
+        }
+
         let mut evm = create_main_evm_from_state(
             block_env.clone(),
             self.evm_cfg.cfg.clone(),

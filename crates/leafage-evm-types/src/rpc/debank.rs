@@ -42,6 +42,12 @@ pub struct DebankTrace {
     pub pos_in_parent_trace: usize,
     pub self_storage_change: bool,
     pub storage_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtraces: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_address: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 impl DebankID for DebankTrace {
@@ -64,6 +70,8 @@ pub struct DebankEvent {
     pub tx_id: H256,
     pub parent_trace_id: String,
     pub pos_in_parent_trace: usize,
+    #[serde(rename = "idx", default, skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u32>,
 }
 
 impl DebankID for DebankEvent {
@@ -223,6 +231,10 @@ pub struct DebankSingleSimulateResult {
     pub code: i32,
     pub err: String,
     pub gas_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_traces: Option<Vec<DebankTrace>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_events: Option<Vec<DebankEvent>>,
 }
 
 impl<T: Clone + Debug> From<ExecutionResult<T>> for DebankSingleSimulateResult

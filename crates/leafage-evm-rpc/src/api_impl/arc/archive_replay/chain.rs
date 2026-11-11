@@ -91,11 +91,7 @@ where
         .state_at(BlockId::Hash(info.header.hash.into()))
         .map_err(|err| anyhow!("state of block {number}: {err}"))?
         .ok_or_else(|| anyhow!("the state of block {number} is not in the archive"))?;
-    Ok(EvmStorageWrapper {
-        db: state,
-        ovm_address: None,
-        normalize_state_key: false,
-    })
+    Ok(EvmStorageWrapper::new(state))
 }
 
 #[cfg(test)]

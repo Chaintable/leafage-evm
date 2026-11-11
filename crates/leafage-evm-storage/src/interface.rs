@@ -117,6 +117,66 @@ pub struct EvmStorageWrapper<T> {
     pub db: T,
     pub ovm_address: Option<H256>,
     pub normalize_state_key: bool,
+    pub zksync: bool,
+}
+
+impl<T> EvmStorageWrapper<T> {
+    pub fn new(db: T) -> Self {
+        Self {
+            db,
+            ovm_address: None,
+            normalize_state_key: false,
+            zksync: false,
+        }
+    }
+
+    pub fn new_with_cfg(
+        db: T,
+        ovm_address: Option<H256>,
+        normalize_state_key: bool,
+        zksync: bool,
+    ) -> Self {
+        Self {
+            db,
+            ovm_address,
+            normalize_state_key,
+            zksync,
+        }
+    }
+}
+
+pub const ERA_BASE_TOKEN_ADDRESS: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x0a,
+]);
+pub const ERA_NONCE_HOLDER_ADDRESS: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x03,
+]);
+pub const ERA_ACCOUNT_CODE_ADDRESS: Address = Address::new([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x02,
+]);
+
+/// Computes the storage slot key for an account's ETH balance in L2BaseToken (0x800a).
+/// Formula: keccak256([12 zero bytes, 20 bytes address, 32 zero bytes])
+pub fn get_era_balance_key(address: Address) -> B256 {
+    let mut bytes = [0u8; 64];
+    bytes[12..32].copy_from_slice(address.as_slice());
+    keccak256(&bytes)
+}
+
+/// Computes the storage slot key for an account's nonce in NonceHolder (0x8003).
+/// Formula: keccak256([12 zero bytes, 20 bytes address, 32 zero bytes])
+pub fn get_era_nonce_key(address: Address) -> B256 {
+    let mut bytes = [0u8; 64];
+    bytes[12..32].copy_from_slice(address.as_slice());
+    keccak256(&bytes)
+}
+
+/// Computes the storage slot key for an account's code hash in AccountCodeStorage (0x8002).
+/// Formula: [12 zero bytes, 20 bytes address]
+pub fn get_era_code_key(address: Address) -> B256 {
+    let mut bytes = [0u8; 32];
+    bytes[12..32].copy_from_slice(address.as_slice());
+    B256::from(bytes)
 }
 
 /// `keccak256(address)`, the state key of an account. Reads that miss the
@@ -157,6 +217,39 @@ impl<T: StateDB> DatabaseRef for EvmStorageWrapper<T> {
                 let mut account = AccountInfo::default();
                 account.balance = balance;
                 return Ok(Some(account));
+            }
+        }
+        if self.zksync {
+            let balance_slot = get_era_balance_key(address);
+            let balance = self
+                .db
+                .storage(hash_address(&ERA_BASE_TOKEN_ADDRESS), keccak256(balance_slot.as_slice()))?;
+
+            let nonce_slot = get_era_nonce_key(address);
+            let raw_nonce = self
+                .db
+                .storage(hash_address(&ERA_NONCE_HOLDER_ADDRESS), keccak256(nonce_slot.as_slice()))?;
+            let nonce = (raw_nonce & U256::from(u128::MAX)).to::<u64>();
+
+            let code_slot = get_era_code_key(address);
+            let code_hash_val = self
+                .db
+                .storage(hash_address(&ERA_ACCOUNT_CODE_ADDRESS), keccak256(code_slot.as_slice()))?;
+            let code_hash = B256::from(code_hash_val.to_be_bytes());
+
+            let mut code = None;
+            if !code_hash.is_zero() {
+                code = self.code_by_hash_ref(code_hash).ok();
+            }
+
+            if balance != U256::ZERO || nonce != 0 || !code_hash.is_zero() {
+                return Ok(Some(AccountInfo {
+                    balance,
+                    nonce,
+                    code_hash,
+                    code,
+                    account_id: Default::default(),
+                }));
             }
         }
         Ok(account)
@@ -204,7 +297,7 @@ impl<T: StateDB> EvmStorageWrapper<T> {
         &self,
         addresses: &[Address],
     ) -> Result<Vec<Option<AccountInfo>>, T::Error> {
-        if self.ovm_address.is_some() {
+        if self.ovm_address.is_some() || self.zksync {
             return addresses
                 .iter()
                 .map(|address| self.basic_ref(*address))
@@ -245,7 +338,7 @@ impl<T: StateDB> EvmStorageWrapper<T> {
     /// Whether eager batched prefetch is recommended: the backend must
     /// opt in, and OVM balance overrides must not force scalar account reads.
     pub fn supports_batched_reads(&self) -> bool {
-        self.ovm_address.is_none() && self.db.supports_batched_reads()
+        self.ovm_address.is_none() && !self.zksync && self.db.supports_batched_reads()
     }
 }
 
@@ -369,6 +462,7 @@ mod tests {
                 db: RecordingDB::default(),
                 ovm_address: None,
                 normalize_state_key: normalize,
+                zksync: false,
             };
             let address = Address::repeat_byte(0x11);
             let index = U256::from(0x8000_0001u64) << 248usize;
@@ -397,6 +491,7 @@ mod tests {
             db: RecordingDB::default(),
             ovm_address: Some(ovm_address),
             normalize_state_key: true,
+            zksync: false,
         };
         let address = Address::repeat_byte(0x11);
 
@@ -411,6 +506,34 @@ mod tests {
             keys[0],
             (ovm_address, keccak256(get_ovm_balance_key(address)).into())
         );
+    }
+
+    #[test]
+    fn test_zksync_era_basic_ref() {
+        let wrapper = EvmStorageWrapper {
+            db: RecordingDB::default(),
+            ovm_address: None,
+            normalize_state_key: false,
+            zksync: true,
+        };
+        let address = Address::repeat_byte(0x22);
+
+        let account = wrapper.basic_ref(address).unwrap().unwrap();
+        assert_eq!(account.balance, U256::from(42u64));
+        // In RecordingDB, storage returns 42, so nonce is 42 & u128::MAX = 42
+        assert_eq!(account.nonce, 42);
+
+        let keys = wrapper.db.storage_keys.borrow();
+        assert_eq!(keys.len(), 3);
+        // Balance checked at ERA_BASE_TOKEN_ADDRESS (0x800a)
+        assert_eq!(keys[0].0, keccak256(ERA_BASE_TOKEN_ADDRESS.as_slice()));
+        assert_eq!(keys[0].1, keccak256(get_era_balance_key(address).as_slice()));
+        // Nonce checked at ERA_NONCE_HOLDER_ADDRESS (0x8003)
+        assert_eq!(keys[1].0, keccak256(ERA_NONCE_HOLDER_ADDRESS.as_slice()));
+        assert_eq!(keys[1].1, keccak256(get_era_nonce_key(address).as_slice()));
+        // Code hash checked at ERA_ACCOUNT_CODE_ADDRESS (0x8002)
+        assert_eq!(keys[2].0, keccak256(ERA_ACCOUNT_CODE_ADDRESS.as_slice()));
+        assert_eq!(keys[2].1, keccak256(get_era_code_key(address).as_slice()));
     }
 
     #[test]

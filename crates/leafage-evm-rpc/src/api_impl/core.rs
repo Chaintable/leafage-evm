@@ -33,6 +33,7 @@ use std::sync::Arc;
 pub struct EvmCfg<SpecId, CustomCfg> {
     pub is_archive: bool,
     pub normalize_state_key: bool,
+    pub zksync: bool,
     pub cfg: CfgEnv<SpecId>,
     pub ovm_address: Option<H256>,
     pub version: String,
@@ -55,6 +56,17 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub multicall_parallelism: usize,
 }
 
+impl<SpecId, CustomCfg> EvmCfg<SpecId, CustomCfg> {
+    pub fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
+        leafage_evm_storage::EvmStorageWrapper {
+            db,
+            ovm_address: self.ovm_address,
+            normalize_state_key: self.normalize_state_key,
+            zksync: self.zksync,
+        }
+    }
+}
+
 pub(crate) trait ApiCore:
     ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
 {
@@ -69,9 +81,19 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 
     fn evm_cfg(&self) -> &EvmCfg<Self::SpecId, Self::CustomCfg>;
 
+    fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
+        self.evm_cfg().wrap_storage(db)
+    }
+
     fn historical_client(&self) -> Option<&HttpClient>;
 
     fn historical_height(&self) -> Option<u64>;
+
+    fn upstream_client(&self) -> Option<&HttpClient>;
+
+    fn forward_simulate(&self) -> bool;
+
+    fn forward_estimategas(&self) -> bool;
 
     fn token_collector(&self) -> Option<&TokenCollector>;
 }
@@ -300,6 +322,7 @@ where
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    Zksync(CfgEnv<MainnetSpecId>),
     Arc((CfgEnv<MainnetSpecId>, ArcChainConfig)),
     Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
@@ -322,6 +345,7 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Zksync(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Arc(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
@@ -340,6 +364,10 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }
     }
+
+    pub fn is_zksync(&self) -> bool {
+        matches!(self, MultiChainCfgEnv::Zksync(_))
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +379,14 @@ mod tests {
 
     impl GasFeeHandler for DefaultGasFeeHandler {
         type Tx = TxEnv;
+    }
+
+    #[test]
+    fn test_multichain_cfg_env_zksync() {
+        let env = MultiChainCfgEnv::Zksync(CfgEnv::new_with_spec(MainnetSpecId::OSAKA));
+        assert!(env.is_zksync());
+        let mainnet_env = MultiChainCfgEnv::Mainnet(CfgEnv::new_with_spec(MainnetSpecId::OSAKA));
+        assert!(!mainnet_env.is_zksync());
     }
 
     #[test]
