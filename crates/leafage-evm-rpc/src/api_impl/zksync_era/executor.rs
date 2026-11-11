@@ -55,10 +55,18 @@ impl Precompiles for EraPrecompiles {
         }
 
         if address_low == 0x01 {
-            if let Some(caller) = self.expected_caller {
-                let mut addr_bytes = [0u8; 32];
-                addr_bytes[12..32].copy_from_slice(caller.as_bytes());
-                return PrecompileOutput::from([U256::one(), U256::from_big_endian(&addr_bytes)]);
+            let mut reader = memory.clone().assume_offset_in_words();
+            let mut input = [0u8; 128];
+            for b in &mut input {
+                *b = reader.next().unwrap_or(0);
+            }
+            let r_and_s_is_zero = input[64..128].iter().all(|&b| b == 0);
+            if r_and_s_is_zero {
+                if let Some(caller) = self.expected_caller {
+                    let mut addr_bytes = [0u8; 32];
+                    addr_bytes[12..32].copy_from_slice(caller.as_bytes());
+                    return PrecompileOutput::from([U256::one(), U256::from_big_endian(&addr_bytes)]);
+                }
             }
         }
 

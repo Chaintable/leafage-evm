@@ -104,17 +104,12 @@ pub fn decode_vm_revert_reason(bytes: &[u8]) -> String {
         }
     }
     if bytes.is_empty() {
-        "Unknown revert reason".to_string()
+        "Error function_selector = 0x, data = 0x".to_string()
     } else {
         let hex_data = alloy::primitives::hex::encode(bytes);
         if bytes.len() >= 4 {
             let sel = alloy::primitives::hex::encode(&bytes[0..4]);
-            let tail = if bytes.len() > 4 {
-                alloy::primitives::hex::encode(&bytes[4..])
-            } else {
-                "".to_string()
-            };
-            format!("Error function_selector = 0x{}, data = 0x{}", sel, tail)
+            format!("Error function_selector = 0x{}, data = 0x{}", sel, hex_data)
         } else {
             format!("Error function_selector = 0x{}, data = 0x", hex_data)
         }
