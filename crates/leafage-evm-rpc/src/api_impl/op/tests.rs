@@ -419,9 +419,9 @@ fn op_mainnet_calls_run_the_block_fork() {
     }
 }
 
-/// Other chains with a built-in schedule follow it too: on Soneium (1868) CLZ halts on
-/// the last pre-Karst block and runs on the Karst block. A chain without a schedule keeps
-/// the configured spec (Karst) at the same height.
+/// Other chains with a built-in schedule follow it too: on Soneium (1868) and Unichain
+/// (130) CLZ halts on the last pre-Karst block and runs on the Karst block. A chain
+/// without a schedule keeps the configured spec (Karst) at the same height.
 #[test]
 fn scheduled_op_stack_chains_run_the_block_fork() {
     let api_for = |chain_id: u64| -> ApiImpl<(), OpSpecId, NoneEvmCustomConfig> {
@@ -459,10 +459,14 @@ fn scheduled_op_stack_chains_run_the_block_fork() {
     };
     let pre_karst = at(25_195_824, 1_783_526_399);
     let karst = at(25_195_825, 1_783_526_401);
+    let uni_pre_karst = at(52_778_041, 1_783_526_400);
+    let uni_karst = at(52_778_042, 1_783_526_401);
     for inspect in [false, true] {
         for (chain_id, block, runs) in [
             (1868, &pre_karst, false),
             (1868, &karst, true),
+            (130, &uni_pre_karst, false),
+            (130, &uni_karst, true),
             (480, &pre_karst, true),
         ] {
             let api = api_for(chain_id);

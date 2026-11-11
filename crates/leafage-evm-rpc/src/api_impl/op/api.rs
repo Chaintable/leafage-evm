@@ -177,7 +177,7 @@ impl<DB> ApiCore for OpApiImpl<DB> where DB: Sync + Send + 'static {}
 mod tests {
     use super::*;
     use leafage_evm_chains::op::mainnet::OP_MAINNET_CHAIN_ID;
-    use leafage_evm_chains::op::schedule::SONEIUM_CHAIN_ID;
+    use leafage_evm_chains::op::schedule::{SONEIUM_CHAIN_ID, UNICHAIN_CHAIN_ID};
     use leafage_evm_types::U256;
 
     fn block(number: u64, timestamp: u64) -> BlockEnv {
@@ -246,6 +246,24 @@ mod tests {
             (block(6_835_824, 1_746_806_399), OpSpecId::HOLOCENE),
             (block(6_835_825, 1_746_806_401), OpSpecId::ISTHMUS),
             (block(25_195_825, 1_783_526_401), OpSpecId::KARST),
+        ] {
+            let actual = block_cfg(&cfg, &block_env);
+            assert_eq!(actual.spec, spec);
+            assert_eq!(actual.gas_params, CfgEnv::new_with_spec(spec).gas_params);
+        }
+    }
+
+    #[test]
+    fn unichain_follows_its_own_forks() {
+        let mut cfg = op_mainnet_cfg();
+        cfg.chain_id = UNICHAIN_CHAIN_ID;
+        for (block_env, spec) in [
+            (block(5_697_241, 1_736_445_600), OpSpecId::GRANITE),
+            // Soneium was still on Granite at this timestamp.
+            (block(6_251_642, 1_737_000_001), OpSpecId::HOLOCENE),
+            (block(16_058_041, 1_746_806_400), OpSpecId::HOLOCENE),
+            (block(16_058_042, 1_746_806_401), OpSpecId::ISTHMUS),
+            (block(52_778_042, 1_783_526_401), OpSpecId::KARST),
         ] {
             let actual = block_cfg(&cfg, &block_env);
             assert_eq!(actual.spec, spec);
