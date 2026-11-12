@@ -9,12 +9,16 @@ pub(crate) use sst::SstSink;
 
 mod archive;
 pub(crate) use archive::decode_archive_header;
+pub use archive::udt::is_v4_archive as is_archive_schema_v4;
 pub(crate) use archive::udt::{
     check_rewind_target as check_udt_rewind_target, is_udt_archive,
     trim_history as trim_udt_history,
 };
 pub use archive::udt::{
     init_archive_schema, verify_udt_against_v2, ArchiveSchema, UdtConvertReport, UdtVerifyReport,
+};
+pub use archive::v4::convert::{
+    replay_get_trace, verify_v4_against_v3, V4ConvertReport, V4ReplayReport, V4VerifyReport,
 };
 pub use archive::{DataBaseRef as ArchiveRocksDBStorage, StateDB as ArchiveStateDB};
 

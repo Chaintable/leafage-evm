@@ -153,8 +153,9 @@ pub struct Command {
     inverted_block_encoding: bool,
 
     /// Schema of a new RocksDB archive (empty `--db-path`): v1 (ascending
-    /// block tail), v2 (inverted tail) or v3 (RocksDB user-defined
-    /// timestamps). A resumed archive keeps its own schema.
+    /// block tail), v2 (inverted tail), v3 (RocksDB user-defined
+    /// timestamps) or v4 (page files outside RocksDB). A resumed archive
+    /// keeps its own schema.
     #[arg(long, default_value = "v3")]
     archive_schema: ArchiveSchema,
 }
@@ -616,9 +617,10 @@ fn ingest_worker_process(
         .map(|(k, v)| (k.len() + v.len()) as u64)
         .sum();
 
-    // Schema v3 cannot ingest version SSTs (see `is_schema_v3`): its versions
-    // go with the small writes, which the advancer commits in block order.
-    if db.is_schema_v3() {
+    // Schemas v3 and v4 cannot ingest version SSTs (see
+    // `takes_version_ssts`): their versions go with the small writes, which
+    // the advancer commits in block order.
+    if !db.takes_version_ssts() {
         let accounts = std::mem::take(&mut payload.account_writes);
         payload
             .small_writes
@@ -1140,6 +1142,10 @@ impl Command {
             );
             info!(target: "archive_init", "Starting database compaction...");
             compact_db.compact()?;
+            if compact_db.is_schema_v4() {
+                // Fold what the load left in segments into the base files.
+                compact_db.v4_compact()?;
+            }
             info!(target: "archive_init", "Database compaction completed.");
         }
 

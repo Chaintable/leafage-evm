@@ -136,7 +136,9 @@ impl MultiStorage {
             StorageKind::Rocksdb => "CURRENT",
             StorageKind::MDBX => "mdbx.dat",
         };
-        if !path.join(data_file).is_file() {
+        let v4 = matches!(kind, StorageKind::Rocksdb)
+            && super::rocksdb_impl::is_archive_schema_v4(path)?;
+        if !v4 && !path.join(data_file).is_file() {
             return Err(StorageError::UnSupported(format!(
                 "archive database does not exist at {}",
                 path.display()
@@ -237,12 +239,21 @@ impl MultiStorage {
         let target = self.rewind_block(Some(number))?;
         reset_offset(offset_file)?;
         set_inverted_block_encoding(inverted);
-        match self {
+        let landed = match self {
             Self::RocksDBArchive(db) => db.rewind_to(&target, inverted)?,
-            Self::MDBXArchive(db) => db.rewind_to(&target, inverted)?,
+            Self::MDBXArchive(db) => {
+                db.rewind_to(&target, inverted)?;
+                number
+            }
             _ => unreachable!(),
+        };
+        // A schema v4 archive goes back to the end of a segment, which may
+        // be below the target.
+        if landed == number {
+            Ok(target)
+        } else {
+            self.rewind_block(Some(landed))
         }
-        Ok(target)
     }
 }
 

@@ -10,6 +10,10 @@ pub(crate) static STORAGE_METRICS: LazyLock<StorageMetrics> =
 pub(crate) static ROCKSDB_METRICS: LazyLock<RocksdbMetrics> =
     LazyLock::new(RocksdbMetrics::default);
 
+/// Counters and sizes of the schema v4 archive store.
+pub(crate) static ARCHIVE_V4_METRICS: LazyLock<ArchiveV4Metrics> =
+    LazyLock::new(ArchiveV4Metrics::default);
+
 /// The metrics for the latest block
 pub(crate) static BLOCK_METRICS: LazyLock<BlockMetrics> = LazyLock::new(|| BlockMetrics::default());
 
@@ -140,4 +144,54 @@ pub struct RocksdbMetrics {
     pub block_cache_usage_bytes: Gauge,
     /// Bytes pinned in the block cache.
     pub block_cache_pinned_usage_bytes: Gauge,
+}
+
+/// The schema v4 archive store (`docs/ArchiveSchemaV4.md`).
+#[derive(Metrics, Clone)]
+#[metrics(scope = "leafage_archive_v4")]
+pub struct ArchiveV4Metrics {
+    /// Pages read from the device for lookups.
+    pub page_reads: Counter,
+    /// Bytes of those reads.
+    pub page_read_bytes: Counter,
+    /// Lookups that read a second page: the index pointed at a neighbour.
+    pub extra_pages: Counter,
+    /// Lookups answered by the memtable.
+    pub memtable_hits: Counter,
+    /// Segment lookups made after the segment's filter passed.
+    pub segment_probes: Counter,
+    /// Lookups answered by a segment.
+    pub segment_hits: Counter,
+    /// Lookups an address filter answered without reading the base.
+    pub filter_negatives: Counter,
+    /// Memtables written to segments.
+    pub flushes: Counter,
+    /// Segment merges.
+    pub merges: Counter,
+    /// Base files rewritten.
+    pub rewrites: Counter,
+    /// Bytes of base files written by rewrites.
+    pub rewrite_bytes: Counter,
+    /// Versions in the memtable.
+    pub memtable_versions: Gauge,
+    /// Delta segments.
+    pub segments: Gauge,
+    /// Bytes of the segments not yet in every base file.
+    pub delta_bytes: Gauge,
+    /// Base files.
+    pub base_files: Gauge,
+    /// Bytes of the base files.
+    pub base_bytes: Gauge,
+    /// Memory of the page indexes.
+    pub index_bytes: Gauge,
+    /// Memory of the segment filters.
+    pub segment_filter_bytes: Gauge,
+    /// Memory of the address filters.
+    pub address_filter_bytes: Gauge,
+    /// Capacity of the page cache.
+    pub page_cache_capacity_bytes: Gauge,
+    /// Bytes held in the page cache.
+    pub page_cache_usage_bytes: Gauge,
+    /// Last block held by a file.
+    pub durable_block: Gauge,
 }

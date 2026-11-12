@@ -28,6 +28,9 @@ pub struct KafkaS3Config {
     #[serde(default)]
     pub bundle_bucket_name: String,
     pub outer_bucket_name: String,
+    /// No longer used: the updater keeps no offset between runs. Accepted
+    /// so that existing configurations still parse; `standalone` removes
+    /// the offset file an earlier version left there.
     #[serde(default)]
     pub offset_dir: String,
     pub s3_chain_id: String,

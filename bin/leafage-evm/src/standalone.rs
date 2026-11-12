@@ -469,8 +469,9 @@ pub struct Command {
     inverted_block_encoding: bool,
 
     /// Schema of a new RocksDB archive (`--archive` on an empty `--db-path`):
-    /// v1 (ascending block tail), v2 (inverted tail) or v3 (RocksDB
-    /// user-defined timestamps). An existing archive keeps its own schema.
+    /// v1 (ascending block tail), v2 (inverted tail), v3 (RocksDB
+    /// user-defined timestamps) or v4 (page files outside RocksDB, see
+    /// docs/ArchiveSchemaV4.md). An existing archive keeps its own schema.
     #[arg(long, default_value = "v3")]
     archive_schema: ArchiveSchema,
 }
@@ -985,14 +986,23 @@ impl Command {
         }
 
         let state_diff_key = self.resolved_state_diff_key();
-        // set default offset dir if not set
-        if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
-            if kafka_s3_config.offset_dir.is_empty() {
-                kafka_s3_config.offset_dir =
-                    format!("{}/offset", self.db_path.to_str().unwrap_or_default());
-            }
+        if let Some(kafka_s3_config) = &self.kafka_s3_config {
             info!(target: "updater", %state_diff_key, "resolved S3 StateDiff addressing");
             info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
+            // The updater keeps no Kafka offset between runs. Remove the one
+            // an earlier version saved, so that a downgrade does not resume
+            // from it.
+            let offset_dir = if kafka_s3_config.offset_dir.is_empty() {
+                format!("{}/offset", self.db_path.to_str().unwrap_or_default())
+            } else {
+                kafka_s3_config.offset_dir.clone()
+            };
+            let offset_file = format!("{offset_dir}/offset");
+            match std::fs::remove_file(&offset_file) {
+                Ok(()) => info!(target: "updater", "removed the offset file {offset_file} of an earlier version"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         } else {
             info!(target:"updater", "no kafka s3 config");
         }

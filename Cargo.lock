@@ -5205,6 +5205,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "leafage-evm-types",
+ "libc",
  "libmdbx",
  "librocksdb-sys",
  "metrics",
@@ -5217,6 +5218,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

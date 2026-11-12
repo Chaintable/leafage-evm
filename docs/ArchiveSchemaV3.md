@@ -10,6 +10,7 @@ conversion and offline rewind are implemented.
 | v1 | key `key ‖ tail`, 32-byte ascending block tail, read with `SeekForPrev` | no marker, or `leafage:block_encoding_inverted = 0` |
 | v2 | same, descending tail `u64::MAX - block`, forward `Seek` (#162, [ArchiveInvertedBlockEncoding.md](./ArchiveInvertedBlockEncoding.md)) | `leafage:block_encoding_inverted = 1` |
 | v3 | key alone, block as a RocksDB **user-defined timestamp**, point `Get` at a read timestamp (this document) | file `<db>/LEAFAGE_ARCHIVE_SCHEMA` = `3` |
+| v4 | files of its own, no RocksDB ([ArchiveSchemaV4.md](./ArchiveSchemaV4.md)) | file `<db>/LEAFAGE_ARCHIVE_SCHEMA` = `4` |
 
 Block info, the block-number index, the latest pointer and code are the same
 in every version.
@@ -58,7 +59,7 @@ an older binary cannot open a v3 archive.
 
 ### Choosing the schema of a new archive
 
-`standalone --archive` and `archive-init` take `--archive-schema v1|v2|v3`
+`standalone --archive` and `archive-init` take `--archive-schema v1|v2|v3|v4`
 (default `v3`), used only when `--db-path` holds no RocksDB database yet
 (no `CURRENT` file): v3 writes the schema file before the open creates the
 column families, and every new archive records its encoding marker (v1: 0;

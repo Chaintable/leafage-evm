@@ -9,7 +9,7 @@ use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
-    read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
+    BlockContext, EvmStorageRead, EvmStorageWrite,
 };
 use leafage_evm_types::{
     BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, KafkaBlockChangeNotification,
@@ -36,7 +36,6 @@ use tracing::{debug, error, info};
 struct BlockContextWithOffset {
     block_diff: BlockStorageDiff,
     block_info: BlockInfo,
-    offset: i64,
 }
 
 /// Builds the librdkafka configuration for the updater consumer.
@@ -218,16 +217,10 @@ where
         .context(format!("s3 get block info failed, {block_hash}"))
     }
 
-    fn clear(
-        &self,
-        presist_block_num: u64,
-        presist_block_hash: H256,
-    ) -> Option<BlockContextWithOffset> {
+    fn clear(&self, presist_block_num: u64, presist_block_hash: H256) {
         let mut blocks = self.hash_to_blockctx.lock().unwrap();
-        let presist_block = blocks.remove(&presist_block_hash);
+        blocks.remove(&presist_block_hash);
         blocks.retain(|_, block| block.block_info.header.number >= presist_block_num);
-
-        presist_block
     }
 
     async fn prepare_update(&self, messages: &[impl Message]) -> Result<Vec<KafkaBlockContext>> {
@@ -329,7 +322,6 @@ where
                 let block_ctx_with_offset = BlockContextWithOffset {
                     block_diff,
                     block_info,
-                    offset,
                 };
 
                 block_contexts.push((new_block.hash, block_ctx_with_offset));
@@ -613,19 +605,14 @@ where
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
-        self.commit_offset()
+        self.forget_committed()
     }
 
-    fn commit_offset(&self) -> Result<()> {
+    /// Drop the contexts of the blocks the database has taken over.
+    fn forget_committed(&self) -> Result<()> {
         let presist_block = self.tree.last_committed_block()?.unwrap();
-        let presist_block_num = presist_block.header.number;
-        let presist_block_hash = presist_block.header.hash;
-        // clear block context before presist block
-        let presist_block = self.clear(presist_block_num, presist_block_hash);
-        if let Some(presist_block) = presist_block {
-            debug!(target:"updater", "clear block hash {}, block num {}", presist_block.block_info.header.hash, presist_block.block_info.header.number);
-            write_offset(&self.kafka_s3_cfg.offset_dir, presist_block.offset + 1)?;
-        }
+        debug!(target:"updater", "clear up to block hash {}, block num {}", presist_block.header.hash, presist_block.header.number);
+        self.clear(presist_block.header.number, presist_block.header.hash);
         Ok(())
     }
 
@@ -641,9 +628,14 @@ where
         return Ok((low, high - 1));
     }
 
+    /// Start at the end of the Kafka stream: the blocks between the
+    /// database's head and the first message come from S3 (see
+    /// [`Self::update_from_s3`]). No offset is kept between runs. The head a
+    /// node opens on is not always the block it last took from Kafka (a
+    /// rewind, a schema v4 archive that lost its memtable, a snapshot), and
+    /// an offset that does not follow the head fails every update.
     async fn init_offset(&mut self) {
-        let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
-        let (lowest_offset, latest_offset) = loop {
+        let (_, latest_offset) = loop {
             match self.get_offset().await {
                 Ok(v) => break v,
                 Err(e) => {
@@ -652,36 +644,10 @@ where
                 }
             }
         };
-        match offset {
-            Some(offset)
-                if offset >= lowest_offset && !self.kafka_s3_cfg.bundle_bucket_name.is_empty() =>
-            {
-                // A still-valid Kafka offset can nevertheless point at source
-                // objects already removed by the compactor. With bundle
-                // storage enabled, catch up from the latest notification via
-                // bundle/block reads first, then resume live Kafka updates.
-                info!(target: "updater", "kafka offset {} is valid, but bundle storage is enabled; catching up from bundle/block storage", offset);
-                self.read_from_kafka = false;
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
-            }
-            Some(offset) if offset >= lowest_offset => {
-                self.set_offset(offset).expect("Failed to set offset");
-                info!(target: "updater", "kafka updater start with offset {}", offset);
-            }
-            Some(offset) => {
-                info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
-                self.read_from_kafka = false;
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
-            }
-            None => {
-                info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
-                self.read_from_kafka = false;
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
-            }
-        }
+        info!(target: "updater", "kafka updater starts at offset {latest_offset}, catching up from s3/rpc");
+        self.read_from_kafka = false;
+        self.set_offset(latest_offset)
+            .expect("Failed to set latest offset");
     }
 
     /// Whether the node has caught up with the chain head after applying
@@ -784,7 +750,7 @@ where
                             loop {
                                 if let Err(e) = self.update_from_kafka(&msgs).await {
                                     error!(target:"updater", "Failed to update: {:?}", e);
-                                    self.commit_offset().expect("Failed to commit offset");
+                                    self.forget_committed().expect("Failed to clear committed blocks");
                                     time::sleep(time::Duration::from_secs(1)).await
                                 } else {
                                     break;
@@ -925,7 +891,6 @@ mod tests {
                     contexts[&block.hash].block_diff.deleted_accounts.len(),
                     block.block_number as usize
                 );
-                assert_eq!(contexts[&block.hash].offset, 42);
             }
         }
         updater.hash_to_blockctx.lock().unwrap().clear();

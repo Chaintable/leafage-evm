@@ -77,13 +77,13 @@ pub struct Command {
     #[arg(long, value_name = "URL")]
     rpc_addr: Option<String>,
 
-    /// Keep the kafka offset file.
+    /// Keep the kafka offset file of an earlier version.
     /// Default: false
     ///
-    /// By default the offset file is deleted so the next start falls back to
-    /// the S3 catch-up path. A retained offset would resume Kafka at a
-    /// position whose parent blocks no longer match the rewound head, making
-    /// every update fail with ParentBlockHashNotFound.
+    /// The updater no longer keeps an offset between runs: every start
+    /// catches up from S3. A file left by an earlier version is deleted by
+    /// default, so that a downgraded node does not resume Kafka at a
+    /// position whose parent blocks no longer match the rewound head.
     /// In archive mode, this requires --head-only.
     #[arg(long, default_value_t = false)]
     keep_offset: bool,
@@ -108,6 +108,12 @@ impl Command {
             return Ok(());
         }
         if self.archive {
+            if leafage_evm_storage::is_archive_schema_v4(&self.db_path)? {
+                bail!(
+                    "a schema v4 archive cannot keep state above its head: \
+                     rewind it without --head-only"
+                );
+            }
             leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         }
         let db = MultiStorage::open(
