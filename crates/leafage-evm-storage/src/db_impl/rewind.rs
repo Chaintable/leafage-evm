@@ -247,8 +247,8 @@ impl MultiStorage {
             }
             _ => unreachable!(),
         };
-        // A schema v4 archive goes back to the end of a segment, which may
-        // be below the target.
+        // A schema v4 archive whose head was below the target stays where
+        // it was.
         if landed == number {
             Ok(target)
         } else {

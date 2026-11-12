@@ -4,8 +4,8 @@
 > (`docs/StateUpdater.md`, "Start position"): every start catches up from
 > S3. The offset file this document mentions is one left by an earlier
 > version; rewind still removes it, so that a downgraded node does not
-> resume from it. A schema v4 archive is rewound to a segment end at or
-> below the target, not to the target itself, and not into its base
+> resume from it. A schema v4 archive is rewound by writing the files that
+> reach above the target again without what comes after it
 > (`docs/ArchiveSchemaV4.md`, "Rewind").
 
 

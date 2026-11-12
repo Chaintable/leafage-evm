@@ -334,7 +334,7 @@ fn v4_answers_as_v3_across_restarts_and_rewrites() {
 }
 
 #[test]
-fn v4_rewind_goes_back_to_a_segment_end_and_takes_another_chain() {
+fn v4_rewind_goes_back_to_a_block_and_takes_another_chain() {
     let _g = ARCHIVE_DB_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -355,8 +355,8 @@ fn v4_rewind_goes_back_to_a_segment_end_and_takes_another_chain() {
     write(&db, 1, &first, 0);
     flush(&db);
     drop(db);
-    // Twice: each time the archive ends at the last segment end at or
-    // below the target, and says so.
+    // Twice, into the middle of a segment: the archive ends at the block
+    // asked for, and says so.
     let mut landed = 90;
     for target in [85, 77] {
         let rewound = MultiStorage::rewind_archive_offline(
@@ -369,10 +369,7 @@ fn v4_rewind_goes_back_to_a_segment_end_and_takes_another_chain() {
         )
         .unwrap();
         let number = rewound.header.number;
-        assert!(
-            number <= target && number < landed && number % 9 == 0,
-            "block {number}"
-        );
+        assert_eq!(number, target);
         assert_eq!(rewound.header.hash, block_info(number, 0).header.hash);
         landed = number;
         let db = open(&v4_dir);
@@ -390,14 +387,15 @@ fn v4_rewind_goes_back_to_a_segment_end_and_takes_another_chain() {
     let db = open(&v4_dir);
     write(&db, landed + 1, &second[landed as usize..], 1);
     assert_eq!(answers(&db, 90), want);
-    // Everything into the base: there is no way back into it.
+    // Everything into the base, and back into it: the base files are
+    // written again without the blocks after the target.
     db.v4_compact().unwrap();
     drop(db);
     let db = open(&v4_dir);
     assert_eq!(head(&db), 90);
     assert_eq!(answers(&db, 90), want);
     drop(db);
-    assert!(MultiStorage::rewind_archive_offline(
+    let rewound = MultiStorage::rewind_archive_offline(
         &v4_dir,
         64,
         StorageKind::Rocksdb,
@@ -405,10 +403,14 @@ fn v4_rewind_goes_back_to_a_segment_end_and_takes_another_chain() {
         None,
         &v4_dir.join("no-offset"),
     )
-    .is_err());
+    .unwrap();
+    assert_eq!(rewound.header.number, 50);
+    let db = open(&v3_dir);
+    let want = answers(&db, 50);
+    drop(db);
     let db = open(&v4_dir);
-    assert_eq!(head(&db), 90);
-    assert_eq!(answers(&db, 90), want);
+    assert_eq!(head(&db), 50);
+    assert_eq!(answers(&db, 50), want);
     drop(db);
     let _ = std::fs::remove_dir_all(&v3_dir);
     let _ = std::fs::remove_dir_all(&v4_dir);

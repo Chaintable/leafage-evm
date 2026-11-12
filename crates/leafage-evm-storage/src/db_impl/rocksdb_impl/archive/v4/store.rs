@@ -69,7 +69,8 @@ pub(crate) struct Options {
     pub(crate) base_file_bytes: u64,
     /// zstd level of base files.
     pub(crate) base_level: i32,
-    /// Device bytes per second a base rewrite may read and write; 0: no cap.
+    /// Device bytes per second segment merges and base rewrites may read
+    /// and write, together; 0: no cap.
     pub(crate) rewrite_bytes_per_sec: f64,
     /// A base rewrite starts when the delta exceeds this share of the base...
     pub(crate) delta_ratio: f64,
@@ -97,7 +98,7 @@ impl Options {
             tiers: env_u64("ARCHIVE_V4_TIERS", 8).max(2) as usize,
             base_file_bytes: (env_f64("ARCHIVE_V4_BASE_FILE_MB", 8192.0) * (1 << 20) as f64) as u64,
             base_level: env_u64("ARCHIVE_V4_BASE_ZSTD_LEVEL", 3) as i32,
-            rewrite_bytes_per_sec: env_f64("ARCHIVE_V4_REWRITE_MBPS", 16.0) * 1e6,
+            rewrite_bytes_per_sec: env_f64("ARCHIVE_V4_REWRITE_MBPS", 32.0) * 1e6,
             delta_ratio: env_f64("ARCHIVE_V4_DELTA_PERCENT", 4.0) / 100.0,
             delta_min_bytes: env_u64("ARCHIVE_V4_DELTA_MIN_MB", 4096) << 20,
             delta_filter_bytes: env_u64("ARCHIVE_V4_DELTA_FILTER_MB", 512) << 20,
@@ -241,6 +242,10 @@ struct State {
     /// up to (0: no pass). It is in the manifest, so that a pass cut short
     /// goes on with the files it had not reached.
     pass: [u64; 2],
+    /// The block a rewind under way goes back to. It is in the manifest
+    /// while files are trimmed one by one: between two of them the store
+    /// holds some keys up to that block and others beyond it.
+    rewinding: Option<u64>,
 }
 
 /// A result of [`Store::get`].
@@ -274,6 +279,12 @@ struct Inner {
     /// Wakes the rewriter early.
     rewrite_lock: Mutex<bool>,
     rewrite_cv: Condvar,
+    /// The merger sleeps here until a flush adds a segment.
+    merge_lock: Mutex<bool>,
+    merge_cv: Condvar,
+    /// When the background IO accounted so far is paid for: see
+    /// [`Throttle`].
+    paced: Mutex<Instant>,
     stop: AtomicBool,
     /// A background flush or merge failed; writes report it.
     failed: Mutex<Option<String>>,
@@ -324,6 +335,8 @@ struct ManifestData {
     segdict: [u32; 2],
     /// The target of a base rewrite pass under way, per kind (0: none).
     pass: [u64; 2],
+    /// The block a rewind under way goes back to.
+    rewinding: Option<u64>,
     /// kind, fid, dict, hi, records, name, first key.
     base: Vec<(usize, u32, u32, u64, u64, String, [u8; 64])>,
     /// kind, fid, dict, lo, hi, level, records, distinct, name.
@@ -340,6 +353,7 @@ impl ManifestData {
             dicts: Vec::new(),
             segdict: [NO_DICT; 2],
             pass: [0; 2],
+            rewinding: None,
             base: Vec::new(),
             segs: Vec::new(),
             blocks: BlocksMeta::default(),
@@ -375,6 +389,7 @@ impl ManifestData {
                     let kind = num(1)? as usize;
                     *m.pass.get_mut(kind).ok_or_else(bad)? = num(2)?;
                 }
+                Some("rewinding") => m.rewinding = Some(num(1)?),
                 Some("base") => {
                     let key = f.get(7).and_then(|s| unhex(s)).ok_or_else(bad)?;
                     let kind = num(1)? as usize;
@@ -451,6 +466,9 @@ impl ManifestData {
                 s += &format!("pass {kind} {target}\n");
             }
         }
+        if let Some(block) = self.rewinding {
+            s += &format!("rewinding {block}\n");
+        }
         for (kind, fid, dict, hi, records, name, first_key) in &self.base {
             s += &format!(
                 "base {kind} {fid} {dict} {hi} {records} {name} {}\n",
@@ -485,14 +503,13 @@ fn dict_file(id: u32) -> String {
     format!("dict-{id:06}.dict")
 }
 
-/// Paces background IO to a byte rate. Time in which less was done than
-/// the rate allows (the work was slower, or something else ran) gives no
-/// credit beyond [`THROTTLE_BURST`]: it is not made up for at the device's
-/// speed afterwards.
+/// Paces background IO (segment merges and base rewrites) to a byte rate,
+/// one budget for all of it. Time in which less was done than the rate
+/// allows (the work was slower, or there was none) gives no credit beyond
+/// [`THROTTLE_BURST`]: it is not made up for at the device's speed
+/// afterwards.
 struct Throttle<'a> {
     inner: &'a Inner,
-    /// When the IO accounted so far is paid for.
-    paid: Instant,
 }
 
 /// The IO a throttle lets through at once, as time at its rate.
@@ -500,29 +517,29 @@ const THROTTLE_BURST: Duration = Duration::from_millis(200);
 
 impl<'a> Throttle<'a> {
     fn new(inner: &'a Inner) -> Self {
-        Self {
-            inner,
-            paid: Instant::now(),
-        }
+        Self { inner }
     }
 
     /// Account `bytes` of device IO, then wait as the pace requires.
     /// Returns an error once the store is closing.
     fn spend(&mut self, bytes: u64) -> Result<(), Error> {
         let rate = self.inner.opts.rewrite_bytes_per_sec;
-        if rate > 0.0 {
+        let until = (rate > 0.0).then(|| {
+            // When the background IO accounted so far is paid for.
+            let mut paid = self.inner.paced.lock().unwrap();
             let now = Instant::now();
-            let from = self
-                .paid
-                .max(now.checked_sub(THROTTLE_BURST).unwrap_or(now));
-            self.paid = from + Duration::from_secs_f64(bytes as f64 / rate);
-        }
+            let from = (*paid).max(now.checked_sub(THROTTLE_BURST).unwrap_or(now));
+            *paid = from + Duration::from_secs_f64(bytes as f64 / rate);
+            *paid
+        });
         loop {
             if self.inner.stop.load(Ordering::Relaxed) {
                 return Err(Error::ArchiveV4("store is closing".into()));
             }
-            let wait = self.paid.saturating_duration_since(Instant::now());
-            if rate <= 0.0 || wait.is_zero() {
+            let wait = until.map_or(Duration::ZERO, |until| {
+                until.saturating_duration_since(Instant::now())
+            });
+            if wait.is_zero() {
                 return Ok(());
             }
             std::thread::sleep(wait.min(Duration::from_millis(200)));
@@ -730,6 +747,7 @@ impl Inner {
         m.next_dict = st.next_dict;
         m.segdict = st.segdict;
         m.pass = st.pass;
+        m.rewinding = st.rewinding;
         let mut used: HashSet<u32> = st.segdict.iter().copied().collect();
         for (kind, list) in v.base.iter().enumerate() {
             for b in list {
@@ -1055,6 +1073,8 @@ impl Inner {
             nv.codes = codes.meta;
             self.publish(&mut st, nv, Some((blocks, codes)))?;
         }
+        *self.merge_lock.lock().unwrap() = true;
+        self.merge_cv.notify_all();
         M.flushes.increment(1);
         info!(
             target: "archive_v4",
@@ -1181,11 +1201,17 @@ impl Inner {
                 .map(|s| Cursor::new(s.file.clone(), None, None, 0, u64::MAX))
                 .collect();
             let mut it = MergeIter::new(inputs)?;
+            let mut throttle = Throttle::new(self);
+            let (mut n, mut spent) = (0u64, 0u64);
             while let Some(r) = it.next()? {
-                if self.stop.load(Ordering::Relaxed) {
-                    return Err(Error::ArchiveV4("store is closing".into()));
-                }
                 w.add(&r.key[..k], r.block, &r.val)?;
+                n += 1;
+                if n % 4096 == 0 {
+                    // Also where a closing store is noticed.
+                    let now = it.io_bytes() + w.bytes();
+                    throttle.spend(now - spent)?;
+                    spent = now;
+                }
             }
             let out = w.finish()?;
             sync_dir(&self.dir)?;
@@ -1275,6 +1301,9 @@ impl Inner {
         let Some(new_hi) = segs.iter().map(|s| s.hi).max() else {
             return Ok(0);
         };
+        // The rewrite of a file takes long: it keeps its inputs, not the
+        // memtables and every other file of this moment.
+        drop(v);
         let dict = match old {
             // The old file's dictionary, so that its pages can be copied.
             Some(old) => old.file.dict.clone(),
@@ -1462,7 +1491,9 @@ impl Inner {
     fn rewrite_pass(&self) -> Result<(), Error> {
         let _one = self.rewriting.lock().unwrap();
         let mut throttle = Throttle::new(self);
-        for kind in 0..2 {
+        // The block each kind is folded up to; 0: nothing to do there.
+        let mut targets = [0u64; 2];
+        for (kind, target) in targets.iter_mut().enumerate() {
             let v = self.view.load_full();
             let Some(newest) = v.segs[kind].iter().map(|s| s.hi).max() else {
                 self.set_pass(kind, 0)?;
@@ -1474,27 +1505,118 @@ impl Inner {
             }
             let recorded = self.state.lock().unwrap().pass[kind];
             // A recorded block above every segment is from before a rewind.
-            let target = if recorded != 0 && recorded <= newest {
+            *target = if recorded != 0 && recorded <= newest {
                 recorded
             } else {
                 self.set_pass(kind, newest)?;
                 newest
             };
-            let mut i = 0;
-            loop {
-                let v = self.view.load_full();
-                let Some(b) = v.base[kind].get(i) else {
-                    break;
-                };
-                i += if b.hi < target {
-                    self.rewrite_range(kind, Some(b), &mut throttle)?.max(1)
-                } else {
-                    1
-                };
+        }
+        // The file furthest behind first, of either kind: a segment is
+        // dropped when every file of its kind holds it, so the files behind
+        // are what the oldest segments wait for. One pass after another
+        // then goes round the base in the same order, and drops segments as
+        // it goes.
+        let mut stuck: HashSet<u32> = HashSet::new();
+        loop {
+            let v = self.view.load_full();
+            let next = (0..2)
+                .flat_map(|kind| v.base[kind].iter().map(move |b| (kind, b)))
+                .filter(|(kind, b)| b.hi < targets[*kind] && !stuck.contains(&b.file.fid))
+                .min_by_key(|(kind, b)| (b.hi, *kind));
+            let Some((kind, b)) = next.map(|(kind, b)| (kind, b.clone())) else {
+                break;
+            };
+            drop(v);
+            if self.rewrite_range(kind, Some(&b), &mut throttle)? == 0 {
+                // Nothing to fold into it after all.
+                stuck.insert(b.file.fid);
             }
+        }
+        for kind in 0..2 {
             self.set_pass(kind, 0)?;
         }
         Ok(())
+    }
+
+    /// Record that a rewind to `block` is under way, or (`None`) over.
+    fn set_rewinding(&self, block: Option<u64>) -> Result<(), Error> {
+        let mut st = self.state.lock().unwrap();
+        if st.rewinding == block {
+            return Ok(());
+        }
+        st.rewinding = block;
+        let v = (*self.view.load_full()).clone();
+        self.publish(&mut st, v, None)
+    }
+
+    /// Segment `seg` without its versions after `block`, as a new segment;
+    /// `None` if none is left.
+    fn trim_segment(
+        &self,
+        kind: usize,
+        seg: &Arc<Seg>,
+        block: u64,
+    ) -> Result<Option<Arc<Seg>>, Error> {
+        let storage = kind == 1;
+        let k = key_len(storage);
+        let dict = seg.file.dict.clone();
+        let fid = self.new_fid();
+        let name = format!("seg-{fid:08}-{}", kind_tag(kind));
+        let path = self.dir.join(&name);
+        let written = (|| -> Result<Option<Arc<Seg>>, Error> {
+            let mut w = PageWriter::new(&path, storage, &dict, SEGMENT_LEVEL, Some(seg.distinct))?;
+            let mut cursor = Cursor::new(seg.file.clone(), None, None, 0, block);
+            while let Some(r) = cursor.next()? {
+                w.add(&r.key[..k], r.block, &r.val)?;
+            }
+            let out = w.finish()?;
+            if out.records == 0 {
+                return Ok(None);
+            }
+            sync_dir(&self.dir)?;
+            Ok(Some(Arc::new(Seg {
+                file: Arc::new(PageFile::open(&path, fid, storage, dict.clone())?),
+                name: name.clone(),
+                lo: seg.lo,
+                hi: block,
+                level: seg.level,
+                records: out.records,
+                distinct: out.distinct,
+                bloom: out.bloom.expect("asked for"),
+            })))
+        })();
+        if !matches!(written, Ok(Some(_))) {
+            remove_page_file(&path);
+        }
+        written
+    }
+
+    /// Base file `old` without its versions after `block`, as new files
+    /// that hold the history up to `block`.
+    fn trim_base(
+        &self,
+        kind: usize,
+        old: &Arc<BaseFile>,
+        block: u64,
+    ) -> Result<Vec<Arc<BaseFile>>, Error> {
+        let storage = kind == 1;
+        let k = key_len(storage);
+        let mut out = BaseOut::new(self, storage, old.file.dict.clone(), block);
+        let mut cursor = Cursor::new(old.file.clone(), None, None, 0, block);
+        let result = (|| -> Result<(), Error> {
+            while let Some(r) = cursor.next()? {
+                out.add(&r.key[..k], r.block, &r.val)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            out.abort();
+            return Err(e);
+        }
+        let files = out.finish()?;
+        sync_dir(&self.dir)?;
+        Ok(files)
     }
 
     /// Record the block the rewrite pass of `kind` folds up to (0: none).
@@ -1544,6 +1666,18 @@ impl Inner {
                 Ok(false) => {}
                 Err(e) => return self.fail("memtable flush", e),
             }
+            M.page_cache_usage_bytes.set(self.cache.weight() as f64);
+            let g = self.flush_lock.lock().unwrap();
+            if self.view.load().frozen.is_none() && !self.stop.load(Ordering::Relaxed) {
+                let _ = self.flush_cv.wait_timeout(g, Duration::from_secs(5));
+            }
+        }
+    }
+
+    /// Merges segments. Not on the flusher's thread: a merge is paced and
+    /// may take long, and a memtable must not wait for it to be written.
+    fn merger(&self) {
+        while !self.stop.load(Ordering::Relaxed) {
             match self.merge_step() {
                 Ok(true) => continue,
                 Ok(false) => {}
@@ -1555,15 +1689,19 @@ impl Inner {
                     }
                 }
             }
-            M.page_cache_usage_bytes.set(self.cache.weight() as f64);
-            let g = self.flush_lock.lock().unwrap();
-            if self.view.load().frozen.is_none() && !self.stop.load(Ordering::Relaxed) {
-                let _ = self.flush_cv.wait_timeout(g, Duration::from_secs(5));
+            let mut woken = self.merge_lock.lock().unwrap();
+            if !*woken && !self.stop.load(Ordering::Relaxed) {
+                woken = self
+                    .merge_cv
+                    .wait_timeout(woken, Duration::from_secs(5))
+                    .unwrap()
+                    .0;
             }
+            *woken = false;
         }
     }
 
-    /// Rewrites the base and maintains the address filters.
+    /// Rewrites the base.
     fn rewriter(&self) {
         while !self.stop.load(Ordering::Relaxed) {
             if self.rewrite_due() {
@@ -1672,6 +1810,16 @@ impl Store {
             }
         }
         let m = ManifestData::parse(&std::fs::read_to_string(dir.join(MANIFEST))?)?;
+        if let Some(block) = m.rewinding {
+            // Some files hold the history up to that block, others beyond.
+            if opts.background {
+                return Err(Error::UnSupported(format!(
+                    "a rewind of this archive to block {block} was cut short: run it again \
+                     (to that block or below) before the archive is used"
+                )));
+            }
+            warn!(target: "archive_v4", "a rewind to block {block} was cut short and is to be run again");
+        }
         let mut dicts: HashMap<u32, Arc<Dict>> = HashMap::new();
         dicts.insert(NO_DICT, Arc::new(Dict::new(NO_DICT, Vec::new())));
         for (id, name) in &m.dicts {
@@ -1846,6 +1994,7 @@ impl Store {
                 dicts,
                 segdict: m.segdict,
                 pass: m.pass,
+                rewinding: m.rewinding,
             }),
             next_block: AtomicU64::new(next_block),
             flush_lock: Mutex::new(()),
@@ -1853,6 +2002,9 @@ impl Store {
             rewriting: Mutex::new(()),
             merging: Mutex::new(()),
             rewrite_lock: Mutex::new(false),
+            merge_lock: Mutex::new(false),
+            merge_cv: Condvar::new(),
+            paced: Mutex::new(Instant::now()),
             rewrite_cv: Condvar::new(),
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
@@ -1867,6 +2019,7 @@ impl Store {
         if inner.opts.background {
             for (name, run) in [
                 ("v4-flush", Inner::flusher as fn(&Inner)),
+                ("v4-merge", Inner::merger),
                 ("v4-rewrite", Inner::rewriter),
             ] {
                 let inner = inner.clone();
@@ -2283,15 +2436,21 @@ impl Store {
         Ok(())
     }
 
-    /// Go back to the last block at or below `block` that ends a segment:
-    /// every segment reaching above `block` is dropped whole, with all the
-    /// blocks it holds, and the block files are cut to match. Returns that
-    /// block; the caller fetches the later ones again. Offline: the store
-    /// must have no background work and an empty memtable.
+    /// Go back to block `block`: every version, block info and segment
+    /// after it goes. A file that reaches above the block is written again
+    /// without what comes after it, base files as well as segments, so the
+    /// cost is the size of those files: the segments and, of the base, the
+    /// files rewritten since that block. Returns the block the store is at
+    /// (`block`, or its head if that is lower); the caller fetches the later
+    /// ones again. Offline: the store must have no background work and an
+    /// empty memtable.
     ///
-    /// The base files are not rewound: a block below what they hold is an
-    /// error, and so is one below the first segment of a store without a
-    /// base.
+    /// Files are trimmed one at a time, each replacing the one it comes
+    /// from, so that the space needed is that of one file. In between the
+    /// store holds some keys up to `block` and others beyond: the manifest
+    /// says that a rewind is under way, a store in that state is opened by
+    /// nothing but a rewind, and a rewind that was cut short is run again,
+    /// to the same block or one below it.
     pub(crate) fn rewind(&self, block: u64) -> Result<u64, Error> {
         let inner = &*self.inner;
         if inner.opts.background {
@@ -2309,58 +2468,76 @@ impl Store {
         let Some(durable) = v.durable() else {
             return Err(Error::UnSupported("rewinding an empty store".into()));
         };
-        if block >= durable {
-            return Ok(durable);
-        }
-        // A dropped segment takes its first blocks with it, and so the
-        // segments of the other kind that hold those.
-        let mut land = block;
-        while let Some(lo) = v
-            .segs
-            .iter()
-            .flatten()
-            .filter(|s| s.hi > land)
-            .map(|s| s.lo)
-            .min()
-            .filter(|lo| *lo <= land)
-        {
-            land = lo.checked_sub(1).ok_or_else(|| {
-                Error::UnSupported(format!(
-                    "block {block} is in the first segment of the archive: nothing would remain"
-                ))
-            })?;
-        }
-        if let Some(hi) = v
-            .base
-            .iter()
-            .flatten()
-            .map(|b| b.hi)
-            .max()
-            .filter(|hi| *hi > land)
-        {
+        let pending = inner.state.lock().unwrap().rewinding;
+        if let Some(pending) = pending.filter(|pending| block > *pending) {
             return Err(Error::UnSupported(format!(
-                "block {block} is below block {hi}, up to which the base files hold the history; \
-                 an archive is not rewound into its base: create it again from a snapshot"
+                "a rewind to block {pending} was cut short: files hold nothing above it any \
+                 more, rewind to that block or below"
             )));
         }
-        if v.blocks.count > 0 && land < v.blocks.first {
+        if pending.is_none() && block >= durable {
+            return Ok(durable);
+        }
+        if v.blocks.count > 0 && block < v.blocks.first {
             return Err(Error::UnSupported(format!(
                 "block {block} is below the first block of the archive"
             )));
         }
-        let mut nv = (*v).clone();
-        let mut removed: Vec<String> = Vec::new();
+        drop(v);
+        inner.set_rewinding(Some(block))?;
+        let mut trimmed = (0usize, 0u64);
         for kind in 0..2 {
-            nv.segs[kind].retain(|s| {
-                let keep = s.hi <= land;
-                if !keep {
-                    removed.push(s.name.clone());
+            // Segments wholly after the block go; those across it and the
+            // base files that reach beyond it are written again.
+            loop {
+                let v = inner.view.load_full();
+                let Some(seg) = v.segs[kind].iter().find(|s| s.hi > block).cloned() else {
+                    break;
+                };
+                drop(v);
+                let new = if seg.lo > block {
+                    None
+                } else {
+                    inner.trim_segment(kind, &seg, block)?
+                };
+                {
+                    let mut st = inner.state.lock().unwrap();
+                    let mut nv = (*inner.view.load_full()).clone();
+                    let at = nv.segs[kind]
+                        .iter()
+                        .position(|s| s.file.fid == seg.file.fid)
+                        .ok_or_else(|| corrupt("segment vanished during a rewind"))?;
+                    nv.segs[kind].splice(at..at + 1, new);
+                    inner.publish(&mut st, nv, None)?;
                 }
-                keep
-            });
+                remove_page_file(&inner.dir.join(&seg.name));
+                trimmed = (trimmed.0 + 1, trimmed.1 + seg.file.data_len());
+            }
+            loop {
+                let v = inner.view.load_full();
+                let Some(old) = v.base[kind].iter().find(|b| b.hi > block).cloned() else {
+                    break;
+                };
+                drop(v);
+                let files = inner.trim_base(kind, &old, block)?;
+                {
+                    let mut st = inner.state.lock().unwrap();
+                    let mut nv = (*inner.view.load_full()).clone();
+                    let at = nv.base[kind]
+                        .iter()
+                        .position(|b| b.file.fid == old.file.fid)
+                        .ok_or_else(|| corrupt("base file vanished during a rewind"))?;
+                    nv.base[kind].splice(at..at + 1, files);
+                    inner.publish(&mut st, nv, None)?;
+                }
+                remove_page_file(&inner.dir.join(&old.name));
+                trimmed = (trimmed.0 + 1, trimmed.1 + old.file.data_len());
+            }
         }
-        let cut = if v.blocks.last().is_some_and(|last| last > land) {
-            Some(inner.blocks.cut(land)?)
+        let v = inner.view.load_full();
+        let mut nv = (*v).clone();
+        let cut = if v.blocks.last().is_some_and(|last| last > block) {
+            Some(inner.blocks.cut(block)?)
         } else {
             None
         };
@@ -2374,17 +2551,21 @@ impl Store {
             let mut st = inner.state.lock().unwrap();
             // A pass that was folding up to a block now gone starts anew.
             for target in st.pass.iter_mut() {
-                if *target > land {
+                if *target > block {
                     *target = 0;
                 }
             }
+            st.rewinding = None;
             inner.publish(&mut st, nv, side.transpose()?)?;
         }
-        for name in removed {
-            remove_page_file(&inner.dir.join(name));
-        }
+        let land = inner.view.load().durable().unwrap_or(block);
         inner.next_block.store(land + 1, Ordering::Release);
-        info!(target: "archive_v4", "rewound to block {land} (asked for {block})");
+        info!(
+            target: "archive_v4",
+            "rewound to block {land} (asked for {block}): {} files of {:.2} GiB written again or dropped",
+            trimmed.0,
+            trimmed.1 as f64 / (1u64 << 30) as f64
+        );
         Ok(land)
     }
 
@@ -2409,6 +2590,10 @@ impl Drop for Store {
         {
             let _g = self.inner.flush_lock.lock().unwrap();
             self.inner.flush_cv.notify_all();
+        }
+        {
+            let _g = self.inner.merge_lock.lock().unwrap();
+            self.inner.merge_cv.notify_all();
         }
         {
             let mut woken = self.inner.rewrite_lock.lock().unwrap();
@@ -2855,35 +3040,73 @@ pub(crate) mod tests {
         }
         store.flush().unwrap();
         drop(store);
-        // Into the delta: it lands on the end of a segment at or below the
-        // target, and everything up to there is as it was.
+        // Into the delta, to the very block, in the middle of a segment or
+        // at its end; a block at or above the head changes nothing.
         let mut head = 260;
-        for target in [233, 201, 201] {
+        for target in [233, 201, 201, 300] {
             let store = Store::open(&dir, small_options()).unwrap();
             let landed = store.rewind(target).unwrap();
-            assert!(landed <= target && landed > 144, "landed on {landed}");
+            assert_eq!(landed, target.min(head));
             assert_eq!(store.durable(), Some(landed));
             assert_eq!(store.head(), Some(landed));
-            assert!(landed <= head);
             head = landed;
             model.retain(|k, _| k.2 <= head);
             check(&store, &model, head);
             check_slots(&store, &model, 0, head);
             drop(store);
         }
-        // Not into the base, which holds the blocks flushed before it was
-        // rewritten: 144 of the 150, in memtables of 16.
+        // Into the base, which holds the blocks flushed before it was
+        // rewritten (144 of the 150, in memtables of 16): its files are
+        // written again without what came after the block.
         {
             let store = Store::open(&dir, small_options()).unwrap();
-            assert!(store.rewind(120).is_err());
-            assert_eq!(store.durable(), Some(head));
-            check(&store, &model, head);
-            // To its end it goes: no segment is left.
-            assert_eq!(store.rewind(150).unwrap(), 144);
-            head = 144;
+            assert_eq!(store.rewind(120).unwrap(), 120);
+            head = 120;
             model.retain(|k, _| k.2 <= head);
-            assert_eq!(store.sizes().2, 0);
+            assert_eq!(store.sizes().2, 0, "no segment is left");
+            let v = store.inner.view.load_full();
+            assert!(v.base.iter().flatten().all(|b| b.hi == 120));
             check(&store, &model, head);
+            check_slots(&store, &model, 0, head);
+            drop(v);
+            drop(store);
+            let store = Store::open(&dir, small_options()).unwrap();
+            assert_eq!(store.head(), Some(120));
+            check(&store, &model, head);
+        }
+        // A rewind that was cut short after its first base file: the store
+        // is opened by nothing but a rewind, to that block or below, which
+        // then goes on.
+        {
+            let store = Store::open(&dir, small_options()).unwrap();
+            let inner = &store.inner;
+            inner.set_rewinding(Some(100)).unwrap();
+            let v = inner.view.load_full();
+            let old = v.base[1][0].clone();
+            let files = inner.trim_base(1, &old, 100).unwrap();
+            {
+                let mut st = inner.state.lock().unwrap();
+                let mut nv = (*v).clone();
+                nv.base[1].splice(0..1, files);
+                inner.publish(&mut st, nv, None).unwrap();
+            }
+            remove_page_file(&dir.join(&old.name));
+            drop(v);
+            drop(store);
+            let mut serving = small_options();
+            serving.background = true;
+            assert!(Store::open(&dir, serving).is_err());
+            let store = Store::open(&dir, small_options()).unwrap();
+            assert!(store.rewind(110).is_err());
+            assert_eq!(store.rewind(100).unwrap(), 100);
+            head = 100;
+            model.retain(|k, _| k.2 <= head);
+            check(&store, &model, head);
+            check_slots(&store, &model, 0, head);
+            drop(store);
+            let mut serving = small_options();
+            serving.background = true;
+            drop(Store::open(&dir, serving).unwrap());
         }
         // A different chain grows from the rewind point.
         let store = Store::open(&dir, small_options()).unwrap();
@@ -3151,6 +3374,12 @@ pub(crate) mod tests {
         throttle.spend(600_000).unwrap();
         // 0.6 s at the rate, less the burst.
         assert!(started.elapsed() >= Duration::from_millis(350));
+        // Merges and rewrites pay from one budget: what one spent, the
+        // other waits for.
+        let mut other = Throttle::new(&store.inner);
+        let started = Instant::now();
+        other.spend(300_000).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

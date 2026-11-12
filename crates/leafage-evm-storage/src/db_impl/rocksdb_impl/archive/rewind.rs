@@ -36,9 +36,8 @@ impl DataBaseRef {
     }
 
     /// Truncate the archive to `target`. Returns the block it then ends at:
-    /// the target, or on schema v4 the last block at or below it that ends
-    /// a segment (see `v4::Store::rewind`); the node fetches the blocks
-    /// after it again.
+    /// the target (on schema v4 see `v4::Store::rewind`); the node fetches
+    /// the blocks after it again.
     pub(crate) fn rewind_to(&self, target: &BlockInfo, inverted: bool) -> Result<u64, Error> {
         if let Some(store) = &self.v4 {
             return store.rewind(target.header.number);

@@ -247,7 +247,8 @@ When the memtable reaches `ARCHIVE_V4_FLUSH_MB` (512) or spans
 thread writes it out: a segment per kind, the infos of its blocks appended
 to the block files, its code to the code files; all synced, and then the
 manifest lists the segments and the new lengths. Writers wait if the
-previous memtable is still being written.
+previous memtable is still being written. Merges run on a thread of their
+own, at the pace of the background IO: a memtable does not wait for one.
 
 Segments merge size-tiered: `ARCHIVE_V4_TIERS` (8) neighbours of a level
 become one of the next. On bsc the segments cost 4.7 bytes written per byte
@@ -327,10 +328,12 @@ When the delta exceeds `ARCHIVE_V4_DELTA_PERCENT` (4 %) of the base and
 `ARCHIVE_V4_DELTA_FILTER_MB` (512), a background thread folds it into the
 base, one base file at a time: it merges the file with the versions of its
 key range from every segment above the file's block, writes new files, and
-swaps them in. Pages no new version falls into are copied without being
-decoded (the new file keeps the old one's dictionary). A segment is removed
-when every base file of its kind holds it, at the end of the kind's pass:
-until then its versions are on disk twice. A pass so needs free space for
+swaps them in. Pages no new version falls into are copied as stored: they
+are decompressed, to see where they begin, and not encoded or compressed
+again (the new file keeps the old one's dictionary). The file furthest
+behind goes first, of either kind. A segment is removed when every base
+file of its kind holds it: in a first pass at the end of the kind's files,
+until when its versions are on disk twice. A pass so needs free space for
 the delta once more and for one base file: about 35 GiB on bsc at the
 default limits, 55 with `ARCHIVE_V4_DELTA_FILTER_MB=1024`, returned when
 the pass ends.
@@ -342,15 +345,30 @@ being written and keeps the files already rewritten; when it is due again
 that are still below that block. The delta flushed since the pass began
 stays for the next one.
 
-The rewrite is paced by the node, since the device has no IO scheduler to
-do it: at most `ARCHIVE_V4_REWRITE_MBPS` (16) of device IO, read and
-written. The rate is all there is: the rewrite does not watch the lookups,
-so a pass always ends after `2 × base / rate`. Time in which it did less
-than the rate allows (a slow stretch) is not made up for afterwards at the speed of the device. Unthrottled, a rewrite at
-200 MB/s on a 125 MB/s volume cut read throughput by 3.5 (measured on the
-prototype), so do not raise the rate to the volume's limit on a serving
-node. At 16 MB/s a pass over bsc
-takes about two days; the delta that accumulates meanwhile is about 2 GiB.
+Background IO is paced by the node, since the device has no IO scheduler
+to do it: segment merges and base rewrites together read and write at
+most `ARCHIVE_V4_REWRITE_MBPS` (32) of device IO. Flushes are not paced: a
+memtable must get out. The rate is all there is: the rewrite does not
+watch the lookups, so a pass ends after `2 × base / rate`, plus the
+merges that ran meanwhile. Time in which less was done than the rate
+allows is not made up for afterwards at the speed of the device.
+Unthrottled, a rewrite at 200 MB/s on a 125 MB/s volume cut read
+throughput by 3.5 (measured on the prototype), so do not raise the rate to
+the volume's limit on a serving node. At 32 MB/s a pass over bsc takes
+about a day; the delta that accumulates meanwhile is about 2 GiB.
+
+**Even writes.** A rate low enough that a pass takes weeks makes the next
+pass due when one ends, and the passes then go round the base without a
+pause: each file folds the delta up to the moment it is rewritten, the
+next pass takes the files in the same order, and segments are dropped as
+it goes. On bsc `ARCHIVE_V4_REWRITE_MBPS=1.2` with
+`ARCHIVE_V4_DELTA_PERCENT=2` is a round of about 25 days, 48 GiB written a
+day at 0.6 MB/s all the time, instead of the whole base in a day every
+two weeks; the delta is then a round's worth at all times (50 – 70 GiB,
+so `ARCHIVE_V4_DELTA_FILTER_MB=1536` for its filters), the merges share
+the rate, and a base file of 8 GiB takes four hours, which a node that
+restarts loses: write the archive with `ARCHIVE_V4_BASE_FILE_MB=2048` for
+this. These figures follow from the code; no node has run this way yet.
 
 A pass writes the whole base again, so the rewrite costs `base / delta`
 bytes written per byte of history, against 4.7 for the segments. On bsc
@@ -360,7 +378,7 @@ per GiB of delta (measured on a node following the chain: 332 MiB for
 15.8 GB; on the prototype 993 MiB for 52 GiB), so 512 MiB stands for a
 delta of about 26 GiB, 2.2 % of the base and two weeks of blocks. That is
 46 bytes written per byte of history, about 90 GiB a day on average, all of
-it in the two days of a pass. The rewrite is an estimate from these
+it in the day of a pass. The rewrite is an estimate from these
 settings: no node has run long enough to start one by itself. A production
 v3 replica writes 58 – 75 GiB a day to its volume (CloudWatch, November
 2026).
@@ -408,18 +426,21 @@ finds (a damaged prefix makes a block not found, never another returned).
 
 ## Rewind
 
-`leafage-evm rewind --archive --to-block N` is offline, as for v2 and v3.
-On v4 it does not cut inside a file: **every segment that reaches above
-`N` is dropped whole**, with all the blocks it holds, the block files are
-cut to match, and the archive ends at the last segment end at or below
-`N`. The command reports that block; the node fetches the blocks after it
-again. Segments grow by merging, so the archive may go back up to the span
-of its largest segment (on bsc at most the two weeks between base
-rewrites, an hour or two of catching up).
+`leafage-evm rewind --archive --to-block N` is offline, as for v2 and v3,
+and goes back to block `N` itself. A file that reaches above `N` is
+written again without what comes after it: the segments (those wholly
+after `N` are dropped) and, of the base, the files rewritten since that
+block; the block files are cut. The cost is the size of those files. A
+rewind of a few hours writes a base file or two again, one into what the
+base held before its last rewrite of every file writes all of it (hours:
+it is the size of a base rewrite, unpaced).
 
-The base files are not rewound. A target below the block up to which they
-hold the history is refused: create the archive again from a snapshot.
-After a base rewrite that is everything but its last two days.
+Files are trimmed one at a time, each replacing the one it comes from, so
+the space needed is that of one file. In between the archive holds some
+keys up to `N` and others beyond: the manifest says that a rewind is under
+way (`rewinding <block>`), a node does not open an archive in that state,
+and a rewind that was cut short is run again, to the same block or one
+below it.
 
 `--head-only` is refused: v4 cannot keep versions above its head.
 
@@ -466,7 +487,7 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 | `ARCHIVE_V4_TIERS` | 8 | segments of a level merged into one |
 | `ARCHIVE_V4_DELTA_PERCENT` / `ARCHIVE_V4_DELTA_MIN_MB` | 4 / 4096 | delta size, relative to the base and absolute, that starts a base rewrite |
 | `ARCHIVE_V4_DELTA_FILTER_MB` | 512 | segment filter memory that starts one |
-| `ARCHIVE_V4_REWRITE_MBPS` | 16 | device IO of a base rewrite, read plus written (0: no limit) |
+| `ARCHIVE_V4_REWRITE_MBPS` | 32 | device IO of segment merges and base rewrites together, read plus written (0: no limit); about 1.2 for even writes on bsc ("Base rewrite") |
 | `ARCHIVE_V4_BASE_FILE_MB` | 8192 | size at which a base file is closed |
 | `ARCHIVE_V4_BASE_ZSTD_LEVEL` | 3 | zstd level of base files (15 – 19: about 3 % smaller, 5 – 10 times slower to write) |
 | `ARCHIVE_V4_BLOCK_CACHE_MB` | 64 | memory for decoded chunks of block infos |
@@ -493,7 +514,7 @@ archive.
 - `archive-clear-deleted`, `archive-scan`, `force-compact`, `put-code`,
   `pipeline-export`: they work on a RocksDB, which a v4 archive does not
   have. Convert an archive after repairing it.
-- `rewind --head-only`, and a rewind into the base (above).
+- `rewind --head-only`.
 - Block numbers of 2^32 and above.
 - An exact restart: see "Writes".
 - Archives of development builds that kept block infos and code in a
@@ -588,7 +609,7 @@ production replicas write. v4 flushed five times (one segment per kind and
 once. No base rewrite ran, and none is due for two weeks; averaged over
 its period it adds the 90 GiB a day estimated under *Base rewrite*, or 48
 with `ARCHIVE_V4_DELTA_FILTER_MB=1024` (a pass every 25 days, when the
-delta is 4 % of the base), in the two days of each pass.
+delta is 4 % of the base), in the day of each pass.
 
 ### Lookups alone
 

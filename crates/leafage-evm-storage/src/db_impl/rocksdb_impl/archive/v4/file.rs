@@ -436,8 +436,13 @@ impl Cursor {
                 .min(n),
             None => n,
         };
+        // A scan of a few pages does not read a whole window for them.
+        let until = match end.checked_sub(1) {
+            Some(last) if end < n => file.index.range(last).1,
+            _ => file.data_len(),
+        };
         Self {
-            seq: SeqReader::new(file),
+            seq: SeqReader::until(file, until),
             storage,
             next_page: start,
             end_page: end,
