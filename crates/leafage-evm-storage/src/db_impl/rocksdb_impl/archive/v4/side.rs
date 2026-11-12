@@ -477,12 +477,14 @@ impl Blocks {
     /// [`Self::append`], in two steps.
     pub(crate) fn cut(&self, last: u64) -> Result<BlocksAppend, Error> {
         let meta = self.meta();
-        let count = last + 1 - meta.first;
-        if last < meta.first || count > meta.count {
-            return Err(Error::UnSupported(format!(
-                "archive v4 block files do not hold block {last}"
-            )));
-        }
+        let count = match last.checked_sub(meta.first) {
+            Some(n) if n < meta.count => n + 1,
+            _ => {
+                return Err(Error::UnSupported(format!(
+                    "archive v4 block files do not hold block {last}"
+                )))
+            }
+        };
         let keep = (count / BLOCK_CHUNK) as usize;
         let rest = (count % BLOCK_CHUNK) as usize;
         let mut new = BlocksMeta {
@@ -929,6 +931,10 @@ mod tests {
         let blocks = Blocks::open(&dir, meta, 1 << 20).unwrap();
         assert!(blocks.append(next + 1, &[block(next + 1)], LEVEL).is_err());
         check(&blocks, first, next - 1);
+        // A cut to a block the files do not hold is refused.
+        for last in [first - 1, 0, next, u64::MAX] {
+            assert!(blocks.cut(last).is_err(), "cut to {last}");
+        }
         // Cuts: into a chunk, onto a chunk's end, then appends go on.
         for last in [first + 70, first + 63, first + 2] {
             let cut = blocks.cut(last).unwrap();

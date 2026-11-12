@@ -138,11 +138,28 @@ thread_local! {
     });
 }
 
-/// Whether page files are opened with `O_DIRECT` (`ARCHIVE_V4_DIRECT_IO=0`
-/// turns it off). The store keeps its own page cache, so going through the
-/// kernel's would hold every page twice.
+/// Whether lookups read page files with `O_DIRECT` (`ARCHIVE_V4_DIRECT_IO=1`).
+/// By default they go through the kernel's page cache, which holds the
+/// stored pages the store's own cache of decompressed pages has no room
+/// for, sizes itself to the memory that is free, and outlives the process.
+/// With `O_DIRECT` the store's cache is all there is: `--db-cache` must
+/// then be most of the memory.
 fn direct_io() -> bool {
-    std::env::var("ARCHIVE_V4_DIRECT_IO").map_or(true, |v| v.trim() != "0")
+    std::env::var("ARCHIVE_V4_DIRECT_IO").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Open `path` for reads with `O_DIRECT`; `None` where the filesystem has
+/// none (tmpfs).
+fn open_direct(path: &Path) -> Result<Option<File>, Error> {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Decompress a zstd frame written with `dict` (or with none) that holds at
@@ -211,8 +228,13 @@ pub(crate) struct PageFile {
     pub(crate) storage: bool,
     /// Path without extension.
     pub(crate) base: PathBuf,
+    /// For lookups: one page at a place of its own.
     file: File,
     direct: bool,
+    /// For reads front to back (merges, rewrites, filter builds): always
+    /// direct where the filesystem can, so that passing over a file does
+    /// not fill the kernel's page cache with it.
+    seq: File,
     pub(crate) index: Index,
     pub(crate) dict: Arc<Dict>,
 }
@@ -229,23 +251,19 @@ impl PageFile {
             return Err(corrupt(format!("{base:?}: index of the wrong kind")));
         }
         let path = data_path(base);
-        let mut direct = direct_io();
-        let file = if direct {
-            match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&path)
-            {
-                Ok(f) => f,
-                // The filesystem has no direct IO (tmpfs).
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                    direct = false;
-                    File::open(&path)?
-                }
-                Err(e) => return Err(e.into()),
+        let seq = match open_direct(&path)? {
+            Some(f) => f,
+            None => File::open(&path)?,
+        };
+        let (file, direct) = match direct_io().then(|| open_direct(&path)).transpose()? {
+            Some(Some(f)) => (f, true),
+            _ => {
+                let f = File::open(&path)?;
+                // Lookups read single pages all over the file: no readahead.
+                // Advice only.
+                unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+                (f, false)
             }
-        } else {
-            File::open(&path)?
         };
         let len = file.metadata()?.len();
         if len != index.data_len() {
@@ -260,6 +278,7 @@ impl PageFile {
             base: base.to_path_buf(),
             file,
             direct,
+            seq,
             index,
             dict,
         })
@@ -355,7 +374,7 @@ impl SeqReader {
                 .div_ceil(ALIGN)
                 * ALIGN;
             let b = self.buf.slice(want);
-            self.wlen = read_at(&self.file.file, b, self.wstart)?;
+            self.wlen = read_at(&self.file.seq, b, self.wstart)?;
             self.io_bytes += self.wlen as u64;
             if end > self.wstart + self.wlen as u64 {
                 return Err(corrupt(format!(

@@ -178,11 +178,23 @@ probes that cannot pay"). The bound is exact in a base file; a segment above
 the read height whose filter has the key ends the span at the segment's
 first block, without being read.
 
-Pages are read with `O_DIRECT` into the store's own cache of decompressed
-pages (the kernel page cache is not used for them). `--db-cache` is the
-memory of the whole store: the page index, the filters, the tables of the
-block and code files and the cache of block chunks take what they need,
-the page cache the rest.
+The store keeps a cache of decompressed pages, and reads the pages it
+misses through the kernel's page cache, which holds them as stored: two
+levels, the small one without a decompression per lookup, the large one
+sized by the kernel to the memory that is free and kept over a restart of
+the process. `--db-cache` is the memory of the store itself: the page
+index, the filters, the tables of the block and code files and the cache of
+block chunks take what they need, the cache of pages the rest. It stays at
+what a v3 archive is given (8192 on bsc); the memory beyond it is the
+kernel's. With `ARCHIVE_V4_DIRECT_IO=1` lookups read with `O_DIRECT` and
+the store's cache is all there is: `--db-cache` must then be most of the
+memory (22000 of 30 GiB in the runs below). The two were the same in CPU,
+latency and device reads at the production rate (Results).
+
+Merges, base rewrites and filter builds read files front to back with
+`O_DIRECT` in either mode, and what they write is dropped from the
+kernel's cache as it is synced: a pass over the base does not push the
+pages of the lookups out.
 
 ### Address filters
 
@@ -202,12 +214,16 @@ filter over every key would need 5 – 9 GiB on bsc and is not kept.
 ### Writes
 
 A commit applies the batch to the memtable: the versions sorted by block,
-the infos of its blocks, new code. Nothing else is written. A reader finds
-all of it there at once.
+the infos of its blocks, new code. Nothing else is written. Readers do not
+wait for it; they take a block for written when they find its info or see
+the head at it, so the order is: the code (found by its hash), then for
+each block its versions, its info, the head.
 
 Blocks come in order. A commit of versions at or below the head fails; the
 head block itself may be written again while it is still in the active
-memtable, and replaces what it wrote. A block the files hold is accepted
+memtable, as the block it is (the same hash; its versions are written
+over). Another block at that number is refused, as the versions of the
+first would stay: that needs a rewind. A block the files hold is accepted
 again only with the hash they have and without versions (the state tree
 writes the head it opened on again). The head is the last block written and
 cannot be set to anything else.
@@ -260,8 +276,8 @@ into a table sorted by the first 8 bytes of the hash (16 bytes per code:
 Both are append-only, and their valid lengths are in the manifest: a flush
 appends, syncs, and the manifest that lists its segments records the new
 lengths. They need no merge and no rewrite. They are read through the
-kernel's page cache, not with `O_DIRECT` like page files: they are appended
-to while they are read, and a direct read of a file under buffered appends
+kernel's page cache in either mode of the page files: they are appended to
+while they are read, and a direct read of a file under buffered appends
 fails on the kernels tried.
 
 Each has a zstd dictionary (`blocks.dict`, 32 KiB; `code.dict`, 1 MiB)
@@ -431,15 +447,13 @@ value, block, and that the span v4 reports skips no version. It opens the
 v4 store itself: stop the node first.
 
 To move a fleet: convert on the seed, verify, snapshot, and create the
-replicas from the snapshot, as for v2 → v3. Raise `--db-cache` to the memory
-the pod can give the archive (the kernel page cache no longer serves
-history): on a 30 GiB pod, about 22 GiB.
+replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `--db-cache` | | memory of the store: page index, filters, the tables of the block and code files, block chunk cache, and the page cache with the rest |
+| `--db-cache` | | memory of the store: page index, filters, the tables of the block and code files, block chunk cache, and its cache of decompressed pages with the rest. As for v3 (8192 on bsc); most of the memory with `ARCHIVE_V4_DIRECT_IO=1` |
 | `ARCHIVE_V4_FLUSH_MB` / `ARCHIVE_V4_FLUSH_BLOCKS` | 512 / 4800 | memtable size and age at which it becomes a segment |
 | `ARCHIVE_V4_TIERS` | 8 | segments of a level merged into one |
 | `ARCHIVE_V4_DELTA_PERCENT` / `ARCHIVE_V4_DELTA_MIN_MB` | 4 / 4096 | delta size, relative to the base and absolute, that starts a base rewrite |
@@ -450,7 +464,7 @@ history): on a 30 GiB pod, about 22 GiB.
 | `ARCHIVE_V4_FILTER_MB` | 256 | memory of the address filters (0: none) |
 | `ARCHIVE_V4_FILTER_PERIOD_SECS` | 600 | how often the address filters are revised |
 | `ARCHIVE_V4_BLOCK_CACHE_MB` | 64 | memory for decoded chunks of block infos |
-| `ARCHIVE_V4_DIRECT_IO` | 1 | read page files with `O_DIRECT` |
+| `ARCHIVE_V4_DIRECT_IO` | 0 | 1: lookups read page files with `O_DIRECT`, past the kernel's page cache |
 
 `ARCHIVE_STATE_CACHE_MB` and `ARCHIVE_CODE_CACHE_MB` work as on v3. The
 block index is always on (`ARCHIVE_BLOCK_INDEX` is not read), and the
@@ -594,8 +608,9 @@ The same pod's requests (5.88 M, almost all `contractMultiCall`) replayed
 against a node in a container of 6 CPUs with the device throttled as above:
 2.35 M requests as fast as 16 connections take them from a cold start, then
 the other 3.53 M at a fixed rate. v3 runs as in production (`--db-cache`
-8192, reads through the page cache, 30 GiB), v4 with `--db-cache` 22000 in
-30 GiB and with `--db-cache` 10000 in 16 GiB.
+8192, reads through the page cache, 30 GiB), v4 with `ARCHIVE_V4_DIRECT_IO=1`
+(the default when these were run) and `--db-cache` 22000 in 30 GiB, 10000
+in 16 GiB.
 
 At 4500 requests/s, the rate of a production pod (785 s):
 
@@ -663,6 +678,31 @@ filters at `ARCHIVE_V4_REWRITE_MBPS`, and a segment merge. A round
 lists the filters it has built every ten seconds, the most useful first,
 so a node that stops during one keeps those (the build measured here
 listed them only at its end, and lost the round at each restart).
+
+With its 527 address filters built again and no filter round in the
+window, the v4 node at 4500 requests/s, as above and with page files read
+through the kernel page cache (`ARCHIVE_V4_DIRECT_IO=0`, `--db-cache=8192`:
+a small cache of decompressed pages over the kernel's cache of the files;
+since then the default):
+
+| | `O_DIRECT`, `--db-cache=22000` | buffered, `--db-cache=8192` |
+|---|---|---|
+| CPU ms / request | 0.298 | 0.298 |
+| Latency p50 / p90 ms | 0.35 / 0.95 | 0.35 / 0.91 |
+| Latency p99 / p99.9 ms | 9.67 / 27.7 | 9.57 / 29.9 |
+| Device reads / request | 0.123 | 0.113 |
+| Read from the device | 5.8 GiB | 5.8 GiB |
+| Pages the store read / request | 0.121 | 0.275 (0.162 from the kernel's cache) |
+| Memory: process + page cache | 22.2 + 3.2 GiB | 10.1 + 17.5 GiB |
+| Cold start, requests/s on 16 connections | 13,900 | 14,400 |
+
+The two are the same at this load: the store misses its own cache more
+than twice as often, and a miss that the kernel has costs too little to
+show. Against v3 in the same conditions that is −21 % CPU, −44 % p99 and
+−56 % device reads. The buffered arrangement leaves the sizing to the
+kernel, keeps the cache over a restart of the process and needs no other
+`--db-cache` than v3's, which is why it is the default; neither run filled
+the 30 GiB, so they do not show which evicts better.
 
 Not measured here: a base rewrite on a serving node (covered by tests and
 by the store-level runs of the study), and more than ten minutes of

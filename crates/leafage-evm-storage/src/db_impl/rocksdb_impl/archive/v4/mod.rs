@@ -12,10 +12,10 @@
 //! - a background rewrite that folds the delta into the base one file at a
 //!   time.
 //!
-//! Block infos, the block-number index, the head pointer and code stay in
-//! RocksDB. The blocks still only in the memtable are in no file: after a
-//! restart the archive's head is the last flushed block, and the node
-//! fetches the later ones again.
+//! Block infos and code are in append-only files beside them; a v4 archive
+//! has no RocksDB. The blocks still only in the memtable are in no file:
+//! after a restart the archive's head is the last flushed block, and the
+//! node fetches the later ones again.
 
 mod codec;
 mod file;

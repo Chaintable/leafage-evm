@@ -938,6 +938,9 @@ pub(crate) fn move_out_of_rocksdb(path: &Path) -> Result<(), Error> {
     file::sync_dir(path)
 }
 
+/// How far below its last block info the head of a source is looked for.
+const HEAD_SEARCH_BLOCKS: usize = 1 << 20;
+
 /// The number of the block with hash `hash` in an archive opened read-only.
 fn source_block_number(db: &DB, hash: &[u8]) -> Result<u64, Error> {
     if let Some(cf) = db.cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str()) {
@@ -945,7 +948,8 @@ fn source_block_number(db: &DB, hash: &[u8]) -> Result<u64, Error> {
             return Ok(decode_archive_header(&mut &info[..])?.number);
         }
     }
-    // Infos by number: the head is the last record, and names its hash.
+    // Infos by number: the head is the last record that names its hash. A
+    // head-only rewind leaves the infos of the blocks it went back over.
     let cf = db
         .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
         .ok_or_else(|| Error::UnSupported("source archive has no block infos".into()))?;
@@ -953,17 +957,21 @@ fn source_block_number(db: &DB, hash: &[u8]) -> Result<u64, Error> {
     ro.set_total_order_seek(true);
     let mut iter = db.raw_iterator_cf_opt(cf, ro);
     iter.seek_to_last();
-    match (iter.key(), iter.value()) {
-        (Some(key), Some(value)) if key.len() == 8 && value.len() >= 32 && value[..32] == *hash => {
-            Ok(u64::from_be_bytes(key.try_into().unwrap()))
+    for _ in 0..HEAD_SEARCH_BLOCKS {
+        match (iter.key(), iter.value()) {
+            (Some(key), Some(value)) if key.len() == 8 && value.len() >= 32 => {
+                if value[..32] == *hash {
+                    return Ok(u64::from_be_bytes(key.try_into().unwrap()));
+                }
+            }
+            _ => break,
         }
-        _ => {
-            iter.status()?;
-            Err(Error::UnSupported(
-                "the source's last block info is not its head".into(),
-            ))
-        }
+        iter.prev();
     }
+    iter.status()?;
+    Err(Error::UnSupported(format!(
+        "the source's head is not among its last {HEAD_SEARCH_BLOCKS} block infos"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1131,7 @@ fn cpu_seconds() -> f64 {
 }
 
 /// Replay a trace of archive lookups against the store of the v4 archive at
-/// `v4_path` (its files only: blocks still in the log are not applied), on
+/// `v4_path` (what its files hold), on
 /// `threads` threads, and compare the block of each version found with the
 /// one the trace recorded. The first `warmup` lookups fill the cache and are
 /// reported apart; after them the address filters get one round, as they
@@ -1314,6 +1322,31 @@ mod tests {
             });
         }
         d
+    }
+
+    /// The head of a source that keeps its block infos by number is found
+    /// below the infos a head-only rewind left above it.
+    #[test]
+    fn the_head_is_found_below_later_block_infos() {
+        let dir = std::env::temp_dir().join(format!("leafage-v4-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = StorageTypeColumn::BlockNumToBlockInfo.to_str();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf(&opts, &dir, [name]).unwrap();
+        let cf = db.cf_handle(name).unwrap();
+        let hash = |n: u64| [n as u8; 32];
+        for n in 1..=10u64 {
+            let mut value = hash(n).to_vec();
+            value.extend_from_slice(b"info");
+            db.put_cf(cf, n.to_be_bytes(), value).unwrap();
+        }
+        assert_eq!(source_block_number(&db, &hash(10)).unwrap(), 10);
+        assert_eq!(source_block_number(&db, &hash(7)).unwrap(), 7);
+        assert!(source_block_number(&db, &hash(11)).is_err());
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

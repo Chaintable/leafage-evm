@@ -1126,25 +1126,35 @@ impl Command {
 
         // RocksDB-specific: compaction phase
         if matches!(self.db_type, StorageKind::Rocksdb) {
+            // Schema v4 has no RocksDB to compact, and nothing of its last
+            // blocks is in a file yet: a store that closes drops its
+            // memtable. Flush it and fold the segments into the base files
+            // through the handle that loaded them, which is not throttled.
+            let v4 = match &*db {
+                ArchiveStorage::RocksDB(db) if db.is_schema_v4() => {
+                    info!(target: "archive_init", "Flushing and folding the delta into the base files...");
+                    db.v4_compact()?;
+                    true
+                }
+                _ => false,
+            };
             // Close database to ensure all writes are persisted before compaction
-            info!(target: "archive_init", "Closing database before compaction...");
+            info!(target: "archive_init", "Closing database...");
             Arc::try_unwrap(db).expect("Database Arc has other references, cannot close safely");
 
-            // Wait for RocksDB background threads to fully terminate
-            sleep(ROCKSDB_SETTLE_DELAY).await;
+            if !v4 {
+                // Wait for RocksDB background threads to fully terminate
+                sleep(ROCKSDB_SETTLE_DELAY).await;
 
-            // Reopen database with auto compaction enabled for the compaction phase
-            let compact_db = ArchiveRocksDBStorage::open(
-                &self.db_path,
-                self.db_cache,
-                false,
-                self.archive_zstd_compression,
-            );
-            info!(target: "archive_init", "Starting database compaction...");
-            compact_db.compact()?;
-            if compact_db.is_schema_v4() {
-                // Fold what the load left in segments into the base files.
-                compact_db.v4_compact()?;
+                // Reopen database with auto compaction enabled for the compaction phase
+                let compact_db = ArchiveRocksDBStorage::open(
+                    &self.db_path,
+                    self.db_cache,
+                    false,
+                    self.archive_zstd_compression,
+                );
+                info!(target: "archive_init", "Starting database compaction...");
+                compact_db.compact()?;
             }
             info!(target: "archive_init", "Database compaction completed.");
         }

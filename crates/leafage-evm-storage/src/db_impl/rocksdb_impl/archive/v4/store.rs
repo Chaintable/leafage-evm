@@ -2269,11 +2269,17 @@ impl Store {
     /// Add blocks: their versions (at most one per key and block), their
     /// infos, and code first seen in them; `versions` and `blocks` in block
     /// order. Blocks come in order. The block applied last may be applied
-    /// again and then replaces what it wrote, unless it is already on its
-    /// way into the files: a block the files hold is only accepted again
-    /// with the hash they have, and without versions. A block without
-    /// versions only moves the head. Everything stays in memory until
+    /// again, as the block it is: with the hash it has, and its versions
+    /// are written over (a different block at that number needs a rewind);
+    /// a block on its way into the files is only accepted again with the
+    /// hash they have, and without versions. A block without versions only
+    /// moves the head. Everything stays in memory until
     /// [`Self::flush_if_due`] or [`Self::flush`] writes it out.
+    ///
+    /// Readers do not wait for the writer. They take a block for applied
+    /// when they find its info or see the head at it, so those come last:
+    /// first the code (found by its hash), then per block its versions,
+    /// its info, the head.
     pub(crate) fn commit(
         &self,
         versions: &[BlockVersions],
@@ -2311,6 +2317,9 @@ impl Store {
             ))
         };
         let mem = &v.active;
+        for (hash, code) in codes {
+            mem.put_code(*hash, code.clone());
+        }
         let (mut vi, mut bi) = (0, 0);
         loop {
             let block = match (versions.get(vi), blocks.get(bi)) {
@@ -2320,6 +2329,8 @@ impl Store {
                 (None, None) => break,
             };
             let next = inner.next_block.load(Ordering::Acquire);
+            // The info to put, once the block's versions are in.
+            let mut info = None;
             if let Some((_, rec)) = blocks.get(bi).filter(|b| b.0 == block) {
                 bi += 1;
                 if is_fixed(block) {
@@ -2331,40 +2342,37 @@ impl Store {
                     if held.map(|held| held.0) != Some(rec.0) {
                         return Err(refuse(block));
                     }
-                } else if block + 1 < next {
+                } else if block + 1 < next || mem.block(block).is_some_and(|held| held.0 != rec.0) {
+                    // Below the head, or another block in the head's place:
+                    // the versions the first one wrote would stay.
                     return Err(refuse(block));
                 } else {
-                    mem.put_block(block, rec.clone());
-                    inner.next_block.fetch_max(block + 1, Ordering::AcqRel);
+                    info = Some(rec);
                 }
             }
-            let Some((_, accounts, slots)) = versions.get(vi).filter(|v| v.0 == block) else {
-                continue;
-            };
-            vi += 1;
-            if accounts.is_empty() && slots.is_empty() {
+            if let Some((_, accounts, slots)) = versions.get(vi).filter(|v| v.0 == block) {
+                vi += 1;
+                if !accounts.is_empty() || !slots.is_empty() {
+                    if block + 1 < next || is_fixed(block) {
+                        return Err(refuse(block));
+                    }
+                    let mut key = [0u8; 64];
+                    for (address, val) in accounts.iter() {
+                        key[..32].copy_from_slice(address);
+                        mem.insert(false, &key, block, val)?;
+                    }
+                    for (key, value) in slots.iter() {
+                        mem.insert(true, key, block, &Val::Storage(*value))?;
+                    }
+                }
                 if !is_fixed(block) && block + 1 >= next {
                     mem.note_block(block);
                 }
-                inner.next_block.fetch_max(block + 1, Ordering::AcqRel);
-                continue;
             }
-            if block + 1 < next || is_fixed(block) {
-                return Err(refuse(block));
+            if let Some(rec) = info {
+                mem.put_block(block, rec.clone());
             }
-            let mut key = [0u8; 64];
-            for (address, val) in accounts.iter() {
-                key[..32].copy_from_slice(address);
-                mem.insert(false, &key, block, val)?;
-            }
-            for (key, value) in slots.iter() {
-                mem.insert(true, key, block, &Val::Storage(*value))?;
-            }
-            mem.note_block(block);
             inner.next_block.fetch_max(block + 1, Ordering::AcqRel);
-        }
-        for (hash, code) in codes {
-            mem.put_code(*hash, code.clone());
         }
         M.memtable_versions.set(mem.versions() as f64);
         Ok(())
@@ -3072,7 +3080,7 @@ pub(crate) mod tests {
     }
 
     /// Apply the model's blocks above the store's durable head again: what
-    /// the archive's log replay does after a restart.
+    /// the node does after a restart, with the blocks it fetches again.
     fn replay(store: &Store, model: &Model, head: u64) {
         let from = store.durable().map_or(0, |d| d + 1);
         for block in from..=head {
@@ -3208,7 +3216,7 @@ pub(crate) mod tests {
                     assert!(store.inner.view.load().delta(1).count() <= 1);
                 }
                 4 => {
-                    // Restart: the memtable is gone, the log brings it back.
+                    // Restart: the memtable is gone, its blocks come again.
                     drop(store);
                     store = Store::open(&dir, small_options()).unwrap();
                     assert!(store.durable().unwrap() < head);
@@ -3368,9 +3376,11 @@ pub(crate) mod tests {
         check(&store, 75, u64::MAX);
         let durable = store.durable().unwrap();
         assert!(durable < 75 && durable >= 57, "flushed through {durable}");
-        // The head block again: with another hash while it is in the
-        // memtable, not once it is in the files.
+        // The head block again: as the block it is, in the memtable or in
+        // the files; another block in its place is refused.
         store.commit(&[], &[(75, rec(75, 0))], &[]).unwrap();
+        assert!(store.commit(&[], &[(75, rec(75, 1))], &[]).is_err());
+        assert_eq!(store.block(75).unwrap(), Some(rec(75, 0)));
         assert!(store.commit(&[], &[(74, rec(74, 0))], &[]).is_err());
         store
             .commit(&[], &[(durable, rec(durable, 0))], &[])
@@ -3487,6 +3497,96 @@ pub(crate) mod tests {
         store.rewrite_base().unwrap();
         assert!(store.inner.view.load().filters.is_empty());
         check(&store, &model, 280);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A reader does not wait for the writer: a block it can see (the head
+    /// is at it, or its info is there) has its versions and its code.
+    #[test]
+    fn a_block_is_seen_with_all_it_wrote() {
+        let dir = test_dir("commit-order");
+        Store::create(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir, small_options()).unwrap());
+        let account = |n: u64| -> ([u8; 32], Val) {
+            let mut hash = [0xc0u8; 32];
+            hash[..8].copy_from_slice(&n.to_be_bytes());
+            let val = Val::Account {
+                nonce: n,
+                balance: [0; 32],
+                code_hash: hash,
+            };
+            (address(n), val)
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (store, done) = (store.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut seen = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let Some(head) = store.head() else { continue };
+                    let via_info = (head + 1..head + 4)
+                        .rev()
+                        .find(|n| store.block(*n).unwrap().is_some());
+                    for n in [Some(head), via_info].into_iter().flatten() {
+                        let (address, val) = account(n);
+                        let mut key = [0u8; 64];
+                        key[..32].copy_from_slice(&address);
+                        let read = store.get(false, &key[..32], n).unwrap();
+                        assert_eq!(read.found, Some((n, val)), "block {n}");
+                        let Val::Account { code_hash, .. } = val else {
+                            unreachable!()
+                        };
+                        assert!(store.code(&code_hash).unwrap().is_some(), "code of {n}");
+                        seen += 1;
+                    }
+                }
+                seen
+            })
+        };
+        // Batches of three blocks: each deploys an account, with its code,
+        // and writes enough slots for a reader to get in between.
+        let mut n = 1u64;
+        while n <= 600 {
+            let blocks: Vec<u64> = (n..n + 3).collect();
+            let accounts: Vec<[([u8; 32], Val); 1]> =
+                blocks.iter().map(|b| [account(*b)]).collect();
+            let slots: Vec<Vec<([u8; 64], [u8; 32])>> = blocks
+                .iter()
+                .map(|b| {
+                    (0..200)
+                        .map(|s| (slot_key(1, b * 1000 + s), [*b as u8; 32]))
+                        .collect()
+                })
+                .collect();
+            let versions: Vec<BlockVersions> = blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (*b, &accounts[i][..], &slots[i][..]))
+                .collect();
+            let infos: Vec<(u64, BlockRec)> = blocks
+                .iter()
+                .map(|b| {
+                    let mut hash = [7u8; 32];
+                    hash[..8].copy_from_slice(&b.to_be_bytes());
+                    (*b, (hash, Arc::from(vec![1u8; 40])))
+                })
+                .collect();
+            let codes: Vec<([u8; 32], Arc<[u8]>)> = blocks
+                .iter()
+                .map(|b| {
+                    let Val::Account { code_hash, .. } = account(*b).1 else {
+                        unreachable!()
+                    };
+                    (code_hash, Arc::from(vec![*b as u8; 100]))
+                })
+                .collect();
+            store.commit(&versions, &infos, &codes).unwrap();
+            store.flush_if_due().unwrap();
+            n += 3;
+        }
+        done.store(true, Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

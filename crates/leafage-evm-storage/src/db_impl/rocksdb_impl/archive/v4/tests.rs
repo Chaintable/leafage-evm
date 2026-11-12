@@ -586,7 +586,7 @@ fn v4_recovers_from_a_crash_at_any_moment() {
 }
 
 /// Blocks that were never flushed are gone after a restart, with their
-/// infos still in RocksDB: the head is the last flushed block, the archive
+/// infos: the head is the last flushed block, the archive
 /// answers as it did at that block, and takes the blocks again, of another
 /// chain too.
 #[test]

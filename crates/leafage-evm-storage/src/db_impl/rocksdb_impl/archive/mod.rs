@@ -1895,9 +1895,9 @@ impl DataBaseRef {
         !self.udt && self.v4.is_none()
     }
 
-    /// Schema v4: write the memtable to segment files now (the log already
-    /// makes it durable; this bounds the replay of the next open) and fold
-    /// every segment into the base, unthrottled.
+    /// Schema v4: write the memtable to segment files now (nothing of it
+    /// is in a file before, and a store that closes drops it) and fold
+    /// every segment into the base, at the pace of the store's options.
     pub fn v4_compact(&self) -> Result<(), Error> {
         let Some(store) = &self.v4 else {
             return Err(Error::UnSupported("not a schema v4 archive".into()));
