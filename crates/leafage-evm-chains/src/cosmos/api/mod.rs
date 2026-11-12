@@ -17,6 +17,8 @@ use std::ops::{Deref, DerefMut};
 use revm::primitives::hardfork::SpecId;
 
 mod exec;
+#[cfg(test)]
+mod tests;
 
 pub type CosmosContext<DB> = Context<BlockEnv, TxEnv, CfgEnv<CosmosHardfork>, DB>;
 
@@ -201,13 +203,12 @@ where
             )));
         };
         if let FrameInput::Call(ref call) = frame_input {
-            if super::precompile::unsupported::is_unsupported(&call.bytecode_address) {
-                return unsupported_precompiles(call.bytecode_address);
-            }
-            if let Some(addr) = self.config.native_token {
-                if addr.eq(&call.bytecode_address) {
-                    return unsupported_precompiles(call.bytecode_address);
-                }
+            let addr = call.bytecode_address;
+            if super::precompile::unsupported::is_unsupported(&addr)
+                || self.config.native_token == Some(addr)
+                || self.config.unsupported_precompiles.contains(&addr)
+            {
+                return unsupported_precompiles(addr);
             }
         }
         Ok(())
