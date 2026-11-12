@@ -9,13 +9,14 @@
 //! shows it. Files not in the manifest are leftovers of an interrupted
 //! write and are removed at open.
 
+use super::super::udt::hex;
 use super::codec::{self, key_len, Look, Next, Val};
 use super::corrupt;
 use super::file::{
-    self, bloom_path, key_hashes, remove_page_file, sync_dir, write_file_synced, Bloom, Cursor,
-    Dict, MergeIter, PageFile, PageWriter, Rec, SeqReader,
+    self, bloom_path, remove_page_file, sync_dir, write_file_synced, Bloom, Cursor, Dict,
+    MergeIter, PageFile, PageWriter, Rec, SeqReader,
 };
-use super::mem::{KeyHashBuild, Mem};
+use super::mem::Mem;
 use super::side::{
     self, BlockRec, Blocks, BlocksAppend, BlocksMeta, Codes, CodesAppend, CodesMeta,
 };
@@ -38,18 +39,6 @@ const MANIFEST_MAGIC: &str = "leafage-archive-v4 1";
 const NO_DICT: u32 = 0;
 /// zstd level of delta segments: they are rewritten into the base soon.
 const SEGMENT_LEVEL: i32 = 3;
-/// Slots a storage page holds on average, to estimate a filter's size from
-/// the pages of an address before reading them.
-const SLOTS_PER_PAGE: u64 = 75;
-/// An address needs this many disk reads for slots it never had, between
-/// two filter rounds, to be considered for a filter.
-const FILTER_MIN_READS: u64 = 3;
-/// Rounds an address filter is kept before its use is judged.
-const FILTER_GRACE_ROUNDS: u32 = 6;
-/// How often a filter round lists the filters it has built so far.
-const FILTER_LIST_EVERY: Duration = Duration::from_secs(10);
-/// Addresses tracked for absent reads, at most.
-const ABSENT_TRACKED: usize = 1 << 20;
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -88,9 +77,6 @@ pub(crate) struct Options {
     pub(crate) delta_min_bytes: u64,
     /// ...or when the segment filters take this much memory.
     pub(crate) delta_filter_bytes: u64,
-    /// Memory for filters of the slots of addresses read for slots they
-    /// never had; 0 disables them.
-    pub(crate) filter_bytes: u64,
     /// Memory for decoded chunks of block infos.
     pub(crate) block_cache_bytes: u64,
     /// How often the background looks whether a base rewrite is due.
@@ -115,7 +101,6 @@ impl Options {
             delta_ratio: env_f64("ARCHIVE_V4_DELTA_PERCENT", 4.0) / 100.0,
             delta_min_bytes: env_u64("ARCHIVE_V4_DELTA_MIN_MB", 4096) << 20,
             delta_filter_bytes: env_u64("ARCHIVE_V4_DELTA_FILTER_MB", 512) << 20,
-            filter_bytes: env_u64("ARCHIVE_V4_FILTER_MB", 256) << 20,
             block_cache_bytes: env_u64("ARCHIVE_V4_BLOCK_CACHE_MB", 64) << 20,
             rewrite_check: Duration::from_secs_f64(
                 env_f64("ARCHIVE_V4_REWRITE_CHECK_SECS", 30.0).max(0.01),
@@ -131,7 +116,6 @@ impl Options {
             rewrite_bytes_per_sec: 0.0,
             delta_ratio: 0.5,
             delta_filter_bytes: u64::MAX,
-            filter_bytes: 0,
             ..Self::serving(budget_bytes)
         }
     }
@@ -140,7 +124,6 @@ impl Options {
     pub(crate) fn maintenance(budget_bytes: u64) -> Self {
         Self {
             rewrite_bytes_per_sec: 0.0,
-            filter_bytes: 0,
             background: false,
             ..Self::serving(budget_bytes)
         }
@@ -153,10 +136,6 @@ fn kind_tag(kind: usize) -> char {
     } else {
         'a'
     }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
@@ -192,22 +171,6 @@ struct Seg {
     bloom: Bloom,
 }
 
-/// The slots `address` has in base file `fid`.
-struct AddrFilter {
-    fid: u32,
-    address: [u8; 32],
-    name: String,
-    slots: u64,
-    bloom: Bloom,
-    /// Lookups this filter answered since the last round.
-    negatives: AtomicU64,
-    /// Decayed negatives per round, as `f64` bits; and rounds lived.
-    score: AtomicU64,
-    rounds: AtomicU64,
-}
-
-type Filters = HashMap<[u8; 32], Vec<Arc<AddrFilter>>, KeyHashBuild>;
-
 /// An immutable snapshot of the store's layers.
 #[derive(Clone)]
 struct View {
@@ -218,13 +181,9 @@ struct View {
     segs: [Vec<Arc<Seg>>; 2],
     /// Per kind, in key order.
     base: [Vec<Arc<BaseFile>>; 2],
-    filters: Arc<Filters>,
     /// The valid part of the block and code files.
     blocks: BlocksMeta,
     codes: CodesMeta,
-    /// Address filters the manifest lists and this open did not load (it
-    /// keeps none in memory): fid, address, slots, name.
-    unloaded_filters: Arc<Vec<(u32, [u8; 32], u64, String)>>,
 }
 
 impl View {
@@ -282,9 +241,6 @@ struct State {
     /// up to (0: no pass). It is in the manifest, so that a pass cut short
     /// goes on with the files it had not reached.
     pass: [u64; 2],
-    /// Absent reads per address and base file, decayed, across filter
-    /// rounds.
-    absent_score: HashMap<([u8; 32], u32), f64>,
 }
 
 /// A result of [`Store::get`].
@@ -326,12 +282,6 @@ struct Inner {
     codes: Codes,
     /// Held while the store is open: one process at a time.
     _lock: std::fs::File,
-    /// Disk reads for slots absent from the base, per address and base
-    /// file.
-    absent: Mutex<HashMap<([u8; 32], u32), u64>>,
-    /// When the last address filter round began, and how often one is due.
-    filter_round: Mutex<Instant>,
-    filter_period: Duration,
 }
 
 /// The versions of one block: its number, accounts and slots.
@@ -378,8 +328,6 @@ struct ManifestData {
     base: Vec<(usize, u32, u32, u64, u64, String, [u8; 64])>,
     /// kind, fid, dict, lo, hi, level, records, distinct, name.
     segs: Vec<(usize, u32, u32, u64, u64, u32, u64, u64, String)>,
-    /// base fid, address, slots, name.
-    filters: Vec<(u32, [u8; 32], u64, String)>,
     blocks: BlocksMeta,
     codes: CodesMeta,
 }
@@ -394,7 +342,6 @@ impl ManifestData {
             pass: [0; 2],
             base: Vec::new(),
             segs: Vec::new(),
-            filters: Vec::new(),
             blocks: BlocksMeta::default(),
             codes: CodesMeta::default(),
         }
@@ -463,14 +410,9 @@ impl ManifestData {
                         text(9)?,
                     ));
                 }
-                Some("filter") => {
-                    let address: [u8; 32] = f
-                        .get(2)
-                        .and_then(|s| unhex(s))
-                        .and_then(|a| a.try_into().ok())
-                        .ok_or_else(bad)?;
-                    m.filters.push((num(1)? as u32, address, num(3)?, text(4)?));
-                }
+                // Address filters, which earlier builds kept: their files
+                // go with the other leftovers at this open.
+                Some("filter") => {}
                 Some("blocks") => {
                     m.blocks = BlocksMeta {
                         first: num(1)?,
@@ -518,9 +460,6 @@ impl ManifestData {
         for (kind, fid, dict, lo, hi, level, records, distinct, name) in &self.segs {
             s +=
                 &format!("seg {kind} {fid} {dict} {lo} {hi} {level} {records} {distinct} {name}\n");
-        }
-        for (fid, address, slots, name) in &self.filters {
-            s += &format!("filter {fid} {} {slots} {name}\n", hex(address));
         }
         let b = &self.blocks;
         s += &format!(
@@ -822,18 +761,6 @@ impl Inner {
                 ));
             }
         }
-        for f in v.filters.values().flatten() {
-            m.filters.push((f.fid, f.address, f.slots, f.name.clone()));
-        }
-        // Those this open left on disk stay listed while their base file
-        // lives.
-        m.filters.extend(
-            v.unloaded_filters
-                .iter()
-                .filter(|f| v.base[1].iter().any(|b| b.file.fid == f.0))
-                .cloned(),
-        );
-        m.filters.sort();
         used.remove(&NO_DICT);
         let mut dropped = Vec::new();
         st.dicts.retain(|id, _| {
@@ -880,13 +807,6 @@ impl Inner {
         M.index_bytes.set(index_bytes(v) as f64);
         M.segment_filter_bytes
             .set(segs.map(|s| s.bloom.mem_bytes()).sum::<u64>() as f64);
-        M.address_filter_bytes.set(
-            v.filters
-                .values()
-                .flatten()
-                .map(|f| f.bloom.mem_bytes())
-                .sum::<u64>() as f64,
-        );
         if let Some(d) = v.durable() {
             M.durable_block.set(d as f64);
         }
@@ -905,28 +825,27 @@ impl Inner {
         Ok(d)
     }
 
-    fn page(&self, f: &PageFile, c: usize) -> Result<(Arc<[u8]>, bool), Error> {
+    fn page(&self, f: &PageFile, c: usize) -> Result<Arc<[u8]>, Error> {
         let ck = ((f.fid as u64) << 32) | c as u64;
         match self.cache.get_value_or_guard(&ck, None) {
-            GuardResult::Value(v) => Ok((v, false)),
+            GuardResult::Value(v) => Ok(v),
             GuardResult::Guard(g) => {
                 let page = f.read_page(c)?;
                 let _ = g.insert(page.clone());
-                Ok((page, true))
+                Ok(page)
             }
             GuardResult::Timeout => unreachable!("no timeout given"),
         }
     }
 
-    /// The greatest version `<= h` of `key` in one page file, the block
-    /// below which that answer holds as far as this file knows, and whether
-    /// the device was read.
+    /// The greatest version `<= h` of `key` in one page file, and the block
+    /// below which that answer holds as far as this file knows.
     fn file_get(
         &self,
         f: &PageFile,
         key: &[u8],
         h: u64,
-    ) -> Result<(Option<(u64, Val)>, u64, bool), Error> {
+    ) -> Result<(Option<(u64, Val)>, u64), Error> {
         // "Unknown": the answer is only known to hold at `h` itself.
         let unknown = h.saturating_add(1);
         let Some(mut c) = f.index.floor(key, h) else {
@@ -935,13 +854,11 @@ impl Inner {
                 Some((first, block)) if first == key => block,
                 _ => u64::MAX,
             };
-            return Ok((None, next, false));
+            return Ok((None, next));
         };
         let (mut back, mut fwd) = (false, false);
-        let mut read = false;
         loop {
-            let (page, from_device) = self.page(f, c)?;
-            read |= from_device;
+            let page = self.page(f, c)?;
             let (look, next) = codec::lookup(&page, f.storage, key, h)?;
             match look {
                 Look::Found(block, val) => {
@@ -952,7 +869,7 @@ impl Inner {
                         // index knows how the next page starts.
                         Next::PageEnd => f.index.continues_at(c, key).unwrap_or(u64::MAX),
                     };
-                    return Ok((Some((block, val)), next.max(unknown), read));
+                    return Ok((Some((block, val)), next.max(unknown)));
                 }
                 Look::Absent => {
                     let next = match next {
@@ -960,26 +877,26 @@ impl Inner {
                         Next::None => u64::MAX,
                         Next::PageEnd => unknown,
                     };
-                    return Ok((None, next.max(unknown), read));
+                    return Ok((None, next.max(unknown)));
                 }
                 // The index window of a page's first key is a prefix: when
                 // another key shares it, the floor may be a neighbour.
                 Look::BeforeFirst => {
                     if c == 0 || fwd {
-                        return Ok((None, unknown, read));
+                        return Ok((None, unknown));
                     }
                     c -= 1;
                     back = true;
                 }
                 Look::AfterLast => {
                     if back {
-                        return Ok((None, unknown, read));
+                        return Ok((None, unknown));
                     }
                     if !f.index.may_continue(c, key) {
                         // The next page starts with another key, unless it
                         // opens an index block with this very key, above `h`.
                         let next = f.index.starts_next_block(c, key).unwrap_or(u64::MAX);
-                        return Ok((None, next.max(unknown), read));
+                        return Ok((None, next.max(unknown)));
                     }
                     c += 1;
                     fwd = true;
@@ -1022,7 +939,7 @@ impl Inner {
                 continue;
             }
             M.segment_probes.increment(1);
-            let (found, n, _) = self.file_get(&s.file, key, h)?;
+            let (found, n) = self.file_get(&s.file, key, h)?;
             next = next.min(n);
             if found.is_some() {
                 M.segment_hits.increment(1);
@@ -1032,30 +949,8 @@ impl Inner {
         let Some(base) = base else {
             return Ok(Read { found: None, next });
         };
-        if storage && !v.filters.is_empty() {
-            let filter = v
-                .filters
-                .get(<&[u8; 32]>::try_from(&key[..32]).unwrap())
-                .and_then(|l| l.iter().find(|f| f.fid == base.file.fid));
-            if let Some(f) = filter {
-                if !f.bloom.may_contain(&key[32..64]) {
-                    f.negatives.fetch_add(1, Ordering::Relaxed);
-                    M.filter_negatives.increment(1);
-                    return Ok(Read { found: None, next });
-                }
-            }
-        }
-        let (found, n, read) = self.file_get(&base.file, key, h)?;
+        let (found, n) = self.file_get(&base.file, key, h)?;
         next = next.min(n);
-        if storage && read && found.is_none() && n == u64::MAX && self.opts.filter_bytes > 0 {
-            // A disk read for a slot this file never had: what an address
-            // filter saves.
-            let mut absent = self.absent.lock().unwrap();
-            let at: ([u8; 32], u32) = (key[..32].try_into().unwrap(), base.file.fid);
-            if absent.len() < ABSENT_TRACKED || absent.contains_key(&at) {
-                *absent.entry(at).or_insert(0) += 1;
-            }
-        }
         Ok(Read { found, next })
     }
 
@@ -1531,28 +1426,9 @@ impl Inner {
                     keep
                 });
             }
-            let dropped_filters = old.map_or(Vec::new(), |old| {
-                let mut filters = (*nv.filters).clone();
-                let mut dropped = Vec::new();
-                filters.retain(|_, list| {
-                    list.retain(|f| {
-                        let keep = f.fid != old.file.fid;
-                        if !keep {
-                            dropped.push(f.name.clone());
-                        }
-                        keep
-                    });
-                    !list.is_empty()
-                });
-                nv.filters = Arc::new(filters);
-                dropped
-            });
             // A manifest that failed to be written may still be the one the
             // next open finds: the new files stay for it to sort out.
             self.publish(&mut st, nv, None)?;
-            for name in dropped_filters {
-                let _ = std::fs::remove_file(bloom_path(&self.dir.join(name)));
-            }
         }
         if let Some(old) = old {
             remove_page_file(&self.dir.join(&old.name));
@@ -1611,13 +1487,7 @@ impl Inner {
                     break;
                 };
                 i += if b.hi < target {
-                    let n = self.rewrite_range(kind, Some(b), &mut throttle)?.max(1);
-                    // A pass takes days, and each file it rewrites loses its
-                    // address filters: the rounds go on between the files.
-                    if self.opts.background {
-                        self.filter_round(false);
-                    }
-                    n
+                    self.rewrite_range(kind, Some(b), &mut throttle)?.max(1)
                 } else {
                     1
                 };
@@ -1652,245 +1522,6 @@ impl Inner {
         let filters: u64 = v.segs.iter().flatten().map(|s| s.bloom.mem_bytes()).sum();
         (delta >= self.opts.delta_min_bytes && delta as f64 >= base as f64 * self.opts.delta_ratio)
             || filters >= self.opts.delta_filter_bytes
-    }
-
-    // ---- address filters ----
-
-    /// The pages of base file `b` that may hold slots of `address`.
-    fn address_pages(b: &BaseFile, address: &[u8; 32]) -> Option<(usize, usize)> {
-        let (mut lo, mut hi) = ([0u8; 64], [0xffu8; 64]);
-        lo[..32].copy_from_slice(address);
-        hi[..32].copy_from_slice(address);
-        let c1 = b.file.index.floor_range(&hi, u64::MAX)?.1;
-        let c0 = b.file.index.floor_range(&lo, 0).map_or(0, |r| r.0);
-        Some((c0, c1.max(c0)))
-    }
-
-    fn build_filter(
-        &self,
-        b: &BaseFile,
-        address: [u8; 32],
-        throttle: &mut Throttle,
-    ) -> Result<Option<Arc<AddrFilter>>, Error> {
-        let Some((c0, c1)) = Self::address_pages(b, &address) else {
-            return Ok(None);
-        };
-        let mut src = SeqReader::until(b.file.clone(), b.file.index.range(c1).1);
-        let mut hashes: Vec<(u64, u64)> = Vec::new();
-        let mut last = [0u8; 32];
-        let mut spent = 0;
-        for c in c0..=c1 {
-            codec::for_each(src.page(c)?, true, |key, _, _| {
-                if key[..32] == address && (hashes.is_empty() || key[32..64] != last) {
-                    last.copy_from_slice(&key[32..64]);
-                    hashes.push(key_hashes(&key[32..64]));
-                }
-            })?;
-            throttle.spend(src.io_bytes - spent)?;
-            spent = src.io_bytes;
-        }
-        if hashes.is_empty() {
-            return Ok(None);
-        }
-        let mut bloom = Bloom::new(hashes.len() as u64);
-        for (h1, h2) in &hashes {
-            bloom.insert_hashes(*h1, *h2);
-        }
-        let name = format!("flt-{:08}-{}", b.file.fid, hex(&address[..12]));
-        write_file_synced(&bloom_path(&self.dir.join(&name)), &bloom.to_bytes())?;
-        Ok(Some(Arc::new(AddrFilter {
-            fid: b.file.fid,
-            address,
-            name,
-            slots: hashes.len() as u64,
-            bloom,
-            negatives: AtomicU64::new(0),
-            score: AtomicU64::new(0f64.to_bits()),
-            rounds: AtomicU64::new(0),
-        })))
-    }
-
-    /// One filter round: age the statistics, then spend the filter memory
-    /// on the addresses whose absent slots cost the most disk reads per
-    /// filter byte.
-    fn maintain_filters(&self) -> Result<(), Error> {
-        if self.opts.filter_bytes == 0 {
-            return Ok(());
-        }
-        let v = self.view.load_full();
-        let fresh = std::mem::take(&mut *self.absent.lock().unwrap());
-        // (address, base file) -> reads a filter there would save per
-        // round. A filter is for one base file, and so are the reads it is
-        // weighed by: an address in several files gets one where its absent
-        // slots are read, not in all of them for the reads of one.
-        let mut want: Vec<([u8; 32], Arc<BaseFile>, f64, u64)> = Vec::new();
-        {
-            let files: HashMap<u32, &Arc<BaseFile>> =
-                v.base[1].iter().map(|b| (b.file.fid, b)).collect();
-            let mut st = self.state.lock().unwrap();
-            for score in st.absent_score.values_mut() {
-                *score *= 0.5;
-            }
-            for (at, n) in fresh {
-                *st.absent_score.entry(at).or_insert(0.0) += n as f64;
-            }
-            // Reads of a file that was rewritten since count for nothing.
-            st.absent_score
-                .retain(|(_, fid), s| *s >= 0.5 && files.contains_key(fid));
-            for ((address, fid), score) in &st.absent_score {
-                if *score < FILTER_MIN_READS as f64 {
-                    continue;
-                }
-                let has = v
-                    .filters
-                    .get(address)
-                    .is_some_and(|l| l.iter().any(|f| f.fid == *fid));
-                if has {
-                    continue;
-                }
-                let b = files[fid];
-                if let Some((c0, c1)) = Self::address_pages(b, address) {
-                    let bytes = (c1 - c0 + 1) as u64 * SLOTS_PER_PAGE * 10 / 8;
-                    want.push((*address, b.clone(), *score, bytes.max(64)));
-                }
-            }
-        }
-        // Existing filters: fold this round's use into their score.
-        let mut have: Vec<(Arc<AddrFilter>, f64)> = Vec::new();
-        for f in v.filters.values().flatten() {
-            let n = f.negatives.swap(0, Ordering::Relaxed) as f64;
-            let score = f64::from_bits(f.score.load(Ordering::Relaxed)) * 0.5 + n;
-            f.score.store(score.to_bits(), Ordering::Relaxed);
-            let rounds = f.rounds.fetch_add(1, Ordering::Relaxed) + 1;
-            // A young filter is not judged yet.
-            let density = if rounds < FILTER_GRACE_ROUNDS as u64 {
-                f64::INFINITY
-            } else {
-                score / f.bloom.mem_bytes() as f64
-            };
-            have.push((f.clone(), density));
-        }
-        want.sort_by(|a, b| (b.2 / b.3 as f64).total_cmp(&(a.2 / a.3 as f64)));
-        have.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let mut used: u64 = have.iter().map(|f| f.0.bloom.mem_bytes()).sum();
-        let mut evict: Vec<Arc<AddrFilter>> = Vec::new();
-        let mut build: Vec<([u8; 32], Arc<BaseFile>)> = Vec::new();
-        let mut worst = 0usize;
-        for (address, base, score, bytes) in want {
-            let density = score / bytes as f64;
-            // Make room by dropping filters used less than half as much per
-            // byte as this one would be.
-            while used + bytes > self.opts.filter_bytes
-                && worst < have.len()
-                && have[worst].1 * 2.0 < density
-            {
-                used -= have[worst].0.bloom.mem_bytes();
-                evict.push(have[worst].0.clone());
-                worst += 1;
-            }
-            if used + bytes > self.opts.filter_bytes {
-                continue;
-            }
-            used += bytes;
-            build.push((address, base));
-        }
-        if build.is_empty() && evict.is_empty() {
-            return Ok(());
-        }
-        // Filters are listed as they are built, the most useful first: a
-        // round reads for a long time at the background rate, and a node
-        // that stops during it keeps what the round had got to.
-        let mut throttle = Throttle::new(self);
-        let mut built: Vec<Arc<AddrFilter>> = Vec::new();
-        let (mut n_built, n_evicted) = (0, evict.len());
-        let mut listed = Instant::now();
-        // The sizes above are estimates; the memory is spent by what the
-        // filters turn out to take.
-        let mut held: u64 = have
-            .iter()
-            .filter(|f| !evict.iter().any(|e| Arc::ptr_eq(e, &f.0)))
-            .map(|f| f.0.bloom.mem_bytes())
-            .sum();
-        for (address, base) in &build {
-            match self.build_filter(base, *address, &mut throttle) {
-                Ok(Some(f)) if held + f.bloom.mem_bytes() > self.opts.filter_bytes => {
-                    let _ = std::fs::remove_file(bloom_path(&self.dir.join(&f.name)));
-                }
-                Ok(Some(f)) => {
-                    held += f.bloom.mem_bytes();
-                    built.push(f);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.list_filters(std::mem::take(&mut built), std::mem::take(&mut evict))?;
-                    return Err(e);
-                }
-            }
-            if listed.elapsed() >= FILTER_LIST_EVERY && !built.is_empty() {
-                n_built += built.len();
-                self.list_filters(std::mem::take(&mut built), std::mem::take(&mut evict))?;
-                listed = Instant::now();
-            }
-        }
-        n_built += built.len();
-        self.list_filters(built, evict)?;
-        info!(
-            target: "archive_v4",
-            "address filters: built {n_built}, dropped {n_evicted}, {:.1} MiB in use",
-            self.view
-                .load()
-                .filters
-                .values()
-                .flatten()
-                .map(|f| f.bloom.mem_bytes())
-                .sum::<u64>() as f64
-                / (1 << 20) as f64
-        );
-        Ok(())
-    }
-
-    /// Put built address filters into the view and the manifest, and take
-    /// `evict` out of both.
-    fn list_filters(
-        &self,
-        built: Vec<Arc<AddrFilter>>,
-        evict: Vec<Arc<AddrFilter>>,
-    ) -> Result<(), Error> {
-        if built.is_empty() && evict.is_empty() {
-            return Ok(());
-        }
-        sync_dir(&self.dir)?;
-        let mut stale = Vec::new();
-        {
-            let mut st = self.state.lock().unwrap();
-            let mut nv = (*self.view.load_full()).clone();
-            let live: HashSet<u32> = nv.base[1].iter().map(|b| b.file.fid).collect();
-            let mut filters = (*nv.filters).clone();
-            for f in built {
-                if live.contains(&f.fid) {
-                    filters.entry(f.address).or_default().push(f);
-                } else {
-                    // Its base file was rewritten meanwhile.
-                    stale.push(f.name.clone());
-                }
-            }
-            filters.retain(|_, list| {
-                list.retain(|f| {
-                    let keep = !evict.iter().any(|e| Arc::ptr_eq(e, f));
-                    if !keep {
-                        stale.push(f.name.clone());
-                    }
-                    keep
-                });
-                !list.is_empty()
-            });
-            nv.filters = Arc::new(filters);
-            self.publish(&mut st, nv, None)?;
-        }
-        for name in stale {
-            let _ = std::fs::remove_file(bloom_path(&self.dir.join(name)));
-        }
-        Ok(())
     }
 
     // ---- background threads ----
@@ -1933,38 +1564,15 @@ impl Inner {
     }
 
     /// Rewrites the base and maintains the address filters.
-    /// Run an address filter round if one is due, or `now`.
-    fn filter_round(&self, now: bool) {
-        {
-            let mut last = self.filter_round.lock().unwrap();
-            if !now && last.elapsed() < self.filter_period {
-                return;
-            }
-            *last = Instant::now();
-        }
-        if self.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Err(e) = self.maintain_filters() {
-            if !self.stop.load(Ordering::Relaxed) {
-                warn!(target: "archive_v4", "address filter round failed: {e}");
-            }
-        }
-    }
-
     fn rewriter(&self) {
         while !self.stop.load(Ordering::Relaxed) {
-            let mut rewrote = false;
             if self.rewrite_due() {
-                match self.rewrite_pass() {
-                    Ok(()) => rewrote = true,
-                    Err(e) if !self.stop.load(Ordering::Relaxed) => {
+                if let Err(e) = self.rewrite_pass() {
+                    if !self.stop.load(Ordering::Relaxed) {
                         warn!(target: "archive_v4", "base rewrite failed, will retry: {e}");
                     }
-                    Err(_) => {}
                 }
             }
-            self.filter_round(rewrote);
             let mut woken = self.rewrite_lock.lock().unwrap();
             if !*woken && !self.stop.load(Ordering::Relaxed) {
                 woken = self
@@ -2089,7 +1697,6 @@ impl Store {
         {
             known.extend(["v4", "cidx", "bloom"].map(|ext| format!("{name}.{ext}")));
         }
-        known.extend(m.filters.iter().map(|f| format!("{}.bloom", f.3)));
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -2165,10 +1772,8 @@ impl Store {
             frozen: None,
             segs: [Vec::new(), Vec::new()],
             base: [Vec::new(), Vec::new()],
-            filters: Arc::new(Filters::default()),
             blocks: m.blocks,
             codes: m.codes,
-            unloaded_filters: Arc::default(),
         };
         let blocks = Blocks::open(dir, m.blocks, opts.block_cache_bytes)?;
         let codes = Codes::open(dir, m.codes)?;
@@ -2194,45 +1799,8 @@ impl Store {
                 return Err(corrupt("segments overlap"));
             }
         }
-        let live: HashSet<u32> = view.base[1].iter().map(|b| b.file.fid).collect();
-        let mut filters = Filters::default();
-        let mut unloaded = Vec::new();
-        let mut held = 0u64;
-        for (fid, address, slots, name) in &m.filters {
-            if !live.contains(fid) {
-                continue;
-            }
-            // As many as the memory for them holds (it may have been
-            // lowered); the others stay listed.
-            let bloom = (held < opts.filter_bytes)
-                .then(|| Bloom::load(&bloom_path(&dir.join(name))))
-                .transpose()?
-                .filter(|bloom| held + bloom.mem_bytes() <= opts.filter_bytes);
-            let Some(bloom) = bloom else {
-                unloaded.push((*fid, *address, *slots, name.clone()));
-                continue;
-            };
-            held += bloom.mem_bytes();
-            filters
-                .entry(*address)
-                .or_default()
-                .push(Arc::new(AddrFilter {
-                    fid: *fid,
-                    address: *address,
-                    name: name.clone(),
-                    slots: *slots,
-                    bloom,
-                    negatives: AtomicU64::new(0),
-                    score: AtomicU64::new(0f64.to_bits()),
-                    rounds: AtomicU64::new(0),
-                }));
-        }
-        view.filters = Arc::new(filters);
-        view.unloaded_filters = Arc::new(unloaded);
-
         // What the index and filters hold now, and room for what the delta
-        // and the address filters may grow to, come out of the budget; the
-        // page cache gets the rest.
+        // may grow to, come out of the budget; the page cache gets the rest.
         let index = index_bytes(&view);
         let seg_filters: u64 = view
             .segs
@@ -2247,13 +1815,12 @@ impl Store {
                 0
             } else {
                 opts.delta_filter_bytes
-            })
-            + opts.filter_bytes;
+            });
         let cache_bytes = opts.budget_bytes.saturating_sub(reserved).max(64 << 20);
         let next_block = view.durable().map_or(0, |d| d + 1);
         info!(
             target: "archive_v4",
-            "opened {dir:?} in {:.1}s: {} base files, {} segments, {} blocks and {} codes, through block {:?}; index {:.2} GiB, segment filters {:.1} MiB, {} address filters, page cache {:.2} GiB",
+            "opened {dir:?} in {:.1}s: {} base files, {} segments, {} blocks and {} codes, through block {:?}; index {:.2} GiB, segment filters {:.1} MiB, page cache {:.2} GiB",
             started.elapsed().as_secs_f64(),
             view.base.iter().flatten().count(),
             view.segs.iter().flatten().count(),
@@ -2262,7 +1829,6 @@ impl Store {
             view.durable(),
             index as f64 / (1u64 << 30) as f64,
             seg_filters as f64 / (1u64 << 20) as f64,
-            view.filters.values().flatten().count(),
             cache_bytes as f64 / (1u64 << 30) as f64,
         );
         let inner = Arc::new(Inner {
@@ -2280,7 +1846,6 @@ impl Store {
                 dicts,
                 segdict: m.segdict,
                 pass: m.pass,
-                absent_score: HashMap::default(),
             }),
             next_block: AtomicU64::new(next_block),
             flush_lock: Mutex::new(()),
@@ -2294,9 +1859,6 @@ impl Store {
             blocks,
             codes,
             _lock: lock,
-            absent: Mutex::new(HashMap::default()),
-            filter_round: Mutex::new(Instant::now()),
-            filter_period: Duration::from_secs(env_u64("ARCHIVE_V4_FILTER_PERIOD_SECS", 600)),
             opts,
         });
         inner.set_gauges(&inner.view.load());
@@ -2721,11 +2283,6 @@ impl Store {
         Ok(())
     }
 
-    /// Run a filter round now.
-    pub(crate) fn maintain_filters(&self) -> Result<(), Error> {
-        self.inner.maintain_filters()
-    }
-
     /// Go back to the last block at or below `block` that ends a segment:
     /// every segment reaching above `block` is dropped whole, with all the
     /// blocks it holds, and the block files are cut to match. Returns that
@@ -2841,12 +2398,7 @@ impl Store {
             v.segs.iter().flatten().count(),
             v.segs.iter().flatten().map(|s| s.file.data_len()).sum(),
             index_bytes(&v),
-            v.segs
-                .iter()
-                .flatten()
-                .map(|s| s.bloom.mem_bytes())
-                .chain(v.filters.values().flatten().map(|f| f.bloom.mem_bytes()))
-                .sum(),
+            v.segs.iter().flatten().map(|s| s.bloom.mem_bytes()).sum(),
         )
     }
 }
@@ -2871,7 +2423,6 @@ impl Drop for Store {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::super::io_stats;
     use super::*;
     use std::collections::BTreeMap;
 
@@ -2912,7 +2463,6 @@ pub(crate) mod tests {
             delta_ratio: 0.3,
             delta_min_bytes: 0,
             delta_filter_bytes: u64::MAX,
-            filter_bytes: 1 << 20,
             block_cache_bytes: 1 << 20,
             rewrite_check: Duration::from_millis(20),
             background: false,
@@ -3457,89 +3007,6 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn address_filters_answer_absent_slots_without_a_read() {
-        let dir = test_dir("filters");
-        Store::create(&dir).unwrap();
-        let mut opts = small_options();
-        // No page cache to speak of: every lookup reads the device.
-        opts.budget_bytes = 0;
-        let store = Store::open(&dir, opts.clone()).unwrap();
-        let mut model = Model::new();
-        let mut r = Rng(31337);
-        for block in 1..=200 {
-            apply_block(&store, &mut model, &mut r, block);
-        }
-        store.flush().unwrap();
-        store.rewrite_base().unwrap();
-        let absent = |n: u64| {
-            for i in 0..n {
-                let key = slot_key(0, 1_000_000 + i);
-                assert_eq!(store.get(true, &key, 150).unwrap().found, None);
-            }
-        };
-        store.inner.cache.clear();
-        absent(300);
-        store.maintain_filters().unwrap();
-        let filters: Vec<Arc<AddrFilter>> = store
-            .inner
-            .view
-            .load()
-            .filters
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        assert!(!filters.is_empty(), "the large address gets filters");
-        assert!(filters.iter().all(|f| f.address == address(0)));
-        let (reads0, ..) = io_stats().snapshot();
-        store.inner.cache.clear();
-        absent(300);
-        let saved: u64 = filters
-            .iter()
-            .map(|f| f.negatives.load(Ordering::Relaxed))
-            .sum();
-        assert!(saved >= 280, "{saved} of 300 answered by the filters");
-        // (Other tests read too; the bound is loose.)
-        let _ = reads0;
-        // Present slots are still found, and the filters survive a reopen
-        // but not the rewrite of their file.
-        check(&store, &model, 200);
-        drop(store);
-        let store = Store::open(&dir, opts.clone()).unwrap();
-        assert_eq!(
-            store.inner.view.load().filters.values().flatten().count(),
-            filters.len()
-        );
-        check(&store, &model, 200);
-        drop(store);
-        // An offline tool loads no filters; what it writes still lists them.
-        let mut offline = opts.clone();
-        offline.filter_bytes = 0;
-        let store = Store::open(&dir, offline).unwrap();
-        assert!(store.inner.view.load().filters.is_empty());
-        for block in 201..=220 {
-            apply_block(&store, &mut model, &mut r, block);
-        }
-        store.flush().unwrap();
-        drop(store);
-        let store = Store::open(&dir, opts).unwrap();
-        assert_eq!(
-            store.inner.view.load().filters.values().flatten().count(),
-            filters.len()
-        );
-        check(&store, &model, 220);
-        for block in 221..=280 {
-            apply_block(&store, &mut model, &mut r, block);
-        }
-        store.flush().unwrap();
-        store.rewrite_base().unwrap();
-        assert!(store.inner.view.load().filters.is_empty());
-        check(&store, &model, 280);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     /// A reader does not wait for the writer: a block it can see (the head
     /// is at it, or its info is there) has its versions and its code.
     #[test]
@@ -3669,92 +3136,6 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// An address in several base files gets a filter in the file whose
-    /// absent slots are read, and filters take no more than their memory,
-    /// also when it is lowered.
-    #[test]
-    fn address_filters_go_by_file_and_stay_within_their_memory() {
-        let dir = test_dir("filters-file");
-        Store::create(&dir).unwrap();
-        let mut opts = small_options();
-        opts.budget_bytes = 0;
-        let store = Store::open(&dir, opts.clone()).unwrap();
-        let mut model = Model::new();
-        let mut r = Rng(777);
-        for block in 1..=200 {
-            apply_block(&store, &mut model, &mut r, block);
-        }
-        store.flush().unwrap();
-        store.rewrite_base().unwrap();
-        let inner = &store.inner;
-        let v = inner.view.load_full();
-        let fids: Vec<u32> = v.base[1]
-            .iter()
-            .filter(|b| Inner::address_pages(b, &address(0)).is_some())
-            .map(|b| b.file.fid)
-            .collect();
-        assert!(
-            fids.len() >= 2,
-            "the large address is in {} files",
-            fids.len()
-        );
-        let listed = |store: &Store| -> Vec<(u32, u64)> {
-            let mut all: Vec<(u32, u64)> = store
-                .inner
-                .view
-                .load()
-                .filters
-                .values()
-                .flatten()
-                .map(|f| (f.fid, f.bloom.mem_bytes()))
-                .collect();
-            all.sort_unstable();
-            all
-        };
-        // Absent slots read in one of its files only.
-        inner
-            .absent
-            .lock()
-            .unwrap()
-            .insert((address(0), fids[1]), 50);
-        store.maintain_filters().unwrap();
-        let one = listed(&store);
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].0, fids[1]);
-        // Then in all of them, with memory for that one and one more.
-        for fid in &fids {
-            inner.absent.lock().unwrap().insert((address(0), *fid), 50);
-        }
-        drop(store);
-        let mut tight = opts.clone();
-        tight.filter_bytes = one[0].1 * 2 + 8;
-        let store = Store::open(&dir, tight.clone()).unwrap();
-        for fid in &fids {
-            let mut absent = store.inner.absent.lock().unwrap();
-            absent.insert((address(0), *fid), 50);
-        }
-        store.maintain_filters().unwrap();
-        let held: u64 = listed(&store).iter().map(|f| f.1).sum();
-        assert!(
-            held <= tight.filter_bytes,
-            "{held} of {}",
-            tight.filter_bytes
-        );
-        assert!(listed(&store).len() >= 2);
-        let all = listed(&store);
-        drop(store);
-        // Less memory: fewer are loaded; none is forgotten.
-        tight.filter_bytes = one[0].1;
-        let store = Store::open(&dir, tight).unwrap();
-        assert!(listed(&store).len() < all.len());
-        check(&store, &model, 200);
-        drop(store);
-        let store = Store::open(&dir, opts).unwrap();
-        assert_eq!(listed(&store), all);
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     /// Time a throttle was not used gives no credit: what comes after it
     /// is paced like anything else.
     #[test]
@@ -3770,64 +3151,6 @@ pub(crate) mod tests {
         throttle.spend(600_000).unwrap();
         // 0.6 s at the rate, less the burst.
         assert!(started.elapsed() >= Duration::from_millis(350));
-        drop(store);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A filter round that is cut short leaves the filters it had listed.
-    #[test]
-    fn address_filters_are_kept_as_they_are_built() {
-        let dir = test_dir("filters-partial");
-        Store::create(&dir).unwrap();
-        let mut opts = small_options();
-        opts.budget_bytes = 0;
-        let store = Store::open(&dir, opts.clone()).unwrap();
-        let mut model = Model::new();
-        let mut r = Rng(4242);
-        for block in 1..=200 {
-            apply_block(&store, &mut model, &mut r, block);
-        }
-        store.flush().unwrap();
-        store.rewrite_base().unwrap();
-        // What a round does for its first filter, and no more.
-        let inner = &store.inner;
-        let v = inner.view.load_full();
-        let (b, filter) = v.base[1]
-            .iter()
-            .find_map(|b| {
-                inner
-                    .build_filter(b, address(0), &mut Throttle::new(inner))
-                    .unwrap()
-                    .map(|f| (b.clone(), f))
-            })
-            .expect("a base file with slots of the address");
-        inner.list_filters(vec![filter], Vec::new()).unwrap();
-        drop(store);
-        let store = Store::open(&dir, opts).unwrap();
-        let listed: Vec<Arc<AddrFilter>> = store
-            .inner
-            .view
-            .load()
-            .filters
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        assert_eq!(listed.len(), 1);
-        assert_eq!((listed[0].fid, listed[0].address), (b.file.fid, address(0)));
-        // The next round builds the others and keeps this one.
-        for i in 0..300 {
-            let key = slot_key(0, 1_000_000 + i);
-            assert_eq!(store.get(true, &key, 150).unwrap().found, None);
-        }
-        store.maintain_filters().unwrap();
-        let v = store.inner.view.load_full();
-        assert!(v
-            .filters
-            .values()
-            .flatten()
-            .any(|f| Arc::ptr_eq(f, &listed[0])));
-        check(&store, &model, 200);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3938,19 +3261,30 @@ pub(crate) mod tests {
         }
         store.flush().unwrap();
         drop(store);
-        // What an interrupted flush leaves behind.
+        // What an interrupted flush leaves behind, and an address filter of
+        // an earlier build with its line in the manifest.
         for name in [
             "seg-00009999-s.v4",
             "seg-00009999-s.cidx",
             "MANIFEST.tmp",
             "dict-000777.dict",
+            "flt-00000001-0123456789abcdef01234567.bloom",
         ] {
             std::fs::write(dir.join(name), b"partial").unwrap();
         }
+        let manifest = std::fs::read_to_string(dir.join(MANIFEST)).unwrap();
+        let line = format!(
+            "filter 1 {} 5 flt-00000001-0123456789abcdef01234567\n",
+            "01".repeat(32)
+        );
+        std::fs::write(dir.join(MANIFEST), manifest + &line).unwrap();
         std::fs::write(dir.join("unrelated"), b"kept").unwrap();
         let store = Store::open(&dir, small_options()).unwrap();
         assert!(!dir.join("seg-00009999-s.v4").exists());
         assert!(!dir.join("dict-000777.dict").exists());
+        assert!(!dir
+            .join("flt-00000001-0123456789abcdef01234567.bloom")
+            .exists());
         assert!(dir.join("unrelated").exists());
         check(&store, &model, 64);
         let seg = store.inner.view.load().segs[1][0].name.clone();

@@ -162,8 +162,6 @@ pub struct ArchiveV4Metrics {
     pub segment_probes: Counter,
     /// Lookups answered by a segment.
     pub segment_hits: Counter,
-    /// Lookups an address filter answered without reading the base.
-    pub filter_negatives: Counter,
     /// Memtables written to segments.
     pub flushes: Counter,
     /// Segment merges.
@@ -186,8 +184,6 @@ pub struct ArchiveV4Metrics {
     pub index_bytes: Gauge,
     /// Memory of the segment filters.
     pub segment_filter_bytes: Gauge,
-    /// Memory of the address filters.
-    pub address_filter_bytes: Gauge,
     /// Capacity of the page cache.
     pub page_cache_capacity_bytes: Gauge,
     /// Bytes held in the page cache.

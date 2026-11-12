@@ -72,7 +72,6 @@ Differences in representation only:
 <db>/v4/base-<id>-a|s.v4  .cidx      base files: accounts | storage
 <db>/v4/seg-<id>-a|s.v4   .cidx .bloom   delta segments
 <db>/v4/dict-<id>.dict               zstd dictionaries
-<db>/v4/flt-<base id>-<address>.bloom    address filters
 <db>/v4/blocks.dat  .off  .pfx  .dict    block infos by number
 <db>/v4/code.dat    .idx  .dict          contract code by hash
 <db>/v4/LOCK                         held (flock) by the process that has the store open
@@ -197,30 +196,23 @@ that had to be given most of the memory (22000 of 30 GiB in most runs
 below); the two were the same in CPU, latency and device reads at the
 production rate (Results), and that way of reading is gone.
 
-Merges, base rewrites and filter builds read files front to back with
-`O_DIRECT`, and what they write is dropped from the kernel's cache as it
+Merges and base rewrites read files front to back with `O_DIRECT`, and what they write is dropped from the kernel's cache as it
 is synced: a pass over the base does not push the pages of the lookups
 out.
 
-### Address filters
+### Absent slots
 
-A lookup of a slot that a contract never had still reads a page. On bsc
-these are 19 % of the lookups and concentrate on a few very large contracts.
-The store counts, per address and base file, the device reads that found
-nothing, and keeps filters of the slots of the addresses where a filter
-saves the most reads per byte, within `ARCHIVE_V4_FILTER_MB` (default
-256): what the filters built really take, not an estimate, and a store
-opened with less loads only as many as fit. A filter belongs to one base
-file, is weighed by the absent reads of that file (a contract in several
-files gets one where they are, not in each for the reads of all), and is
-rebuilt after that file is rewritten; the choice is revised every 10
-minutes, between the files of a base rewrite pass too, and a filter is
-dropped when another would be used at least twice as much per byte.
-Building one reads the slots of its address in the base file, at
-`ARCHIVE_V4_REWRITE_MBPS`: a round over large contracts takes tens of
-minutes, and lists what it has built every ten seconds, so that a node
-stopping during it keeps that. A filter over every key would need 5 – 9
-GiB on bsc and is not kept.
+A lookup of a slot that a contract never had still reads a page: there is
+no filter over the base. On bsc these are 19 % of the lookups and
+concentrate on a few very large contracts. A filter over every key would
+need 5 – 9 GiB. Earlier builds kept filters of the slots of the addresses
+most read for absent slots, chosen online within 256 MiB. They were worth
+it for a store that read with `O_DIRECT` into 8 GiB of its own (0.024 →
+0.015 device reads per lookup on the prototype); behind the kernel's page
+cache the pages they save are in memory, and a node at the production size
+read the device as often without them as with them (0.124 – 0.133 against
+0.125 per request). They are removed: a manifest that lists some is read,
+and their files go at the next open.
 
 ### Writes
 
@@ -354,8 +346,7 @@ The rewrite is paced by the node, since the device has no IO scheduler to
 do it: at most `ARCHIVE_V4_REWRITE_MBPS` (16) of device IO, read and
 written. The rate is all there is: the rewrite does not watch the lookups,
 so a pass always ends after `2 × base / rate`. Time in which it did less
-than the rate allows (a slow stretch, a filter round in between) is not
-made up for afterwards at the speed of the device. Unthrottled, a rewrite at
+than the rate allows (a slow stretch) is not made up for afterwards at the speed of the device. Unthrottled, a rewrite at
 200 MB/s on a 125 MB/s volume cut read throughput by 3.5 (measured on the
 prototype), so do not raise the rate to the volume's limit on a serving
 node. At 16 MB/s a pass over bsc
@@ -478,8 +469,6 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 | `ARCHIVE_V4_REWRITE_MBPS` | 16 | device IO of a base rewrite, read plus written (0: no limit) |
 | `ARCHIVE_V4_BASE_FILE_MB` | 8192 | size at which a base file is closed |
 | `ARCHIVE_V4_BASE_ZSTD_LEVEL` | 3 | zstd level of base files (15 – 19: about 3 % smaller, 5 – 10 times slower to write) |
-| `ARCHIVE_V4_FILTER_MB` | 256 | memory of the address filters (0: none) |
-| `ARCHIVE_V4_FILTER_PERIOD_SECS` | 600 | how often the address filters are revised |
 | `ARCHIVE_V4_BLOCK_CACHE_MB` | 64 | memory for decoded chunks of block infos |
 
 `ARCHIVE_STATE_CACHE_MB` and `ARCHIVE_CODE_CACHE_MB` work as on v3. The
@@ -489,11 +478,9 @@ block index is always on (`ARCHIVE_BLOCK_INDEX` is not read), and the
 ## Metrics
 
 `leafage_archive_v4_*`: `page_reads`, `page_read_bytes`, `extra_pages`,
-`memtable_hits`, `segment_probes`, `segment_hits`, `filter_negatives`,
-`flushes`, `merges`, `rewrites`, `rewrite_bytes` (counters);
+`memtable_hits`, `segment_probes`, `segment_hits`, `flushes`, `merges`, `rewrites`, `rewrite_bytes` (counters);
 `memtable_versions`, `segments`, `delta_bytes`, `base_files`, `base_bytes`,
-`index_bytes`, `segment_filter_bytes`, `address_filter_bytes`,
-`page_cache_capacity_bytes`, `page_cache_usage_bytes`, `durable_block`
+`index_bytes`, `segment_filter_bytes`, `page_cache_capacity_bytes`, `page_cache_usage_bytes`, `durable_block`
 (gauges). The read latencies, state cache counters and
 `archive_{account,storage}_gets_{found,missing}` of `leafage_storage_*`
 count v4 reads too. There are no `leafage_rocksdb_*` metrics on a v4
@@ -617,8 +604,9 @@ found. The device is throttled to the production volume (8000 IOPS,
 | 8 GiB | 255,000 | 0.031 | 4.1 µs | 2 / 659 / 1268 µs |
 
 No Get of either run found another version than v3. The first run chose 481
-address filters (280 MiB) from the absent reads it saw; the later runs,
-the node runs included, start with them.
+address filters (280 MiB) from the absent reads it saw, as builds did
+then ("Absent slots"); the later runs, the node runs included, start with
+them.
 
 ### A node at the production size
 
@@ -690,12 +678,9 @@ building them during the first run):
 | Read from the device | 9.3 GiB | 13.3 GiB | 9.8 GiB | 6.9 GiB |
 | Blocks synced meanwhile | 1869 | 1865 | 968 | 962 |
 
-v4's first run read 4.1 GiB for lookups; the rest is the address filter
-round that started in it, which reads the slots of the addresses it
-filters at `ARCHIVE_V4_REWRITE_MBPS`, and a segment merge. A round
-lists the filters it has built every ten seconds, the most useful first,
-so a node that stops during one keeps those (the build measured here
-listed them only at its end, and lost the round at each restart).
+v4's first run read 4.1 GiB for lookups; the rest is a round of address
+filter building that started in it (this build still had them) and a
+segment merge.
 
 With its 527 address filters built again and no filter round in the
 window, the v4 node at 4500 requests/s, as above and with page files read

@@ -1068,8 +1068,7 @@ fn cpu_seconds() -> f64 {
 /// `v4_path` (what its files hold), on
 /// `threads` threads, and compare the block of each version found with the
 /// one the trace recorded. The first `warmup` lookups fill the cache and are
-/// reported apart; after them the address filters get one round, as they
-/// would over time on a node. A trace record is
+/// reported apart. A trace record is
 /// `cf u8 (4 account, 5 storage) | key length u8 | key | height u64 LE |
 /// found block u64 LE (u64::MAX: none)`.
 pub fn replay_get_trace(
@@ -1094,11 +1093,10 @@ pub fn replay_get_trace(
         at += 18 + kl;
     }
     info!(target: "migrate", "v4 replay: {} lookups loaded", offsets.len());
-    let options = Options {
-        filter_bytes: Options::serving(0).filter_bytes,
-        ..Options::maintenance(cache_mb << 20)
-    };
-    let store = Store::open(&v4_path.join(STORE_DIR), options)?;
+    let store = Store::open(
+        &v4_path.join(STORE_DIR),
+        Options::maintenance(cache_mb << 20),
+    )?;
     let head = store.head().unwrap_or(0);
     let warmup = (warmup as usize).min(offsets.len());
     let phase = |from: usize, to: usize| -> Result<V4ReplayReport, Error> {
@@ -1175,7 +1173,6 @@ pub fn replay_get_trace(
     };
     let warm = phase(0, warmup)?;
     info!(target: "migrate", "v4 replay: warm-up {warm:?}");
-    store.maintain_filters()?;
     let measured = phase(warmup, offsets.len())?;
     info!(target: "migrate", "v4 replay: measured {measured:?}; store sizes {:?}", store.sizes());
     Ok([warm, measured])
