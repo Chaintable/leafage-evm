@@ -14,16 +14,17 @@
 //! (versions sort newest-first) and caches the span up to it. That probe costs
 //! about one more seek, so a key whose next version turns out fewer than
 //! [`VOLATILE_SPAN`] blocks later is marked volatile and never probed again.
-//! On schema v3 the probe is a `Get` at the head instead: the newest version
-//! is the read one if the value holds up to the head, otherwise it bounds the
-//! next version from above. A key that was never written is probed too.
+//! On schema v3, a repeated miss on the same version uses a timestamp-range
+//! seek to learn its exact end, bounded by the reader's head. A miss on a
+//! different version can still use a `Get` at the head: it extends a value
+//! unchanged at the head, or remembers an upper bound on the next version.
+//! A key that was never written is probed too.
 //!
 //! A probe that cannot extend the span is skipped: when the read is at the
-//! head (the read alone reaches it), and, on v3, when a version above the one
-//! just read is already known, from an earlier probe or read. The archive only
-//! appends, so that newer version stays and the probe would only find it
-//! again. A backfill reads a changing key at ever higher blocks, each time an
-//! older version than the head's: only its first miss probes.
+//! head (the read alone reaches it), and, for v3's head Get, when a newer
+//! version is already known. That does not skip the exact probe: it can still
+//! extend an older version's span. Cold keys and misses on changing versions
+//! do not pay for that seek until the same version is read again.
 //!
 //! **Staying correct.** The archive only appends final blocks above its
 //! head: reorgs are resolved in the in-memory diff layers, and rewind is an
@@ -269,8 +270,8 @@ where
     }
 
     /// Schema v3 [`Self::record`]: `newer` is a version above the span,
-    /// found by probing at the head. It bounds the key's next version from
-    /// above.
+    /// found by a head Get or exact boundary seek. It bounds the key's next
+    /// version from above (and equals it for an exact probe).
     pub(super) fn record_udt(&self, key: [u8; N], span: Span<V>, newer: Option<u64>) {
         let short = newer.is_some_and(|n| n - span.lo < VOLATILE_SPAN);
         let read = if span.found { span.lo } else { 0 };
@@ -323,6 +324,19 @@ impl std::fmt::Debug for StateCache {
 }
 
 impl StateCache {
+    /// Pay for an exact v3 boundary only after another miss found this version.
+    pub(super) fn probe_udt_interval<V>(
+        prev: &Option<Arc<Entry<V>>>,
+        view: &ReadView,
+        block: u64,
+        read: &Span<V>,
+    ) -> bool {
+        block < view.head
+            && prev.as_ref().is_some_and(|entry| {
+                entry.newest != VOLATILE && entry.spans.iter().any(|s| s.same_version(read))
+            })
+    }
+
     /// Build the cache honoring `ARCHIVE_STATE_CACHE_MB` (`0` disables).
     pub(super) fn from_env() -> Option<Self> {
         let mb = std::env::var("ARCHIVE_STATE_CACHE_MB")
@@ -595,6 +609,29 @@ mod tests {
         record(&cache, 12, 150, found(100, 150, 1), false);
         record(&cache, 12, 250, found(200, 250, 2), false);
         assert_eq!(probe(12, 160, 1000, found(100, 160, 1)), Probe::Yes);
+    }
+
+    #[test]
+    fn udt_interval_probe_requires_a_repeated_nonvolatile_version() {
+        let cache = StateCache::new(1 << 20);
+        let read = found(100, 102, 1);
+        let probe = |block, span| {
+            StateCache::probe_udt_interval(&miss(&cache, 9, block), &view(1000), block, &span)
+        };
+        assert!(!probe(102, read), "cold key");
+        cache
+            .storage
+            .record_udt(key(9), found(100, 101, 1), Some(500));
+        assert!(
+            probe(102, read),
+            "known newer version does not cap an exact probe"
+        );
+        assert!(!probe(1000, read), "already at head");
+        assert!(!probe(501, found(500, 501, 2)), "different version");
+        cache
+            .storage
+            .record_udt(key(9), found(100, 102, 1), Some(103));
+        assert!(!probe(104, found(100, 104, 1)), "volatile key");
     }
 
     #[test]
