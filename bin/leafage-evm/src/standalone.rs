@@ -49,6 +49,7 @@ pub struct Command {
         long,
         value_parser = [
             "mainnet",
+            "hyper",
             "zksync",
             "arc",
             "arbitrum",
@@ -329,6 +330,17 @@ pub struct Command {
     /// Whether to forward estimateGas requests to the upstream RPC
     #[arg(long, default_value_t = false)]
     forward_estimategas: bool,
+
+    /// Resolve HyperEVM's HyperCore read precompiles (0x800..=0x814) through --upstream-url
+    /// during simulateTransactions instead of treating them as empty accounts.
+    ///
+    /// The state behind those precompiles lives in HyperCore and never reaches the EVM
+    /// archive, so a simulated call that reads it can only be answered by a node that
+    /// holds it, typically a local hl-node (for example http://localhost:3001/evm).
+    /// Unlike --forward-simulate this keeps execution, tracing and state overrides local;
+    /// only the read-precompile calls themselves are forwarded.
+    #[arg(long, default_value_t = false)]
+    forward_read_precompiles: bool,
 
     /// Upstream RPC of the chain serving full block bodies. Enables
     /// `trace_debankBlock` on BSC, Ethereum and Arc mainnet archive nodes, which
@@ -614,6 +626,9 @@ impl Command {
         let evm_type = self.evm_type.clone();
         let custom_evm_cfg = self.evm_custom_config.clone();
         let gas_cap = self.rpc_gas_cap;
+        if self.forward_read_precompiles && evm_type != "hyper" {
+            bail!("--forward-read-precompiles is only supported with --evm-type=hyper");
+        }
         match evm_type.as_str() {
             "mainnet" => {
                 let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "mainnet")?;
@@ -625,6 +640,19 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "hyper" => {
+                // HyperEVM executes mainnet rules; its chain-specific read precompiles are
+                // layered on by the hyper API implementation.
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "hyper")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Hyper(chain_cfg))
             }
             "zksync" => {
                 let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "zksync")?;
@@ -1078,8 +1106,10 @@ impl Command {
             ),
         )?);
 
-        if (self.forward_simulate || self.forward_estimategas) && self.upstream_url.is_none() {
-            bail!("--upstream-url must be provided when --forward-simulate or --forward-estimategas is enabled");
+        if (self.forward_simulate || self.forward_estimategas || self.forward_read_precompiles)
+            && self.upstream_url.is_none()
+        {
+            bail!("--upstream-url must be provided when --forward-simulate, --forward-estimategas or --forward-read-precompiles is enabled");
         }
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
@@ -1089,6 +1119,7 @@ impl Command {
                 self.upstream_url.clone(),
                 self.forward_simulate,
                 self.forward_estimategas,
+                self.forward_read_precompiles,
             )
             .with_trace_block_rpc(
                 self.trace_block_rpc.clone(),
@@ -1387,16 +1418,63 @@ mod tests {
     }
 
     #[test]
+    fn hyper_evm_type_builds_hyper_config() {
+        let command = parse_command(&["--evm-type", "hyper", "--chain-cfg", "999"]);
+        let chain_cfg = command
+            .build_chain_cfg_env()
+            .expect("HyperEVM config should build");
+
+        let MultiChainCfgEnv::Hyper(cfg) = chain_cfg else {
+            panic!("expected Hyper chain config");
+        };
+        assert_eq!(cfg.chain_id, 999);
+        assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+        assert!(cfg.disable_balance_check);
+        assert!(cfg.disable_eip3607);
+        assert!(cfg.disable_block_gas_limit);
+        assert!(cfg.disable_base_fee);
+    }
+
+    #[test]
+    fn forward_read_precompiles_requires_hyper_evm_type() {
+        let command = parse_command(&[
+            "--evm-type",
+            "mainnet",
+            "--chain-cfg",
+            "999",
+            "--forward-read-precompiles",
+        ]);
+        let error = command
+            .build_chain_cfg_env()
+            .expect_err("forwarding read precompiles on mainnet must be rejected");
+        assert!(error.to_string().contains("--evm-type=hyper"), "{error}");
+
+        let command = parse_command(&[
+            "--evm-type",
+            "hyper",
+            "--chain-cfg",
+            "999",
+            "--forward-read-precompiles",
+        ]);
+        assert!(matches!(
+            command.build_chain_cfg_env().unwrap(),
+            MultiChainCfgEnv::Hyper(_)
+        ));
+    }
+
+    #[test]
     fn upstream_url_and_forwarding_options() {
         let command = parse_command(&[
             "--upstream-url",
             "http://127.0.0.1:8545",
             "--forward-simulate",
             "--forward-estimategas",
+            "--forward-read-precompiles",
         ]);
         assert_eq!(command.upstream_url.as_deref(), Some("http://127.0.0.1:8545"));
         assert!(command.forward_simulate);
         assert!(command.forward_estimategas);
+        assert!(command.forward_read_precompiles);
     }
 
     #[test]

@@ -141,7 +141,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-path` | - | Database path (required) |
 | `--listen-addr` | 0.0.0.0:8545 | RPC listen address |
 | `--rpc-addr` | - | Geth RPC address (for HTTP mode state updates) |
-| `--evm-type` | mainnet | EVM type: mainnet/op/celo/bsc/cosmos |
+| `--evm-type` | mainnet | EVM type: mainnet/hyper/op/celo/bsc/cosmos |
 | `--chain-cfg` | 1 | Chain ID |
 | `--db-type` | rocksdb | Database type: rocksdb/mdbx |
 | `--db-cache` | 2048 | Database cache size (MB) |
@@ -156,6 +156,10 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--iterator-timeout-secs` | 0 | Iterator timeout for archive mode (0 = disabled) |
 | `--historical-rpc` | - | Historical RPC endpoint for pre-fork queries (e.g., OP pre-bedrock) |
 | `--historical-height` | - | Fork height threshold for historical RPC forwarding |
+| `--upstream-url` | - | Upstream RPC. With `--forward-read-precompiles`, the HyperCore node (e.g. `http://localhost:3001/evm`) that answers HyperEVM read precompiles |
+| `--forward-read-precompiles` | false | `hyper` only: resolve HyperEVM's HyperCore read precompiles (`0x800..=0x814`) through `--upstream-url` instead of treating them as empty accounts |
+
+For HyperEVM, use `--evm-type=hyper --chain-cfg=999`. Add `--upstream-url` and `--forward-read-precompiles` to resolve the chain's HyperCore read precompiles (`0x800..=0x814`) during `eth_call`, `estimateGas`, `simulateTransactions` and the `pre_*` traces; the state behind them lives in HyperCore and never reaches the EVM archive, so the upstream is always queried at its latest block and forwarded reads in historical simulations are approximate.
 
 For Cosmos chains, configure additional native precompile addresses with:
 

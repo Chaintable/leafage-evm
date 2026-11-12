@@ -13,6 +13,7 @@ use crate::api_impl::core::{
     ToJsonRpcError,
 };
 use crate::api_impl::historical_overload::{HistoricalOverloadHttpLayer, HistoricalOverloadRpc};
+use crate::api_impl::hyper::HyperEvmConfig;
 use crate::metrics::{HttpMetricLayer, RpcMetric};
 use crate::pipeline::chain::PipelineChain;
 use crate::pipeline::rpc::{TraceDebank, TraceDebankApiServer};
@@ -38,8 +39,12 @@ pub struct ApiBuilder<DB> {
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
     upstream_client: Option<HttpClient>,
+    /// URL the upstream client was built for, kept so the HyperCore read-precompile
+    /// forwarder can be built when the server starts.
+    upstream_url: Option<String>,
     forward_simulate: bool,
     forward_estimategas: bool,
+    forward_read_precompiles: bool,
     trace_block_client: Option<HttpClient>,
     trace_block_check_state: bool,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
@@ -64,8 +69,10 @@ where
             historical_client: None,
             historical_height: None,
             upstream_client: None,
+            upstream_url: None,
             forward_simulate: false,
             forward_estimategas: false,
+            forward_read_precompiles: false,
             trace_block_client: None,
             trace_block_check_state: true,
             replay_blocks: None,
@@ -111,6 +118,7 @@ where
         upstream_url: Option<String>,
         forward_simulate: bool,
         forward_estimategas: bool,
+        forward_read_precompiles: bool,
     ) -> Self {
         if let Some(url) = upstream_url {
             if let Ok(http_client) = HttpClientBuilder::default()
@@ -120,9 +128,11 @@ where
             {
                 self.upstream_client = Some(http_client);
             }
+            self.upstream_url = Some(url);
         }
         self.forward_simulate = forward_simulate;
         self.forward_estimategas = forward_estimategas;
+        self.forward_read_precompiles = forward_read_precompiles;
         self
     }
 
@@ -344,6 +354,14 @@ where
                         self.trace_block_check_state,
                     )?;
                 })
+            }
+            MultiChainCfgEnv::Hyper(env) => {
+                let custom_cfg = HyperEvmConfig::from_upstream(
+                    self.forward_read_precompiles,
+                    self.upstream_url.as_deref(),
+                    tokio::runtime::Handle::current(),
+                );
+                run_chain_setup!(env, Some(custom_cfg))
             }
             MultiChainCfgEnv::Zksync(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)

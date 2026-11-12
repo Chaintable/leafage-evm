@@ -184,29 +184,54 @@ pub(crate) fn create_mainnet_txn_env<ODB: DatabaseRef, SpecId>(
     Ok(env)
 }
 
-pub(crate) fn create_main_evm_from_state<StateDB, INSP>(
-    block_env: BlockEnv,
-    cfg: CfgEnv<MainnetSpecId>,
-    state: StateDB,
-    inspector: INSP,
-) -> Evm<
+pub(crate) type MainnetEvm<StateDB, INSP, P> = Evm<
     Context<BlockEnv, TxEnv, CfgEnv<MainnetSpecId>, WrapDatabaseRef<StateDB>>,
     INSP,
     EthInstructions<
         EthInterpreter,
         Context<BlockEnv, TxEnv, CfgEnv<MainnetSpecId>, WrapDatabaseRef<StateDB>>,
     >,
-    EthPrecompiles,
+    P,
     revm::handler::EthFrame,
->
+>;
+
+pub(crate) fn create_main_evm_from_state<StateDB, INSP>(
+    block_env: BlockEnv,
+    cfg: CfgEnv<MainnetSpecId>,
+    state: StateDB,
+    inspector: INSP,
+) -> MainnetEvm<StateDB, INSP, EthPrecompiles>
 where
     StateDB: DatabaseRef,
 {
     let spec: revm::primitives::hardfork::SpecId = cfg.spec.into();
+    create_main_evm_from_state_with_precompiles(
+        block_env,
+        cfg,
+        state,
+        inspector,
+        EthPrecompiles::new(spec),
+    )
+}
+
+/// Like [`create_main_evm_from_state`], but with the caller's precompile provider.
+///
+/// `simulateTransactions` uses it to install HyperCore read precompiles that forward
+/// to the upstream instead of treating `0x800..=0x814` as empty accounts.
+pub(crate) fn create_main_evm_from_state_with_precompiles<StateDB, INSP, P>(
+    block_env: BlockEnv,
+    cfg: CfgEnv<MainnetSpecId>,
+    state: StateDB,
+    inspector: INSP,
+    precompiles: P,
+) -> MainnetEvm<StateDB, INSP, P>
+where
+    StateDB: DatabaseRef,
+{
     Context::mainnet()
         .with_block(block_env)
         .with_cfg(cfg)
         .with_ref_db(state)
         .build_mainnet_with_inspector(inspector)
-        .with_precompiles(EthPrecompiles::new(spec))
+        .with_precompiles(precompiles)
 }

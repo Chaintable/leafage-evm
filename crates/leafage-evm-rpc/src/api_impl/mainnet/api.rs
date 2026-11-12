@@ -10,7 +10,7 @@ use alloy::eips::eip2935::HISTORY_STORAGE_ADDRESS;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{BlockInfo, CallRequest, DebankErrorCode, MainnetSpecId, H256};
 use revm::context::result::{EVMError, HaltReason, InvalidTransaction};
-use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
+use revm::context::{result::ExecutionResult, BlockEnv, CfgEnv, TxEnv};
 use revm::inspector::NoOpInspector;
 use revm::primitives::hardfork::SpecId;
 use revm::ExecuteEvm;
@@ -22,52 +22,50 @@ use std::fmt::Debug;
 
 type MainnetApiImpl<DB> = ApiImpl<DB, MainnetSpecId, NoneEvmCustomConfig>;
 
-impl<DB> MainnetApiImpl<DB>
+/// Applies EIP-2935's parent-hash write before executing a block's transactions.
+///
+/// Shared with the HyperEVM executor, whose execution rules match mainnet's.
+pub(crate) fn apply_blockhashes_contract_call<StateDB>(
+    cfg: &CfgEnv<MainnetSpecId>,
+    parent_block_hash: H256,
+    block_env: &BlockEnv,
+    state: &mut StateDB,
+) -> RpcResult<()>
 where
-    DB: Sync + Send + 'static,
+    StateDB: DatabaseCommit + DatabaseRef + Debug,
+    StateDB::Error: Sync + Send + 'static,
 {
-    fn apply_blockhashes_contract_call<StateDB>(
-        &self,
-        parent_block_hash: H256,
-        block_env: &BlockEnv,
-        state: &mut StateDB,
-    ) -> RpcResult<()>
-    where
-        StateDB: DatabaseCommit + DatabaseRef + Debug,
-        StateDB::Error: Sync + Send + 'static,
-    {
-        if !self.evm_cfg.cfg.spec.is_enabled_in(SpecId::PRAGUE) {
-            return Ok(());
-        }
-
-        if block_env.number.is_zero() {
-            return Ok(());
-        }
-
-        let result = {
-            let mut evm = create_main_evm_from_state(
-                block_env.clone(),
-                self.evm_cfg.cfg.clone(),
-                &*state,
-                NoOpInspector {},
-            );
-
-            evm.system_call(HISTORY_STORAGE_ADDRESS, parent_block_hash.0.into())
-                .map_err(|e| {
-                    let code = match e {
-                        EVMError::Database(_) => DebankErrorCode::DataBaseFailed,
-                        _ => DebankErrorCode::InternalError,
-                    };
-                    rpc_error_with_code(
-                        code as i32,
-                        format!("EIP-2935 blockhashes contract call failed: {e}"),
-                    )
-                })?
-        };
-
-        state.commit(result.state);
-        Ok(())
+    if !cfg.spec.is_enabled_in(SpecId::PRAGUE) {
+        return Ok(());
     }
+
+    if block_env.number.is_zero() {
+        return Ok(());
+    }
+
+    let result = {
+        let mut evm = create_main_evm_from_state(
+            block_env.clone(),
+            cfg.clone(),
+            &*state,
+            NoOpInspector {},
+        );
+
+        evm.system_call(HISTORY_STORAGE_ADDRESS, parent_block_hash.0.into())
+            .map_err(|e| {
+                let code = match e {
+                    EVMError::Database(_) => DebankErrorCode::DataBaseFailed,
+                    _ => DebankErrorCode::InternalError,
+                };
+                rpc_error_with_code(
+                    code as i32,
+                    format!("EIP-2935 blockhashes contract call failed: {e}"),
+                )
+            })?
+    };
+
+    state.commit(result.state);
+    Ok(())
 }
 
 impl<DB> GasFeeHandler for MainnetApiImpl<DB> where DB: Sync + Send + 'static { type Tx = TxEnv; }
@@ -135,7 +133,7 @@ where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
-        self.apply_blockhashes_contract_call(header.parent_hash(), block_env, state)
+        apply_blockhashes_contract_call(&self.evm_cfg.cfg, header.parent_hash(), block_env, state)
     }
 
     fn inspect_tx_commit<
@@ -217,3 +215,4 @@ impl GetHaltReason for HaltReason {
 }
 
 impl<DB> ApiCore for MainnetApiImpl<DB> where DB: Sync + Send + 'static {}
+

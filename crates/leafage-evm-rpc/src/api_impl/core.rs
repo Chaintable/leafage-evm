@@ -322,6 +322,8 @@ where
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    /// HyperEVM: mainnet execution rules with HyperCore-backed read precompiles.
+    Hyper(CfgEnv<MainnetSpecId>),
     Zksync(CfgEnv<MainnetSpecId>),
     Arc((CfgEnv<MainnetSpecId>, ArcChainConfig)),
     Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
@@ -345,6 +347,7 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Hyper(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Zksync(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Arc(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
