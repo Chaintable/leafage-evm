@@ -156,6 +156,14 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--historical-rpc` | - | 历史 RPC 端点，用于无法获取 block diff 的区块（如 OP pre-bedrock） |
 | `--historical-height` | - | 历史 RPC 转发的分叉高度阈值 |
 
+Cosmos 链可配置额外的原生预编译地址：
+
+```bash
+--evm-type=cosmos --evm-custom-config='{"unsupported_precompiles":["0x0000000000000000000000000000000000001000","0x0000000000000000000000000000000000001003"]}'
+```
+
+列表默认为空，与内置的不支持地址和原有的 `native_token` 配置共同生效。直接或合约内部调用这些地址时返回 `-39008`（`UnsupportedPrecompile`），由已配置原生节点回退的网关重试；Leafage 自身不转发这些调用。列表对所有区块高度生效，原生节点需支持请求对应的历史状态。
+
 Celo L2 主网使用 `--evm-type=celo --chain-cfg=42220`。执行规则按请求区块选择 Granite / Isthmus / Jovian，包含 CELO 原生转账预编译 `0xfd`，合约代码上限为 64 KiB。费用处理仍复用 OP；Celo 专用费用分配、`feeCurrency` / CIP-64 及 Celo L1 历史执行暂不支持，且不接受固定分叉覆盖参数。
 
 ### Kafka + S3 配置
