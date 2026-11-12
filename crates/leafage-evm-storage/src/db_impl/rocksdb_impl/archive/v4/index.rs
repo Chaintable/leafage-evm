@@ -108,11 +108,22 @@ impl IndexBuilder {
         let mut hdr_start: Vec<u32> = Vec::new();
         let mut hdr_base: Vec<u64> = Vec::new();
         let mut win = vec![0u8; n * W];
+        // A page that starts with the key its neighbour starts with: the key
+        // has more versions than a page holds.
+        let in_run =
+            |i: usize| (i > 0 && key(i) == key(i - 1)) || (i + 1 < n && key(i) == key(i + 1));
         let mut s = 0usize;
         while s < n {
             let mut e = s + 1;
             let mut cp = k;
             while e < n && e - s < BLOCK_PAGES {
+                // The pages of such a key get index blocks of their own.
+                // Among the pages of other keys they would all have the
+                // window those of their address have, and a lookup of
+                // another slot of it would step through every one of them.
+                if in_run(e) != in_run(s) || (in_run(s) && key(e) != key(s)) {
+                    break;
+                }
                 let ncp = lcp(key(s), key(e)).min(cp);
                 // Shortening the prefix changes every window of the block.
                 let ap = address_part(k, ncp);
@@ -463,6 +474,38 @@ mod tests {
             .rposition(|(k, b)| (k.as_slice(), *b as u64) <= (key, h))
     }
 
+    /// A key that starts many pages is not put in an index block with the
+    /// pages of other keys: a lookup of another slot of its address goes to
+    /// the page that has it, not to one of those and from there back or
+    /// forth through them all.
+    #[test]
+    fn a_key_of_many_pages_does_not_hide_its_neighbours() {
+        // Addresses that differ in their first bytes: without the rule all
+        // of this is one block, with windows of address bytes only.
+        let hot = key64(3 << 32, 9 << 40);
+        let mut keys: Vec<(Vec<u8>, u32)> =
+            vec![(key64(1 << 32, 1 << 40), 10), (key64(2 << 32, 1 << 40), 10)];
+        for b in 0..30u32 {
+            keys.push((hot.clone(), 100 + b * 100));
+        }
+        keys.push((key64(4 << 32, 1 << 40), 10));
+        let idx = build(&keys);
+        // A slot of the hot key's address below it is on the page before
+        // its pages; one above it, on the last of them.
+        let below = key64(3 << 32, 2 << 40);
+        let above = key64(3 << 32, 11 << 40);
+        for h in [50u64, 150, 1500, 1_000_000] {
+            assert_eq!(idx.floor(&below, h), Some(1), "below, at {h}");
+            assert_eq!(idx.floor(&above, h), Some(31), "above, at {h}");
+            assert!(!idx.may_continue(31, &above));
+            assert_eq!(
+                idx.floor(&hot, h),
+                floor_ref(&keys, &hot, h),
+                "the key, at {h}"
+            );
+        }
+    }
+
     #[test]
     fn floor_matches_full_keys() {
         // Pages inside a few big addresses, single-page addresses, a key
@@ -560,10 +603,19 @@ mod tests {
         assert_eq!(idx.continues_at(2, &k2), None);
         assert_eq!(idx.continues_at(3, &keys[3].0), None);
         assert!(idx.may_continue(0, &k1));
+        // The pages of `k1` are an index block of their own: what follows
+        // them starts with another key, and nothing of `k1`'s is there.
+        assert!(!idx.may_continue(1, &k1));
+        assert!(!idx.may_continue(2, &k2));
         // In a block spanning contracts, the next page of the same address
         // may be of another address with the same leading bytes.
-        assert!(idx.may_continue(1, &k1));
-        assert!(!idx.may_continue(2, &k2));
+        let spanning = vec![
+            (key64(1 << 32, 1 << 40), 10),
+            (key64(1 << 32, 2 << 40), 10),
+            (key64(9 << 32, 0), 3),
+        ];
+        let idx = build(&spanning);
+        assert!(idx.may_continue(0, &spanning[0].0));
         // Inside one contract, only an equal window continues.
         let one: Vec<(Vec<u8>, u32)> = (1..6u64).map(|s| (key64(1 << 32, s << 40), 3)).collect();
         let idx = build(&one);

@@ -252,14 +252,25 @@ impl BlockHashes for DB {
 
 impl BlockHashes for super::v4::Store {
     fn last(&self) -> Result<Option<(u64, H256)>, Error> {
-        // The head, or the block below it that has a hash.
+        // The head, or the last block below it that has a hash: a block
+        // written with its versions only has none.
         let Some(head) = self.head() else {
             return Ok(None);
         };
-        for number in (head.saturating_sub(64)..=head).rev() {
-            if let Some(hash) = self.block_hash(number)? {
-                return Ok(Some((number, H256::from(hash))));
+        let mut to = head + 1;
+        while to > 0 {
+            let from = to.saturating_sub(4096);
+            let mut last = None;
+            self.scan_block_prefixes(from, to, &mut |number, _| {
+                last = Some(number);
+                Ok(())
+            })?;
+            if let Some(number) = last {
+                if let Some(hash) = self.block_hash(number)? {
+                    return Ok(Some((number, H256::from(hash))));
+                }
             }
+            to = from;
         }
         Ok(None)
     }

@@ -1195,8 +1195,7 @@ impl DataBaseRef {
 
     /// Open a schema v4 archive: the files of its store, and the index from
     /// block hash to number built over them. `cache_size` (MiB) is the
-    /// store's whole budget. There is no RocksDB; one left by a build that
-    /// kept block infos and code there is moved into the files first.
+    /// store's whole budget. There is no RocksDB.
     fn open_v4(
         path: &Path,
         cache_size: usize,
@@ -1205,7 +1204,13 @@ impl DataBaseRef {
     ) -> Result<Self, Error> {
         let store_dir = path.join(v4::STORE_DIR);
         if path.join("CURRENT").exists() {
-            v4::convert::move_out_of_rocksdb(path)?;
+            // Development builds kept block infos and code in a RocksDB
+            // next to the store; no released one did.
+            return Err(Error::UnSupported(format!(
+                "{} is a schema v4 archive with a RocksDB, as a development build laid it \
+                 out: convert its v3 source again",
+                path.display()
+            )));
         }
         let budget = (cache_size as u64) << 20;
         let options = if maintenance {

@@ -282,8 +282,9 @@ struct State {
     /// up to (0: no pass). It is in the manifest, so that a pass cut short
     /// goes on with the files it had not reached.
     pass: [u64; 2],
-    /// Absent reads per address, decayed, across filter rounds.
-    absent_score: HashMap<[u8; 32], f64, KeyHashBuild>,
+    /// Absent reads per address and base file, decayed, across filter
+    /// rounds.
+    absent_score: HashMap<([u8; 32], u32), f64>,
 }
 
 /// A result of [`Store::get`].
@@ -325,8 +326,12 @@ struct Inner {
     codes: Codes,
     /// Held while the store is open: one process at a time.
     _lock: std::fs::File,
-    /// Disk reads for slots absent from the base, per address.
-    absent: Mutex<HashMap<[u8; 32], u64, KeyHashBuild>>,
+    /// Disk reads for slots absent from the base, per address and base
+    /// file.
+    absent: Mutex<HashMap<([u8; 32], u32), u64>>,
+    /// When the last address filter round began, and how often one is due.
+    filter_round: Mutex<Instant>,
+    filter_period: Duration,
 }
 
 /// The versions of one block: its number, accounts and slots.
@@ -410,6 +415,10 @@ impl ManifestData {
             let text = |i: usize| -> Result<String, Error> {
                 f.get(i).map(|s| s.to_string()).ok_or_else(bad)
             };
+            // A checksum, which a manifest of an earlier build leaves out.
+            let crc = |i: usize| -> Result<Option<u32>, Error> {
+                f.get(i).map(|s| s.parse().map_err(|_| bad())).transpose()
+            };
             match f.first().copied() {
                 None => {}
                 Some("next_fid") => m.next_fid = num(1)? as u32,
@@ -473,6 +482,7 @@ impl ManifestData {
                         dat_len: num(3)?,
                         tail: num(4)?,
                         dict: num(5)? == 1,
+                        off_crc: crc(6)?,
                     }
                 }
                 Some("codes") => {
@@ -480,6 +490,7 @@ impl ManifestData {
                         count: num(1)?,
                         dat_len: num(2)?,
                         dict: num(3)? == 1,
+                        idx_crc: crc(4)?,
                     }
                 }
                 Some(_) => return Err(bad()),
@@ -518,13 +529,22 @@ impl ManifestData {
             s += &format!("filter {fid} {} {slots} {name}\n", hex(address));
         }
         let b = &self.blocks;
+        let crc = |c: Option<u32>| c.map_or(String::new(), |c| format!(" {c}"));
         s += &format!(
-            "blocks {} {} {} {} {}\n",
-            b.first, b.count, b.dat_len, b.tail, b.dict as u8
+            "blocks {} {} {} {} {}{}\n",
+            b.first,
+            b.count,
+            b.dat_len,
+            b.tail,
+            b.dict as u8,
+            crc(b.off_crc)
         );
         s += &format!(
-            "codes {} {} {}\n",
-            self.codes.count, self.codes.dat_len, self.codes.dict as u8
+            "codes {} {} {}{}\n",
+            self.codes.count,
+            self.codes.dat_len,
+            self.codes.dict as u8,
+            crc(self.codes.idx_crc)
         );
         s
     }
@@ -541,40 +561,47 @@ fn dict_file(id: u32) -> String {
     format!("dict-{id:06}.dict")
 }
 
-/// Paces background IO to a byte rate.
+/// Paces background IO to a byte rate. Time in which less was done than
+/// the rate allows (the work was slower, or something else ran) gives no
+/// credit beyond [`THROTTLE_BURST`]: it is not made up for at the device's
+/// speed afterwards.
 struct Throttle<'a> {
     inner: &'a Inner,
-    started: Instant,
-    bytes: u64,
+    /// When the IO accounted so far is paid for.
+    paid: Instant,
 }
+
+/// The IO a throttle lets through at once, as time at its rate.
+const THROTTLE_BURST: Duration = Duration::from_millis(200);
 
 impl<'a> Throttle<'a> {
     fn new(inner: &'a Inner) -> Self {
         Self {
             inner,
-            started: Instant::now(),
-            bytes: 0,
+            paid: Instant::now(),
         }
     }
 
     /// Account `bytes` of device IO, then wait as the pace requires.
     /// Returns an error once the store is closing.
     fn spend(&mut self, bytes: u64) -> Result<(), Error> {
-        self.bytes += bytes;
         let rate = self.inner.opts.rewrite_bytes_per_sec;
+        if rate > 0.0 {
+            let now = Instant::now();
+            let from = self
+                .paid
+                .max(now.checked_sub(THROTTLE_BURST).unwrap_or(now));
+            self.paid = from + Duration::from_secs_f64(bytes as f64 / rate);
+        }
         loop {
             if self.inner.stop.load(Ordering::Relaxed) {
                 return Err(Error::ArchiveV4("store is closing".into()));
             }
-            if rate > 0.0 {
-                let due = self.bytes as f64 / rate;
-                let run = self.started.elapsed().as_secs_f64();
-                if due > run {
-                    std::thread::sleep(Duration::from_secs_f64((due - run).min(0.2)));
-                    continue;
-                }
+            let wait = self.paid.saturating_duration_since(Instant::now());
+            if rate <= 0.0 || wait.is_zero() {
+                return Ok(());
             }
-            return Ok(());
+            std::thread::sleep(wait.min(Duration::from_millis(200)));
         }
     }
 }
@@ -700,18 +727,25 @@ impl<'a> BaseOut<'a> {
         let Some((fid, name, w)) = self.writer.take() else {
             return Ok(());
         };
-        let out = w.finish()?;
-        self.written += out.bytes;
-        let Some(first_key) = out.first_key else {
-            remove_page_file(&self.inner.dir.join(&name));
-            return Ok(());
+        let path = self.inner.dir.join(&name);
+        let opened = w.finish().and_then(|out| match out.first_key {
+            Some(first_key) => PageFile::open(&path, fid, self.storage, self.dict.clone())
+                .map(|file| Some((out, first_key, file))),
+            None => Ok(None),
+        });
+        let (out, first_key, file) = match opened {
+            Ok(Some(opened)) => opened,
+            // Nothing in it, or it could not be finished: not a file to keep.
+            Ok(None) => {
+                remove_page_file(&path);
+                return Ok(());
+            }
+            Err(e) => {
+                remove_page_file(&path);
+                return Err(e);
+            }
         };
-        let file = PageFile::open(
-            &self.inner.dir.join(&name),
-            fid,
-            self.storage,
-            self.dict.clone(),
-        )?;
+        self.written += out.bytes;
         self.done.push(Arc::new(BaseFile {
             file: Arc::new(file),
             name,
@@ -723,8 +757,11 @@ impl<'a> BaseOut<'a> {
     }
 
     fn finish(mut self) -> Result<Vec<Arc<BaseFile>>, Error> {
-        self.close()?;
-        Ok(self.done)
+        if let Err(e) = self.close() {
+            self.abort();
+            return Err(e);
+        }
+        Ok(std::mem::take(&mut self.done))
     }
 
     /// Remove what was written, after a failure.
@@ -1029,9 +1066,9 @@ impl Inner {
             // A disk read for a slot this file never had: what an address
             // filter saves.
             let mut absent = self.absent.lock().unwrap();
-            let address: [u8; 32] = key[..32].try_into().unwrap();
-            if absent.len() < ABSENT_TRACKED || absent.contains_key(&address) {
-                *absent.entry(address).or_insert(0) += 1;
+            let at: ([u8; 32], u32) = (key[..32].try_into().unwrap(), base.file.fid);
+            if absent.len() < ABSENT_TRACKED || absent.contains_key(&at) {
+                *absent.entry(at).or_insert(0) += 1;
             }
         }
         Ok(Read { found, next })
@@ -1074,19 +1111,25 @@ impl Inner {
             let fid = self.new_fid();
             let name = format!("seg-{fid:08}-{}", kind_tag(kind));
             let path = self.dir.join(&name);
-            let mut w = PageWriter::new(&path, storage, &dict, SEGMENT_LEVEL, Some(distinct))?;
-            mem.for_each_sorted(storage, |k, b, v| w.add(k, b, v))?;
-            let out = w.finish()?;
-            Ok(Some(Arc::new(Seg {
-                file: Arc::new(PageFile::open(&path, fid, storage, dict)?),
-                name,
-                lo,
-                hi,
-                level: 0,
-                records: out.records,
-                distinct: out.distinct,
-                bloom: out.bloom.expect("asked for"),
-            })))
+            let written = (|| -> Result<Arc<Seg>, Error> {
+                let mut w = PageWriter::new(&path, storage, &dict, SEGMENT_LEVEL, Some(distinct))?;
+                mem.for_each_sorted(storage, |k, b, v| w.add(k, b, v))?;
+                let out = w.finish()?;
+                Ok(Arc::new(Seg {
+                    file: Arc::new(PageFile::open(&path, fid, storage, dict.clone())?),
+                    name: name.clone(),
+                    lo,
+                    hi,
+                    level: 0,
+                    records: out.records,
+                    distinct: out.distinct,
+                    bloom: out.bloom.expect("asked for"),
+                }))
+            })();
+            if written.is_err() {
+                remove_page_file(&path);
+            }
+            written.map(Some)
         };
         let (a, s) = std::thread::scope(|scope| {
             let a = scope.spawn(|| write(false));
@@ -1206,6 +1249,7 @@ impl Inner {
     fn merge_step(&self) -> Result<bool, Error> {
         let _one = self.merging.lock().unwrap();
         let v = self.view.load_full();
+        let pass = self.state.lock().unwrap().pass;
         for kind in 0..2 {
             let list = &v.segs[kind];
             let mut levels: Vec<u32> = list.iter().map(|s| s.level).collect();
@@ -1213,12 +1257,20 @@ impl Inner {
             levels.dedup();
             for level in levels {
                 // Segments are ordered by time; only neighbours merge, or
-                // the result would overlap what lies between them.
+                // the result would overlap what lies between them. While a
+                // base rewrite pass is under way, not across the block it
+                // folds up to: the pass ends by dropping the segments up to
+                // there, and one merged with later ones would stay, with
+                // most of the delta in it.
                 let Some(at) = (0..list.len()).find(|&i| {
-                    i + self.opts.tiers <= list.len()
-                        && list[i..i + self.opts.tiers]
-                            .iter()
-                            .all(|s| s.level == level)
+                    i + self.opts.tiers <= list.len() && {
+                        let group = &list[i..i + self.opts.tiers];
+                        let target = pass[kind];
+                        group.iter().all(|s| s.level == level)
+                            && (target == 0
+                                || group.iter().all(|s| s.hi <= target)
+                                || group.iter().all(|s| s.hi > target))
+                    }
                 }) else {
                     continue;
                 };
@@ -1460,9 +1512,17 @@ impl Inner {
         }
         let out_bytes = out.bytes();
         let files = out.finish()?;
-        sync_dir(&self.dir)?;
         let n_files = files.len();
         let mut dropped_segs = Vec::new();
+        // Files that do not get into the manifest are not left behind.
+        let unlisted: Vec<String> = files.iter().map(|b| b.name.clone()).collect();
+        let discard = |e: Error| {
+            for name in &unlisted {
+                remove_page_file(&self.dir.join(name));
+            }
+            e
+        };
+        sync_dir(&self.dir).map_err(discard)?;
         {
             let mut st = self.state.lock().unwrap();
             let mut nv = (*self.view.load_full()).clone();
@@ -1471,7 +1531,7 @@ impl Inner {
                     let at = nv.base[kind]
                         .iter()
                         .position(|b| b.file.fid == old.file.fid)
-                        .ok_or_else(|| corrupt("base file vanished during its rewrite"))?;
+                        .ok_or_else(|| discard(corrupt("base file vanished during its rewrite")))?;
                     nv.base[kind].splice(at..at + 1, files);
                 }
                 None => nv.base[kind] = files,
@@ -1502,6 +1562,8 @@ impl Inner {
                 nv.filters = Arc::new(filters);
                 dropped
             });
+            // A manifest that failed to be written may still be the one the
+            // next open finds: the new files stay for it to sort out.
             self.publish(&mut st, nv, None)?;
             for name in dropped_filters {
                 let _ = std::fs::remove_file(bloom_path(&self.dir.join(name)));
@@ -1564,7 +1626,13 @@ impl Inner {
                     break;
                 };
                 i += if b.hi < target {
-                    self.rewrite_range(kind, Some(b), &mut throttle)?.max(1)
+                    let n = self.rewrite_range(kind, Some(b), &mut throttle)?.max(1);
+                    // A pass takes days, and each file it rewrites loses its
+                    // address filters: the rounds go on between the files.
+                    if self.opts.background {
+                        self.filter_round(false);
+                    }
+                    n
                 } else {
                     1
                 };
@@ -1622,7 +1690,7 @@ impl Inner {
         let Some((c0, c1)) = Self::address_pages(b, &address) else {
             return Ok(None);
         };
-        let mut src = SeqReader::new(b.file.clone());
+        let mut src = SeqReader::until(b.file.clone(), b.file.index.range(c1).1);
         let mut hashes: Vec<(u64, u64)> = Vec::new();
         let mut last = [0u8; 32];
         let mut spent = 0;
@@ -1666,40 +1734,39 @@ impl Inner {
         }
         let v = self.view.load_full();
         let fresh = std::mem::take(&mut *self.absent.lock().unwrap());
-        // (address, base fid) -> reads a filter there would save per round.
+        // (address, base file) -> reads a filter there would save per
+        // round. A filter is for one base file, and so are the reads it is
+        // weighed by: an address in several files gets one where its absent
+        // slots are read, not in all of them for the reads of one.
         let mut want: Vec<([u8; 32], Arc<BaseFile>, f64, u64)> = Vec::new();
         {
+            let files: HashMap<u32, &Arc<BaseFile>> =
+                v.base[1].iter().map(|b| (b.file.fid, b)).collect();
             let mut st = self.state.lock().unwrap();
             for score in st.absent_score.values_mut() {
                 *score *= 0.5;
             }
-            for (address, n) in fresh {
-                *st.absent_score.entry(address).or_insert(0.0) += n as f64;
+            for (at, n) in fresh {
+                *st.absent_score.entry(at).or_insert(0.0) += n as f64;
             }
-            st.absent_score.retain(|_, s| *s >= 0.5);
-            for (address, score) in &st.absent_score {
+            // Reads of a file that was rewritten since count for nothing.
+            st.absent_score
+                .retain(|(_, fid), s| *s >= 0.5 && files.contains_key(fid));
+            for ((address, fid), score) in &st.absent_score {
                 if *score < FILTER_MIN_READS as f64 {
                     continue;
                 }
-                // One filter per base file holding slots of the address;
-                // the reads are not told apart by file, so each gets all.
-                let (mut lo, mut hi) = ([0u8; 64], [0xffu8; 64]);
-                lo[..32].copy_from_slice(address);
-                hi[..32].copy_from_slice(address);
-                let first = v.base_index(1, &lo).unwrap_or(0);
-                let last = v.base_index(1, &hi).unwrap_or(0);
-                for b in v.base[1].iter().take(last + 1).skip(first) {
-                    let has = v
-                        .filters
-                        .get(address)
-                        .is_some_and(|l| l.iter().any(|f| f.fid == b.file.fid));
-                    if has {
-                        continue;
-                    }
-                    if let Some((c0, c1)) = Self::address_pages(b, address) {
-                        let bytes = (c1 - c0 + 1) as u64 * SLOTS_PER_PAGE * 10 / 8;
-                        want.push((*address, b.clone(), *score, bytes.max(64)));
-                    }
+                let has = v
+                    .filters
+                    .get(address)
+                    .is_some_and(|l| l.iter().any(|f| f.fid == *fid));
+                if has {
+                    continue;
+                }
+                let b = files[fid];
+                if let Some((c0, c1)) = Self::address_pages(b, address) {
+                    let bytes = (c1 - c0 + 1) as u64 * SLOTS_PER_PAGE * 10 / 8;
+                    want.push((*address, b.clone(), *score, bytes.max(64)));
                 }
             }
         }
@@ -1752,9 +1819,22 @@ impl Inner {
         let mut built: Vec<Arc<AddrFilter>> = Vec::new();
         let (mut n_built, n_evicted) = (0, evict.len());
         let mut listed = Instant::now();
+        // The sizes above are estimates; the memory is spent by what the
+        // filters turn out to take.
+        let mut held: u64 = have
+            .iter()
+            .filter(|f| !evict.iter().any(|e| Arc::ptr_eq(e, &f.0)))
+            .map(|f| f.0.bloom.mem_bytes())
+            .sum();
         for (address, base) in &build {
             match self.build_filter(base, *address, &mut throttle) {
-                Ok(Some(f)) => built.push(f),
+                Ok(Some(f)) if held + f.bloom.mem_bytes() > self.opts.filter_bytes => {
+                    let _ = std::fs::remove_file(bloom_path(&self.dir.join(&f.name)));
+                }
+                Ok(Some(f)) => {
+                    held += f.bloom.mem_bytes();
+                    built.push(f);
+                }
                 Ok(None) => {}
                 Err(e) => {
                     self.list_filters(std::mem::take(&mut built), std::mem::take(&mut evict))?;
@@ -1868,28 +1948,38 @@ impl Inner {
     }
 
     /// Rewrites the base and maintains the address filters.
+    /// Run an address filter round if one is due, or `now`.
+    fn filter_round(&self, now: bool) {
+        {
+            let mut last = self.filter_round.lock().unwrap();
+            if !now && last.elapsed() < self.filter_period {
+                return;
+            }
+            *last = Instant::now();
+        }
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = self.maintain_filters() {
+            if !self.stop.load(Ordering::Relaxed) {
+                warn!(target: "archive_v4", "address filter round failed: {e}");
+            }
+        }
+    }
+
     fn rewriter(&self) {
-        let mut last_filters = Instant::now();
-        let filter_period = Duration::from_secs(env_u64("ARCHIVE_V4_FILTER_PERIOD_SECS", 600));
         while !self.stop.load(Ordering::Relaxed) {
-            let mut filters_due = last_filters.elapsed() >= filter_period;
+            let mut rewrote = false;
             if self.rewrite_due() {
                 match self.rewrite_pass() {
-                    Ok(()) => filters_due = true,
+                    Ok(()) => rewrote = true,
                     Err(e) if !self.stop.load(Ordering::Relaxed) => {
                         warn!(target: "archive_v4", "base rewrite failed, will retry: {e}");
                     }
                     Err(_) => {}
                 }
             }
-            if filters_due && !self.stop.load(Ordering::Relaxed) {
-                last_filters = Instant::now();
-                if let Err(e) = self.maintain_filters() {
-                    if !self.stop.load(Ordering::Relaxed) {
-                        warn!(target: "archive_v4", "address filter round failed: {e}");
-                    }
-                }
-            }
+            self.filter_round(rewrote);
             let mut woken = self.rewrite_lock.lock().unwrap();
             if !*woken && !self.stop.load(Ordering::Relaxed) {
                 woken = self
@@ -2097,6 +2187,10 @@ impl Store {
         };
         let blocks = Blocks::open(dir, m.blocks, opts.block_cache_bytes)?;
         let codes = Codes::open(dir, m.codes)?;
+        // With the checksums of their indexes, which a manifest of an
+        // earlier build does not have yet.
+        view.blocks = blocks.meta();
+        view.codes = codes.meta();
         for (slot, entry) in base_slots.into_iter().zip(&m.base) {
             let b = slot.into_inner().unwrap().expect("opened");
             view.base[entry.0].push(Arc::new(b));
@@ -2122,14 +2216,22 @@ impl Store {
         let live: HashSet<u32> = view.base[1].iter().map(|b| b.file.fid).collect();
         let mut filters = Filters::default();
         let mut unloaded = Vec::new();
+        let mut held = 0u64;
         for (fid, address, slots, name) in &m.filters {
             if !live.contains(fid) {
                 continue;
             }
-            if opts.filter_bytes == 0 {
+            // As many as the memory for them holds (it may have been
+            // lowered); the others stay listed.
+            let bloom = (held < opts.filter_bytes)
+                .then(|| Bloom::load(&bloom_path(&dir.join(name))))
+                .transpose()?
+                .filter(|bloom| held + bloom.mem_bytes() <= opts.filter_bytes);
+            let Some(bloom) = bloom else {
                 unloaded.push((*fid, *address, *slots, name.clone()));
                 continue;
-            }
+            };
+            held += bloom.mem_bytes();
             filters
                 .entry(*address)
                 .or_default()
@@ -2138,7 +2240,7 @@ impl Store {
                     address: *address,
                     name: name.clone(),
                     slots: *slots,
-                    bloom: Bloom::load(&bloom_path(&dir.join(name)))?,
+                    bloom,
                     negatives: AtomicU64::new(0),
                     score: AtomicU64::new(0f64.to_bits()),
                     rounds: AtomicU64::new(0),
@@ -2212,6 +2314,8 @@ impl Store {
             codes,
             _lock: lock,
             absent: Mutex::new(HashMap::default()),
+            filter_round: Mutex::new(Instant::now()),
+            filter_period: Duration::from_secs(env_u64("ARCHIVE_V4_FILTER_PERIOD_SECS", 600)),
             opts,
         });
         inner.set_gauges(&inner.view.load());
@@ -2238,6 +2342,7 @@ impl Store {
 
     /// The last block held by a file: blocks above it live in the memtable
     /// only and must be applied again after a restart.
+    #[cfg(test)]
     pub(crate) fn durable(&self) -> Option<u64> {
         self.inner.view.load().durable()
     }
@@ -2447,59 +2552,6 @@ impl Store {
             Some(code) => Ok(Some(code.to_vec())),
             None => self.inner.codes.get(hash),
         }
-    }
-
-    /// The block after the last one the block files hold; 0 if they hold
-    /// none.
-    pub(crate) fn blocks_end(&self) -> u64 {
-        self.inner
-            .view
-            .load()
-            .blocks
-            .last()
-            .map_or(0, |last| last + 1)
-    }
-
-    /// Offline: choose the dictionaries of the block chunks and of the code
-    /// from block infos and codes like those to come, where the files have
-    /// none.
-    pub(crate) fn train_side(&self, infos: &[&[u8]], codes: &[&[u8]]) -> Result<(), Error> {
-        let inner = &*self.inner;
-        let _w = inner.write.lock().unwrap();
-        inner.adopt_dicts(inner.blocks.train(infos)?, inner.codes.train(codes)?)
-    }
-
-    /// Offline: add block infos (from block `first` on, following those
-    /// held) and code to the files of a store that has the versions of
-    /// these blocks already, and record them.
-    pub(crate) fn import(
-        &self,
-        first: u64,
-        blocks: &[BlockRec],
-        codes: &[([u8; 32], Box<[u8]>)],
-    ) -> Result<(), Error> {
-        let inner = &*self.inner;
-        if inner.opts.background {
-            return Err(Error::UnSupported(
-                "importing into a store with background work".into(),
-            ));
-        }
-        let _w = inner.write.lock().unwrap();
-        let blocks = inner.blocks.append(first, blocks, side::LEVEL)?;
-        let codes = inner.codes.append(
-            codes.iter().map(|(hash, code)| (hash, &code[..])),
-            side::LEVEL_SLOW,
-        )?;
-        let mut st = inner.state.lock().unwrap();
-        let mut nv = (*inner.view.load_full()).clone();
-        nv.blocks = blocks.meta;
-        nv.codes = codes.meta;
-        inner.publish(&mut st, nv, Some((blocks, codes)))?;
-        let durable = inner.view.load().durable();
-        inner
-            .next_block
-            .fetch_max(durable.map_or(0, |d| d + 1), Ordering::AcqRel);
-        Ok(())
     }
 
     /// Start writing the memtable to a segment if it is large or old
@@ -2782,6 +2834,12 @@ impl Store {
             cut.map(|cut| -> Result<_, Error> { Ok((cut, inner.codes.append([], side::LEVEL)?)) });
         {
             let mut st = inner.state.lock().unwrap();
+            // A pass that was folding up to a block now gone starts anew.
+            for target in st.pass.iter_mut() {
+                if *target > land {
+                    *target = 0;
+                }
+            }
             inner.publish(&mut st, nv, side.transpose()?)?;
         }
         for name in removed {
@@ -3587,6 +3645,150 @@ pub(crate) mod tests {
         }
         done.store(true, Ordering::Relaxed);
         assert!(reader.join().unwrap() > 0);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// While a base rewrite pass is under way, segments it will drop are
+    /// not merged with later ones: the merged one would outlive the pass.
+    #[test]
+    fn segments_do_not_merge_across_the_block_a_pass_folds_up_to() {
+        let dir = test_dir("merge-pass");
+        Store::create(&dir).unwrap();
+        let store = Store::open(&dir, small_options()).unwrap();
+        let mut model = Model::new();
+        let mut r = Rng(0x5e9_0001);
+        let mut head = 0;
+        let mut segment = |store: &Store, model: &mut Model| {
+            for _ in 0..5 {
+                head += 1;
+                apply_block(store, model, &mut r, head);
+            }
+            store.flush().unwrap();
+            head
+        };
+        segment(&store, &mut model);
+        let target = segment(&store, &mut model);
+        store.inner.set_pass(1, target).unwrap();
+        segment(&store, &mut model);
+        segment(&store, &mut model);
+        // Four storage segments, tiers of three: every three neighbours
+        // have segments on both sides of the target.
+        store.merge().unwrap();
+        assert_eq!(store.inner.view.load().segs[1].len(), 4);
+        let head = segment(&store, &mut model);
+        store.merge().unwrap();
+        let v = store.inner.view.load_full();
+        assert_eq!(v.segs[1].len(), 3, "the three after the target merged");
+        for s in &v.segs[1] {
+            assert!(s.hi <= target || s.lo > target, "{}..={}", s.lo, s.hi);
+        }
+        check(&store, &model, head);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An address in several base files gets a filter in the file whose
+    /// absent slots are read, and filters take no more than their memory,
+    /// also when it is lowered.
+    #[test]
+    fn address_filters_go_by_file_and_stay_within_their_memory() {
+        let dir = test_dir("filters-file");
+        Store::create(&dir).unwrap();
+        let mut opts = small_options();
+        opts.budget_bytes = 0;
+        let store = Store::open(&dir, opts.clone()).unwrap();
+        let mut model = Model::new();
+        let mut r = Rng(777);
+        for block in 1..=200 {
+            apply_block(&store, &mut model, &mut r, block);
+        }
+        store.flush().unwrap();
+        store.rewrite_base().unwrap();
+        let inner = &store.inner;
+        let v = inner.view.load_full();
+        let fids: Vec<u32> = v.base[1]
+            .iter()
+            .filter(|b| Inner::address_pages(b, &address(0)).is_some())
+            .map(|b| b.file.fid)
+            .collect();
+        assert!(
+            fids.len() >= 2,
+            "the large address is in {} files",
+            fids.len()
+        );
+        let listed = |store: &Store| -> Vec<(u32, u64)> {
+            let mut all: Vec<(u32, u64)> = store
+                .inner
+                .view
+                .load()
+                .filters
+                .values()
+                .flatten()
+                .map(|f| (f.fid, f.bloom.mem_bytes()))
+                .collect();
+            all.sort_unstable();
+            all
+        };
+        // Absent slots read in one of its files only.
+        inner
+            .absent
+            .lock()
+            .unwrap()
+            .insert((address(0), fids[1]), 50);
+        store.maintain_filters().unwrap();
+        let one = listed(&store);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, fids[1]);
+        // Then in all of them, with memory for that one and one more.
+        for fid in &fids {
+            inner.absent.lock().unwrap().insert((address(0), *fid), 50);
+        }
+        drop(store);
+        let mut tight = opts.clone();
+        tight.filter_bytes = one[0].1 * 2 + 8;
+        let store = Store::open(&dir, tight.clone()).unwrap();
+        for fid in &fids {
+            let mut absent = store.inner.absent.lock().unwrap();
+            absent.insert((address(0), *fid), 50);
+        }
+        store.maintain_filters().unwrap();
+        let held: u64 = listed(&store).iter().map(|f| f.1).sum();
+        assert!(
+            held <= tight.filter_bytes,
+            "{held} of {}",
+            tight.filter_bytes
+        );
+        assert!(listed(&store).len() >= 2);
+        let all = listed(&store);
+        drop(store);
+        // Less memory: fewer are loaded; none is forgotten.
+        tight.filter_bytes = one[0].1;
+        let store = Store::open(&dir, tight).unwrap();
+        assert!(listed(&store).len() < all.len());
+        check(&store, &model, 200);
+        drop(store);
+        let store = Store::open(&dir, opts).unwrap();
+        assert_eq!(listed(&store), all);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Time a throttle was not used gives no credit: what comes after it
+    /// is paced like anything else.
+    #[test]
+    fn a_throttle_does_not_make_up_for_idle_time() {
+        let dir = test_dir("throttle");
+        Store::create(&dir).unwrap();
+        let mut opts = small_options();
+        opts.rewrite_bytes_per_sec = 1e6;
+        let store = Store::open(&dir, opts).unwrap();
+        let mut throttle = Throttle::new(&store.inner);
+        std::thread::sleep(Duration::from_millis(500));
+        let started = Instant::now();
+        throttle.spend(600_000).unwrap();
+        // 0.6 s at the rate, less the burst.
+        assert!(started.elapsed() >= Duration::from_millis(350));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

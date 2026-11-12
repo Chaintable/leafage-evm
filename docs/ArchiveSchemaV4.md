@@ -141,6 +141,12 @@ contracts whose address hashes agree in their first 8 bytes are served
 correctly through the same stepping; making such a pair takes about 2^32
 hashes, and only makes lookups in those two contracts slower.
 
+A key with more versions than a page holds starts several pages. These
+pages are index blocks of their own, never mixed with the pages of other
+keys: in a block spanning contracts they would all have the window of
+their address, and a lookup of another slot of that address would step
+through each of them (up to 63 reads) to find its page.
+
 The file ends with a CRC32.
 
 ## Store
@@ -200,16 +206,21 @@ pages of the lookups out.
 
 A lookup of a slot that a contract never had still reads a page. On bsc
 these are 19 % of the lookups and concentrate on a few very large contracts.
-The store counts, per address, the device reads that found nothing, and
-keeps filters of the slots of the addresses where a filter saves the most
-reads per byte, within `ARCHIVE_V4_FILTER_MB` (default 256). A filter
-belongs to one base file and is rebuilt after that file is rewritten; the
-choice is revised every 10 minutes, and a filter is dropped when another
-would be used at least twice as much per byte. Building one reads the
-slots of its address in the base file, at `ARCHIVE_V4_REWRITE_MBPS`: a
-round over large contracts takes tens of minutes, and lists what it has
-built every ten seconds, so that a node stopping during it keeps that. A
-filter over every key would need 5 – 9 GiB on bsc and is not kept.
+The store counts, per address and base file, the device reads that found
+nothing, and keeps filters of the slots of the addresses where a filter
+saves the most reads per byte, within `ARCHIVE_V4_FILTER_MB` (default
+256): what the filters built really take, not an estimate, and a store
+opened with less loads only as many as fit. A filter belongs to one base
+file, is weighed by the absent reads of that file (a contract in several
+files gets one where they are, not in each for the reads of all), and is
+rebuilt after that file is rewritten; the choice is revised every 10
+minutes, between the files of a base rewrite pass too, and a filter is
+dropped when another would be used at least twice as much per byte.
+Building one reads the slots of its address in the base file, at
+`ARCHIVE_V4_REWRITE_MBPS`: a round over large contracts takes tens of
+minutes, and lists what it has built every ten seconds, so that a node
+stopping during it keeps that. A filter over every key would need 5 – 9
+GiB on bsc and is not kept.
 
 ### Writes
 
@@ -248,7 +259,10 @@ previous memtable is still being written.
 
 Segments merge size-tiered: `ARCHIVE_V4_TIERS` (8) neighbours of a level
 become one of the next. On bsc the segments cost 4.7 bytes written per byte
-of final segment.
+of final segment. While a base rewrite pass is under way, segments it will
+drop are not merged with later ones: the merged segment would stay when the
+pass ends, with most of the delta in it, and the next pass would be due in
+half the time.
 
 ### Block infos and code
 
@@ -284,7 +298,8 @@ Each has a zstd dictionary (`blocks.dict`, 32 KiB; `code.dict`, 1 MiB)
 that the manifest marks as present. A conversion trains them on block infos
 and codes spread over the source; an archive that starts empty trains the
 first on the blocks of its first flush and the second on its codes once it
-holds 20,000. What was written before a dictionary needs none to be read.
+holds 20,000, sampled over all of them in the order they were written.
+What was written before a dictionary needs none to be read.
 Bulk writes compress at zstd level 3; a node following the chain writes a
 few megabytes a flush and compresses them at level 19; code is always
 compressed at 19, on several threads.
@@ -340,7 +355,9 @@ stays for the next one.
 The rewrite is paced by the node, since the device has no IO scheduler to
 do it: at most `ARCHIVE_V4_REWRITE_MBPS` (16) of device IO, read and
 written. The rate is all there is: the rewrite does not watch the lookups,
-so a pass always ends after `2 × base / rate`. Unthrottled, a rewrite at
+so a pass always ends after `2 × base / rate`. Time in which it did less
+than the rate allows (a slow stretch, a filter round in between) is not
+made up for afterwards at the speed of the device. Unthrottled, a rewrite at
 200 MB/s on a 125 MB/s volume cut read throughput by 3.5 (measured on the
 prototype), so do not raise the rate to the volume's limit on a serving
 node. At 16 MB/s a pass over bsc
@@ -393,13 +410,13 @@ file is missing or ends at a block the archive no longer has.
 
 A page or a block chunk that fails its checksum, an index or filter that
 fails its CRC, and a file shorter than the manifest or its index says are
-errors, not wrong answers: the read fails, or the open does.
-
-An archive of a build that kept block infos, block numbers and code in a
-RocksDB next to the store (they were in CFs `7` or `2`, `3` and `6`) is
-moved at its first open: the block infos up to the last block the store
-holds and all code go into the files, then the RocksDB is removed.
-Interrupted, the next open goes on where it stopped.
+errors, not wrong answers: the read fails, or the open does. `blocks.off`
+and `code.idx` are checked at open against CRCs the manifest has of them
+(they are read whole then anyway), and a code is not taken from a place
+that holds another hash. `blocks.pfx` has no checksum: it only leads to
+block numbers, and a lookup compares the whole hash of the block it finds,
+so a damaged prefix makes a block not found by its hash, never another one
+returned.
 
 ## Rewind
 
@@ -443,8 +460,11 @@ archive offline; the source is opened read-only.
 
 `leafage-evm archive-v4 verify --v3 <v3> --v4 <v4>` reads random keys of
 both kinds at heights around each version, and absent keys, and compares
-value, block, and that the span v4 reports skips no version. It opens the
-v4 store itself: stop the node first.
+value, block, and that the span v4 reports skips no version. A storage key
+is picked in two steps, an address and then a slot of it, so that the slots
+inside large contracts are among them (`inner_slots` in the report; the
+verification under Results was run before this, and took the first slot of
+each address it picked). It opens the v4 store itself: stop the node first.
 
 To move a fleet: convert on the seed, verify, snapshot, and create the
 replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
@@ -453,7 +473,7 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `--db-cache` | | memory of the store: page index, filters, the tables of the block and code files, block chunk cache, and its cache of decompressed pages with the rest. As for v3 (8192 on bsc); most of the memory with `ARCHIVE_V4_DIRECT_IO=1` |
+| `--db-cache` | | memory of the store: page index, filters, the tables of the block and code files, block chunk cache, and its cache of decompressed pages with the rest. As for v3 (8192 on bsc); most of the memory with `ARCHIVE_V4_DIRECT_IO=1`. The memtable and the one being flushed (up to `ARCHIVE_V4_FLUSH_MB` each), the state and code caches and the index from block hash to number are beside it |
 | `ARCHIVE_V4_FLUSH_MB` / `ARCHIVE_V4_FLUSH_BLOCKS` | 512 / 4800 | memtable size and age at which it becomes a segment |
 | `ARCHIVE_V4_TIERS` | 8 | segments of a level merged into one |
 | `ARCHIVE_V4_DELTA_PERCENT` / `ARCHIVE_V4_DELTA_MIN_MB` | 4 / 4096 | delta size, relative to the base and absolute, that starts a base rewrite |
@@ -493,6 +513,8 @@ archive.
 - `rewind --head-only`, and a rewind into the base (above).
 - Block numbers of 2^32 and above.
 - An exact restart: see "Writes".
+- Archives of development builds that kept block infos and code in a
+  RocksDB next to the store: convert the v3 source again.
 
 ## Results (bsc)
 

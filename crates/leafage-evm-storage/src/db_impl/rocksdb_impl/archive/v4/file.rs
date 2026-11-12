@@ -343,6 +343,8 @@ pub(crate) struct SeqReader {
     buf: AlignedBuf,
     wstart: u64,
     wlen: usize,
+    /// Where the part of the file to be read ends: windows stop there.
+    end: u64,
     dctx: zstd_safe::DCtx<'static>,
     scratch: Vec<u8>,
     /// Bytes read from the device so far.
@@ -351,8 +353,16 @@ pub(crate) struct SeqReader {
 
 impl SeqReader {
     pub(crate) fn new(file: Arc<PageFile>) -> Self {
+        let end = file.data_len();
+        Self::until(file, end)
+    }
+
+    /// A reader of the pages before byte `end` of the file: one of a few
+    /// pages does not read a whole window for them.
+    pub(crate) fn until(file: Arc<PageFile>, end: u64) -> Self {
         Self {
             file,
+            end,
             buf: AlignedBuf::new(ALIGN),
             wstart: 0,
             wlen: 0,
@@ -366,7 +376,7 @@ impl SeqReader {
     pub(crate) fn stored(&mut self, c: usize) -> Result<&[u8], Error> {
         let (off, end) = self.file.index.range(c);
         if off < self.wstart || end > self.wstart + self.wlen as u64 {
-            let flen = self.file.data_len();
+            let flen = self.file.data_len().min(self.end.max(end));
             self.wstart = off & !(ALIGN as u64 - 1);
             let want = ((flen - self.wstart) as usize)
                 .min(SEQ_WINDOW)

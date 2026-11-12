@@ -423,6 +423,11 @@ impl DataBaseRef {
                 .ok_or_else(|| Error::UnSupported("source archive is empty".into()))?;
             source_block_number(&src, &hash)?
         };
+        if head > u32::MAX as u64 {
+            return Err(Error::UnSupported(format!(
+                "archive schema v4 holds block numbers up to 2^32, not {head}"
+            )));
+        }
         info!(target: "migrate", "v4 convert: source head is block {head}");
 
         let store_dir = dst_path.join(STORE_DIR);
@@ -844,100 +849,6 @@ fn read_codes(
     Ok(total)
 }
 
-/// RocksDB's files in an archive directory.
-fn is_rocksdb_file(name: &str) -> bool {
-    name.ends_with(".sst")
-        || name.ends_with(".log")
-        || name.starts_with("MANIFEST-")
-        || name.starts_with("OPTIONS-")
-        || name.starts_with("LOG")
-        || ["CURRENT", "IDENTITY", "LOCK"].contains(&name)
-}
-
-/// A schema v4 archive written by a build that kept block infos, the block
-/// numbers and code in RocksDB: move them into the store's files, up to the
-/// last block the store holds, and remove the RocksDB. Interrupted, the
-/// next open goes on where it stopped.
-pub(crate) fn move_out_of_rocksdb(path: &Path) -> Result<(), Error> {
-    let started = std::time::Instant::now();
-    let store = Store::open(&path.join(STORE_DIR), Options::maintenance(256 << 20))?;
-    let Some(head) = store.durable() else {
-        return Err(Error::UnSupported(
-            "a schema v4 archive with a RocksDB and no flushed block: create it again".into(),
-        ));
-    };
-    warn!(target: "archive_v4", "moving block infos and code out of RocksDB, up to block {head}");
-    {
-        let src = open_read_only(path, false)?;
-        let stop = AtomicBool::new(false);
-        // What RocksDB holds of each, to compare with the files.
-        for (name, col) in [
-            (
-                "block infos by number",
-                StorageTypeColumn::BlockNumToBlockInfo,
-            ),
-            (
-                "block infos by hash",
-                StorageTypeColumn::BlockHashToBlockInfo,
-            ),
-            ("block numbers", StorageTypeColumn::BlockNumToBlockHash),
-            ("code", StorageTypeColumn::HashToCode),
-        ] {
-            if let Some(cf) = src.cf_handle(col.to_str()) {
-                let bytes = src
-                    .property_int_value_cf(cf, "rocksdb.total-sst-files-size")?
-                    .unwrap_or(0);
-                let keys = src
-                    .property_int_value_cf(cf, "rocksdb.estimate-num-keys")?
-                    .unwrap_or(0);
-                info!(target: "archive_v4", "RocksDB holds {name}: {:.2} GiB, about {keys} records", bytes as f64 / (1u64 << 30) as f64);
-            }
-        }
-        if store.blocks_end() == 0 {
-            let samples = sample_blocks(&src, head)?;
-            let infos: Vec<&[u8]> = samples.iter().map(|info| &info[..]).collect();
-            let codes = sample_codes(&src)?;
-            let codes: Vec<&[u8]> = codes.iter().map(|code| &code[..]).collect();
-            store.train_side(&infos, &codes)?;
-        }
-        let (from, mut last_log) = (store.blocks_end(), std::time::Instant::now());
-        let moved = read_blocks(&src, from, head, BLOCK_BATCH, &stop, &mut |first, recs| {
-            store.import(first, &recs, &[])?;
-            if last_log.elapsed().as_secs() >= 30 {
-                last_log = std::time::Instant::now();
-                info!(target: "archive_v4", "moving block infos: at block {}", first + recs.len() as u64);
-            }
-            Ok(())
-        })?;
-        // The blocks above the last one a segment holds were only in the
-        // memtable of that build: their infos stay behind.
-        if store.blocks_end() != head + 1 {
-            return Err(Error::UnSupported(format!(
-                "the RocksDB of this archive has block infos up to {}, its files hold block {head}",
-                store.blocks_end().saturating_sub(1)
-            )));
-        }
-        let codes = read_codes(&src, &stop, &mut |batch| store.import(0, &[], &batch))?;
-        info!(
-            target: "archive_v4",
-            "moved {moved} block infos and {codes} codes out of RocksDB in {}",
-            fmt_hms(started.elapsed().as_secs_f64())
-        );
-    }
-    drop(store);
-    // `CURRENT` first: without it this is no RocksDB, and nothing is moved
-    // again.
-    std::fs::remove_file(path.join("CURRENT"))?;
-    file::sync_dir(path)?;
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() && is_rocksdb_file(&entry.file_name().to_string_lossy()) {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    file::sync_dir(path)
-}
-
 /// How far below its last block info the head of a source is looked for.
 const HEAD_SEARCH_BLOCKS: usize = 1 << 20;
 
@@ -982,6 +893,9 @@ fn source_block_number(db: &DB, hash: &[u8]) -> Result<u64, Error> {
 #[derive(Debug, Default, Clone)]
 pub struct V4VerifyReport {
     pub keys: u64,
+    /// Storage keys among them that are not the first slot of their
+    /// address.
+    pub inner_slots: u64,
     pub reads: u64,
     pub absent_keys: u64,
     pub mismatches: u64,
@@ -1031,6 +945,26 @@ pub fn verify_v4_against_v3(
             }
             let probe: Vec<u8> = (0..k).map(|_| next() as u8).collect();
             keys.iter.seek(&probe);
+            if storage {
+                // No address starts with random bytes: the seek lands on the
+                // first slot of the next address, and would never reach the
+                // other slots of a contract. Go on to a slot picked at
+                // random in that address (or, past its last one, the first
+                // slot of the address after it).
+                if let Some(raw) = keys.iter.key() {
+                    let first = version_key(raw, k)?.0.to_vec();
+                    let mut inner = first.clone();
+                    for b in &mut inner[32..] {
+                        *b = next() as u8;
+                    }
+                    keys.iter.seek(&inner);
+                    let landed = keys.iter.key().map(|raw| version_key(raw, k)).transpose()?;
+                    if landed.is_some_and(|(key, _)| key[..32] == first[..32] && key != &first[..])
+                    {
+                        report.inner_slots += 1;
+                    }
+                }
+            }
             if !keys.next_key(VERIFY_MAX_VERSIONS)? {
                 continue;
             }
@@ -1432,95 +1366,13 @@ mod tests {
         let verify = verify_v4_against_v3(&src, &dst, 300, 7).unwrap();
         assert_eq!(verify.mismatches, 0, "{verify:?}");
         assert!(verify.keys > 100 && verify.absent_keys > 100, "{verify:?}");
+        // Slots inside the contract with many are among those compared.
+        assert!(verify.inner_slots > 0, "{verify:?}");
 
         let [warm, run] = replay_get_trace(&dst, &base.join("trace"), 3, 64, 100).unwrap();
         assert_eq!((warm.gets, run.gets), (100, 700));
         assert_eq!(warm.mismatches + run.mismatches, 0);
         assert!(warm.reads > 0);
-
-        // The same archive as an earlier build laid it out: block infos,
-        // block numbers and code in a RocksDB next to the store, which has
-        // none. Opening it moves them into the store and removes the
-        // RocksDB.
-        let old = base.join("old-layout");
-        {
-            fn copy(from: &Path, to: &Path) {
-                std::fs::create_dir_all(to).unwrap();
-                for entry in std::fs::read_dir(from).unwrap() {
-                    let entry = entry.unwrap();
-                    let target = to.join(entry.file_name());
-                    if entry.file_type().unwrap().is_dir() {
-                        copy(&entry.path(), &target);
-                    } else if entry.file_name() != "LOCK" {
-                        std::fs::copy(entry.path(), target).unwrap();
-                    }
-                }
-            }
-            copy(&dst, &old);
-            let manifest = old.join(STORE_DIR).join("MANIFEST");
-            let text: String = std::fs::read_to_string(&manifest)
-                .unwrap()
-                .lines()
-                .filter(|line| !line.starts_with("blocks ") && !line.starts_with("codes "))
-                .map(|line| format!("{line}\n"))
-                .collect();
-            std::fs::write(&manifest, text).unwrap();
-            std::fs::remove_file(old.join(block_index::FILE)).ok();
-            let source = open_read_only(&src, true).unwrap();
-            let names = ["1", "2", "3", "6"];
-            let mut opts = rocksdb::Options::default();
-            opts.create_if_missing(true);
-            opts.create_missing_column_families(true);
-            let rocks = DB::open_cf(&opts, &old, names).unwrap();
-            for name in names {
-                let (from, to) = (
-                    source.cf_handle(name).unwrap(),
-                    rocks.cf_handle(name).unwrap(),
-                );
-                for item in source.iterator_cf(from, IteratorMode::Start) {
-                    let (key, value) = item.unwrap();
-                    rocks.put_cf(to, key, value).unwrap();
-                }
-            }
-            // A block that build had written here and not yet to a segment.
-            let lost = block_info(61).header.hash;
-            rocks
-                .put_cf(
-                    rocks.cf_handle("3").unwrap(),
-                    super::super::super::encode_block_num(61),
-                    lost.as_slice(),
-                )
-                .unwrap();
-            rocks
-                .put_cf(rocks.cf_handle("2").unwrap(), lost.as_slice(), [1u8, 2, 3])
-                .unwrap();
-            rocks.flush().unwrap();
-        }
-        assert!(old.join("CURRENT").exists());
-        for _ in 0..2 {
-            let db = Arc::new(DataBaseRef::open(&old, 64, false, false));
-            let rocksdb_files = std::fs::read_dir(&old)
-                .unwrap()
-                .filter(|entry| {
-                    is_rocksdb_file(&entry.as_ref().unwrap().file_name().to_string_lossy())
-                })
-                .count();
-            assert_eq!(rocksdb_files, 0);
-            assert_eq!(read_all(&db, 60), want);
-            assert_eq!(
-                db.read_code(word(901)).unwrap(),
-                Some(Bytes::from(vec![1, 2, 3]))
-            );
-            for n in [1u64, 17, 60] {
-                let info = db.read_block_info(block_info(n).header.hash).unwrap();
-                assert_eq!(info.map(|info| info.header.number), Some(n));
-            }
-            assert_eq!(
-                db.read_block_info(block_info(61).header.hash).unwrap(),
-                None
-            );
-            assert_eq!(db.read_latest_block_num().unwrap(), Some(60));
-        }
 
         let db = Arc::new(DataBaseRef::open(&dst, 64, false, false));
         assert!(db.is_schema_v4());

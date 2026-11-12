@@ -317,6 +317,8 @@ pub(crate) struct Mem {
     blocks: RwLock<BTreeMap<u64, BlockRec>>,
     /// Code first seen in these blocks, by hash.
     codes: RwLock<HashMap<[u8; 32], Arc<[u8]>>>,
+    /// Bytes of the block infos and the code.
+    side_bytes: AtomicU64,
 }
 
 impl Default for Mem {
@@ -328,6 +330,7 @@ impl Default for Mem {
             last: AtomicU64::new(0),
             blocks: RwLock::default(),
             codes: RwLock::default(),
+            side_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -361,7 +364,10 @@ impl Mem {
 
     pub(crate) fn put_block(&self, number: u64, rec: BlockRec) {
         self.note_block(number);
-        self.blocks.write().unwrap().insert(number, rec);
+        let bytes = rec.1.len() as u64 + 96;
+        if self.blocks.write().unwrap().insert(number, rec).is_none() {
+            self.side_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn block(&self, number: u64) -> Option<BlockRec> {
@@ -382,7 +388,10 @@ impl Mem {
     }
 
     pub(crate) fn put_code(&self, hash: [u8; 32], code: Arc<[u8]>) {
-        self.codes.write().unwrap().insert(hash, code);
+        let bytes = code.len() as u64 + 96;
+        if self.codes.write().unwrap().insert(hash, code).is_none() {
+            self.side_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn code(&self, hash: &[u8; 32]) -> Option<Arc<[u8]>> {
@@ -401,8 +410,13 @@ impl Mem {
         codes
     }
 
+    /// Bytes held: the versions, the block infos and the code.
     pub(crate) fn bytes(&self) -> u64 {
-        self.shards.iter().map(|s| s.read().unwrap().bytes()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.read().unwrap().bytes())
+            .sum::<u64>()
+            + self.side_bytes.load(Ordering::Relaxed)
     }
 
     /// Distinct keys of one kind.
