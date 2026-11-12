@@ -411,6 +411,18 @@ goes on from there (as a node started from a snapshot always did, and as
 `rewind` always forced). `standalone` removes the offset file an earlier
 version left, so that a downgraded node does not resume from it.
 
+That catch-up reads S3 by block number, and the index by number can name
+a block of an abandoned branch: its fork mark is written by another
+service, after the fact, and can be missing (bsc, blocks 133128381 and
+133128382: both branches unmarked). Such a block connects, and the first
+canonical block after the branch then finds its parent absent. The
+updater reads the missing ancestors by hash, which names exactly one
+block, back to a block the state tree has, and applies them oldest first:
+the tree takes them as a reorg, and the abandoned blocks stay a side
+branch that is never committed. It follows a branch no deeper than the
+tree (`--diff-depth-limit`); below that the abandoned blocks are in the
+database, and the node stops with an error.
+
 The index from block hash to number is loaded from its file and completed
 from `blocks.pfx`; it is rebuilt from `blocks.pfx` (1 GiB on bsc) when the
 file is missing or ends at a block the archive no longer has.
