@@ -7,6 +7,7 @@ pub mod citrea;
 pub mod cosmos;
 pub mod eth;
 pub mod hemi;
+pub mod hyper;
 pub mod iotex;
 pub mod mantle;
 pub mod monad;

@@ -36,6 +36,7 @@ mod citrea;
 mod op;
 pub use op::build_op_custom_config;
 mod hemi;
+mod hyper;
 mod mantle;
 mod warmup;
 mod cosmos;

@@ -141,7 +141,7 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--db-path` | - | Database path (required) |
 | `--listen-addr` | 0.0.0.0:8545 | RPC listen address |
 | `--rpc-addr` | - | Geth RPC address (for HTTP mode state updates) |
-| `--evm-type` | mainnet | EVM type: mainnet/op/celo/bsc/cosmos |
+| `--evm-type` | mainnet | EVM type: mainnet/hyper/op/celo/bsc/cosmos |
 | `--chain-cfg` | 1 | Chain ID |
 | `--db-type` | rocksdb | Database type: rocksdb/mdbx |
 | `--db-cache` | 2048 | Database cache size (MB) |
@@ -156,6 +156,10 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--iterator-timeout-secs` | 0 | Iterator timeout for archive mode (0 = disabled) |
 | `--historical-rpc` | - | Historical RPC endpoint for pre-fork queries (e.g., OP pre-bedrock) |
 | `--historical-height` | - | Fork height threshold for historical RPC forwarding |
+| `--upstream-url` | - | Upstream RPC. With `--forward-read-precompiles`, the HyperCore node (e.g. `http://localhost:3001/evm`) that answers HyperEVM read precompiles |
+| `--forward-read-precompiles` | false | `hyper` only: resolve HyperEVM's HyperCore read precompiles (`0x800..=0x814`) through `--upstream-url` instead of treating them as empty accounts |
+
+For HyperEVM, use `--evm-type=hyper --chain-cfg=999`. Add `--upstream-url` and `--forward-read-precompiles` to resolve the chain's HyperCore read precompiles (`0x800..=0x814`) during `eth_call`, `estimateGas`, `simulateTransactions` and the `pre_*` traces; the state behind them lives in HyperCore and never reaches the EVM archive, so the upstream is always queried at its latest block and forwarded reads in historical simulations are approximate.
 
 For Celo L2 mainnet, use `--evm-type=celo --chain-cfg=42220`. Execution selects Granite / Isthmus / Jovian at the requested block and includes the CELO native transfer precompile (`0xfd`) and the 64 KiB code limit. This mode reuses OP fee handling; Celo-specific L2 fee distribution and `feeCurrency` / CIP-64 are not yet supported. Select historical L1 execution with `--evm-custom-config='{"execution_mode":"l1"}'`; see [Celo L1 execution](docs/celo-l1.md) for its precompiles, historical fees and verification. Fixed-fork overrides are not accepted.
 
