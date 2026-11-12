@@ -75,7 +75,7 @@ pub fn reimburse_caller<CTX: ContextTr>(
     if context.cfg().is_fee_charge_disabled() {
         return Ok(());
     }
-    let basefee = context.block().basefee() as u128;
+    let basefee = context.block().basefee();
     let caller = context.tx().caller();
     let effective_gas_price = context.tx().effective_gas_price(basefee);
 
@@ -86,7 +86,7 @@ pub fn reimburse_caller<CTX: ContextTr>(
         .journal_mut()
         .load_account_mut(caller)?
         .incr_balance(
-            U256::from(effective_gas_price.saturating_mul(reimbursable as u128))
+            U256::from(effective_gas_price) * U256::from(reimbursable)
                 + additional_refund,
         );
 
@@ -105,7 +105,7 @@ pub fn reward_beneficiary<CTX: ContextTr>(
         return Ok(());
     }
     let (block, tx, cfg, journal, _, _) = context.all_mut();
-    let basefee = block.basefee() as u128;
+    let basefee = block.basefee();
     let effective_gas_price = tx.effective_gas_price(basefee);
 
     // Transfer fee to coinbase/beneficiary.
@@ -121,7 +121,7 @@ pub fn reward_beneficiary<CTX: ContextTr>(
     let effective_used = gas.used().saturating_sub(gas.reservoir());
     journal
         .load_account_mut(block.beneficiary())?
-        .incr_balance(U256::from(coinbase_gas_price * effective_used as u128));
+        .incr_balance(U256::from(coinbase_gas_price) * U256::from(effective_used));
 
     Ok(())
 }

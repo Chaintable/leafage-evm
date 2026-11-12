@@ -128,7 +128,7 @@ where
         let spec = cfg.spec();
 
         if tx.tx_type() == DEPOSIT_TRANSACTION_TYPE {
-            let basefee = block.basefee() as u128;
+            let basefee = block.basefee();
             let blob_price = block.blob_gasprice().unwrap_or_default();
             // deposit skips max fee check and just deducts the effective balance spending.
 
@@ -364,7 +364,7 @@ where
         }
 
         self.mainnet.reward_beneficiary(evm, frame_result)?;
-        let basefee = evm.ctx().block().basefee() as u128;
+        let basefee = evm.ctx().block().basefee();
 
         // If the transaction is not a deposit transaction, fees are paid out
         // to both the Base Fee Vault as well as the L1 Fee Vault.

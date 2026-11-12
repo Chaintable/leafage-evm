@@ -97,7 +97,7 @@ impl<DB: Database, I> Handler for ArcHandler<DB, I> {
     ) -> Result<(), Self::Error> {
         let (beneficiary, effective_gas_price) = {
             let ctx = evm.ctx();
-            let basefee = ctx.block().basefee() as u128;
+            let basefee = ctx.block().basefee();
             (
                 ctx.block().beneficiary(),
                 ctx.tx().effective_gas_price(basefee),

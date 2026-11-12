@@ -509,8 +509,7 @@ impl<DB> ArbitrumApiImpl<DB> {
     where
         StateDB: DatabaseRef,
     {
-        let source_message_gas_price =
-            nitro_message_gas_price(source_tx, block_env.basefee as u128);
+        let source_message_gas_price = nitro_message_gas_price(source_tx, block_env.basefee);
         let l1_base_fee = state
             .try_read_pricing()?
             .map(|pricing| pricing.price_per_unit)
@@ -687,7 +686,7 @@ impl<DB> ArbitrumApiImpl<DB> {
                 let l1_gas = pricing
                     .as_ref()
                     .filter(|_| l2_basefee != 0)
-                    .map(|pricing| pricing.poster_gas(&target_tx.base, l2_basefee))
+                    .map(|pricing| pricing.poster_gas(&target_tx.base, l2_basefee.into()))
                     .unwrap_or_default();
                 let l1_base_fee = pricing
                     .as_ref()
@@ -716,7 +715,9 @@ impl<DB> ArbitrumApiImpl<DB> {
                 let l1_gas = pricing
                     .as_ref()
                     .filter(|_| l2_basefee != 0)
-                    .map(|pricing| pricing.gas_estimate_l1_component(&target_tx.base, l2_basefee))
+                    .map(|pricing| {
+                        pricing.gas_estimate_l1_component(&target_tx.base, l2_basefee.into())
+                    })
                     .unwrap_or_default();
                 let l1_base_fee = pricing
                     .as_ref()

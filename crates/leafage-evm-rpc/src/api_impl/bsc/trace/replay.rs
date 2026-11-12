@@ -351,7 +351,7 @@ fn evm_env(header: &alloy::rpc::types::Header, spec: BscHardfork) -> EvmEnv<BscH
         beneficiary: header.beneficiary,
         timestamp: U256::from(header.timestamp),
         gas_limit: header.gas_limit,
-        basefee: header.base_fee_per_gas.unwrap_or_default(),
+        basefee: header.base_fee_per_gas.unwrap_or_default().into(),
         // BSC keeps DIFFICULTY semantics after the merge specs, so feed the
         // difficulty where revm reads prevrandao (as reth-bsc does).
         difficulty: if post_merge {

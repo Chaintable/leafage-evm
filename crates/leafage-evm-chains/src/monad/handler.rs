@@ -102,7 +102,7 @@ impl<DB: Database, INSP> Handler for MonadHandler<DB, INSP> {
         _exec_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
         let ctx = evm.ctx_mut();
-        let basefee = ctx.block().basefee() as u128;
+        let basefee = ctx.block().basefee();
         let beneficiary = ctx.block().beneficiary();
         let tx = ctx.tx();
         let priority_fee = tx.effective_gas_price(basefee).saturating_sub(basefee);

@@ -1,5 +1,4 @@
 use crate::api_impl::token_collector::TokenCollector;
-use alloy::consensus::BlockHeader;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
 use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
@@ -156,7 +155,7 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
 
     fn apply_pre_execution_changes<StateDB>(
         &self,
-        _header: impl BlockHeader,
+        _parent_hash: leafage_evm_types::H256,
         _block_env: &BlockEnv,
         _state: &mut StateDB,
     ) -> RpcResult<()>

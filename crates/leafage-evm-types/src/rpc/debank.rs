@@ -275,7 +275,7 @@ pub struct DebankBlock {
     pub height: u64,
     pub timestamp: u64,
     pub parent_id: H256,
-    pub base_fee_per_gas: u64,
+    pub base_fee_per_gas: u128,
     pub miner: Address,
     pub gas_limit: u64,
     pub gas_used: u64,

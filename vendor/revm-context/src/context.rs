@@ -491,7 +491,7 @@ impl<
 
     fn effective_gas_price(&self) -> U256 {
         let basefee = self.block().basefee();
-        U256::from(self.tx().effective_gas_price(basefee as u128))
+        U256::from(self.tx().effective_gas_price(basefee))
     }
 
     fn caller(&self) -> Address {

@@ -88,7 +88,7 @@ fn test_block(number: u64, hash: H256, parent_hash: H256, encoded_next_base_fee:
     block.inner.header.inner.parent_hash = parent_hash;
     block.inner.header.inner.timestamp = 1_000 + number;
     block.inner.header.inner.gas_limit = BLOCK_GAS_LIMIT;
-    block.inner.header.inner.base_fee_per_gas = Some(ANCHOR_BASE_FEE);
+    block.inner.header.inner.base_fee_per_gas = Some(ANCHOR_BASE_FEE.into());
     block.inner.header.inner.extra_data =
         Bytes::copy_from_slice(&encoded_next_base_fee.to_be_bytes());
     block.inner.header.inner.beneficiary = Address::repeat_byte(0x77);
@@ -483,7 +483,8 @@ fn execute_arc_estimate_probe(
             &mut cache_db,
             &mut block_env,
             block.header.clone(),
-        );
+        )
+        .unwrap();
     }
     let memory_db = utils::RequestCacheDB::new(cache_db);
     let mut tx = api

@@ -2,7 +2,7 @@ name: stylus-test
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, stable]
     paths:
       - .github/workflows/stylus-test.yml
       - Cargo.lock
@@ -10,6 +10,7 @@ on:
       - Dockerfile
       - crates/leafage-evm-chains/Cargo.toml
       - crates/leafage-evm-chains/src/arbitrum/**
+      - vendor/**
   workflow_dispatch:
 
 concurrency:

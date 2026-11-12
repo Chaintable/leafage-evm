@@ -120,7 +120,7 @@ impl<DB> TempoApiImpl<DB> {
     /// reth's estimate path does not lower the basefee, so estimation runs keep it.
     fn block_env_for_call(block_env: &BlockEnv, tx: &TempoTxEnv) -> BlockEnv {
         let mut block_env = block_env.clone();
-        if !tx.gas_estimation && tx.effective_gas_price(block_env.basefee as u128) == 0 {
+        if !tx.gas_estimation && tx.effective_gas_price(block_env.basefee) == 0 {
             block_env.basefee = 0;
         }
         block_env
@@ -695,7 +695,7 @@ where
 
     fn apply_pre_execution_changes<StateDB>(
         &self,
-        _header: impl alloy::consensus::BlockHeader,
+        _parent_hash: leafage_evm_types::H256,
         block_env: &BlockEnv,
         state: &mut StateDB,
     ) -> RpcResult<()>
@@ -1302,7 +1302,7 @@ mod tests {
             ..Default::default()
         };
         review_api()
-            .apply_pre_execution_changes(alloy::consensus::Header::default(), &block, &mut db)
+            .apply_pre_execution_changes(leafage_evm_types::H256::ZERO, &block, &mut db)
             .unwrap();
 
         let info = db.basic_ref(VALIDATOR_CONFIG_V2_ADDRESS).unwrap().unwrap();

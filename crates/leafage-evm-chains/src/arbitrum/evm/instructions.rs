@@ -85,7 +85,7 @@ where
     DB: Database + DatabaseRef,
 {
     let host = &mut *context.host;
-    let basefee = host.block().basefee() as u128;
+    let basefee = host.block().basefee();
     let price = if host.chain().current_arbos_version() >= ARBOS_VERSION_PAID_GAS_PRICE {
         let collect_tips = match collects_tips(host) {
             Ok(collect_tips) => collect_tips,
