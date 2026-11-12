@@ -707,6 +707,26 @@ kernel, keeps the cache over a restart of the process and needs no other
 `--db-cache` than v3's, which is why it was kept and the other removed;
 neither run filled the 30 GiB, so they do not show which evicts better.
 
+The same run on the builds that followed, each on the archive the one
+before left (`--db-cache=8192`, lookups through the kernel page cache
+without readahead):
+
+| | with address filters | filters, a round building 125 in the window | without (final) |
+|---|---|---|---|
+| CPU ms / request | 0.303 | 0.321 | 0.304 |
+| Latency p50 / p90 ms | 0.35 / 0.91 | 0.37 / 0.98 | 0.35 / 0.91 |
+| Latency p99 / p99.9 ms | 8.69 / 26.7 | 10.98 / 34.4 | 8.70 / 24.5 |
+| Device reads / request | 0.122 | 0.126 | 0.122 |
+| Read from the device | 4.6 GiB | 7.4 GiB | 4.4 GiB |
+| Pages the store read / request | 0.275 | 0.280 | 0.330 |
+
+Without the filters the store asks for a fifth more pages, and the kernel
+has them: the device is read as often. A round of filter building in the
+window cost more than the filters ever saved here. Without readahead the
+device reads are as many as with `O_DIRECT` and a fifth fewer bytes.
+Against v3 (0.376 ms, p99 17.3 ms, 0.280 reads per request) the final
+build is at −19 % CPU, −50 % p99 and −56 % device reads.
+
 Not measured here: a base rewrite on a serving node (covered by tests and
 by the store-level runs of the study), and more than ten minutes of
 traffic.
