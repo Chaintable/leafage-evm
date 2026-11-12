@@ -192,15 +192,15 @@ the process. `--db-cache` is the memory of the store itself: the page
 index, the filters, the tables of the block and code files and the cache of
 block chunks take what they need, the cache of pages the rest. It stays at
 what a v3 archive is given (8192 on bsc); the memory beyond it is the
-kernel's. With `ARCHIVE_V4_DIRECT_IO=1` lookups read with `O_DIRECT` and
-the store's cache is all there is: `--db-cache` must then be most of the
-memory (22000 of 30 GiB in the runs below). The two were the same in CPU,
-latency and device reads at the production rate (Results).
+kernel's. An earlier build read with `O_DIRECT` into a cache of its own
+that had to be given most of the memory (22000 of 30 GiB in most runs
+below); the two were the same in CPU, latency and device reads at the
+production rate (Results), and that way of reading is gone.
 
 Merges, base rewrites and filter builds read files front to back with
-`O_DIRECT` in either mode, and what they write is dropped from the
-kernel's cache as it is synced: a pass over the base does not push the
-pages of the lookups out.
+`O_DIRECT`, and what they write is dropped from the kernel's cache as it
+is synced: a pass over the base does not push the pages of the lookups
+out.
 
 ### Address filters
 
@@ -290,9 +290,7 @@ into a table sorted by the first 8 bytes of the hash (16 bytes per code:
 Both are append-only, and their valid lengths are in the manifest: a flush
 appends, syncs, and the manifest that lists its segments records the new
 lengths. They need no merge and no rewrite. They are read through the
-kernel's page cache in either mode of the page files: they are appended to
-while they are read, and a direct read of a file under buffered appends
-fails on the kernels tried.
+kernel's page cache.
 
 Each has a zstd dictionary (`blocks.dict`, 32 KiB; `code.dict`, 1 MiB)
 that the manifest marks as present. A conversion trains them on block infos
@@ -410,13 +408,12 @@ file is missing or ends at a block the archive no longer has.
 
 A page or a block chunk that fails its checksum, an index or filter that
 fails its CRC, and a file shorter than the manifest or its index says are
-errors, not wrong answers: the read fails, or the open does. `blocks.off`
-and `code.idx` are checked at open against CRCs the manifest has of them
-(they are read whole then anyway), and a code is not taken from a place
-that holds another hash. `blocks.pfx` has no checksum: it only leads to
-block numbers, and a lookup compares the whole hash of the block it finds,
-so a damaged prefix makes a block not found by its hash, never another one
-returned.
+errors, not wrong answers: the read fails, or the open does. The tables of
+the block and code files (`blocks.off`, `blocks.pfx`, `code.idx`) have no
+checksum of their own. What they point at tells: a chunk is a zstd frame
+with a checksum, a code is not taken from a place that holds another hash
+(an error), and a lookup by hash compares the whole hash of the block it
+finds (a damaged prefix makes a block not found, never another returned).
 
 ## Rewind
 
@@ -473,7 +470,7 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `--db-cache` | | memory of the store: page index, filters, the tables of the block and code files, block chunk cache, and its cache of decompressed pages with the rest. As for v3 (8192 on bsc); most of the memory with `ARCHIVE_V4_DIRECT_IO=1`. The memtable and the one being flushed (up to `ARCHIVE_V4_FLUSH_MB` each), the state and code caches and the index from block hash to number are beside it |
+| `--db-cache` | | memory of the store: page index, filters, the tables of the block and code files, block chunk cache, and its cache of decompressed pages with the rest. As for v3 (8192 on bsc). The memtable and the one being flushed (up to `ARCHIVE_V4_FLUSH_MB` each), the state and code caches and the index from block hash to number are beside it |
 | `ARCHIVE_V4_FLUSH_MB` / `ARCHIVE_V4_FLUSH_BLOCKS` | 512 / 4800 | memtable size and age at which it becomes a segment |
 | `ARCHIVE_V4_TIERS` | 8 | segments of a level merged into one |
 | `ARCHIVE_V4_DELTA_PERCENT` / `ARCHIVE_V4_DELTA_MIN_MB` | 4 / 4096 | delta size, relative to the base and absolute, that starts a base rewrite |
@@ -484,7 +481,6 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 | `ARCHIVE_V4_FILTER_MB` | 256 | memory of the address filters (0: none) |
 | `ARCHIVE_V4_FILTER_PERIOD_SECS` | 600 | how often the address filters are revised |
 | `ARCHIVE_V4_BLOCK_CACHE_MB` | 64 | memory for decoded chunks of block infos |
-| `ARCHIVE_V4_DIRECT_IO` | 0 | 1: lookups read page files with `O_DIRECT`, past the kernel's page cache |
 
 `ARCHIVE_STATE_CACHE_MB` and `ARCHIVE_CODE_CACHE_MB` work as on v3. The
 block index is always on (`ARCHIVE_BLOCK_INDEX` is not read), and the
@@ -630,9 +626,9 @@ The same pod's requests (5.88 M, almost all `contractMultiCall`) replayed
 against a node in a container of 6 CPUs with the device throttled as above:
 2.35 M requests as fast as 16 connections take them from a cold start, then
 the other 3.53 M at a fixed rate. v3 runs as in production (`--db-cache`
-8192, reads through the page cache, 30 GiB), v4 with `ARCHIVE_V4_DIRECT_IO=1`
-(the default when these were run) and `--db-cache` 22000 in 30 GiB, 10000
-in 16 GiB.
+8192, reads through the page cache, 30 GiB), v4 as it read when these were
+run: with `O_DIRECT` into its own cache, `--db-cache` 22000 in 30 GiB and
+10000 in 16 GiB.
 
 At 4500 requests/s, the rate of a production pod (785 s):
 
@@ -703,9 +699,9 @@ listed them only at its end, and lost the round at each restart).
 
 With its 527 address filters built again and no filter round in the
 window, the v4 node at 4500 requests/s, as above and with page files read
-through the kernel page cache (`ARCHIVE_V4_DIRECT_IO=0`, `--db-cache=8192`:
-a small cache of decompressed pages over the kernel's cache of the files;
-since then the default):
+through the kernel page cache (`--db-cache=8192`: a small cache of
+decompressed pages over the kernel's cache of the files; since then the
+only way):
 
 | | `O_DIRECT`, `--db-cache=22000` | buffered, `--db-cache=8192` |
 |---|---|---|
@@ -723,8 +719,8 @@ than twice as often, and a miss that the kernel has costs too little to
 show. Against v3 in the same conditions that is −21 % CPU, −44 % p99 and
 −56 % device reads. The buffered arrangement leaves the sizing to the
 kernel, keeps the cache over a restart of the process and needs no other
-`--db-cache` than v3's, which is why it is the default; neither run filled
-the 30 GiB, so they do not show which evicts better.
+`--db-cache` than v3's, which is why it was kept and the other removed;
+neither run filled the 30 GiB, so they do not show which evicts better.
 
 Not measured here: a base rewrite on a serving node (covered by tests and
 by the store-level runs of the study), and more than ten minutes of

@@ -129,9 +129,6 @@ pub(crate) struct BlocksMeta {
     pub(crate) tail: u64,
     /// Whether chunks are written with the dictionary in `blocks.dict`.
     pub(crate) dict: bool,
-    /// CRC32 of the valid part of `blocks.off`; `None` in the manifest of
-    /// a build that kept none.
-    pub(crate) off_crc: Option<u32>,
 }
 
 impl BlocksMeta {
@@ -219,8 +216,6 @@ struct BlocksState {
     meta: BlocksMeta,
     /// Of the full chunks.
     offsets: Vec<u64>,
-    /// The CRC of `offsets` as `blocks.off` holds them, to go on from.
-    off_crc: crc32fast::Hasher,
     /// Empty while the files have none.
     dict: Arc<Dict>,
 }
@@ -234,8 +229,6 @@ pub(crate) struct BlocksAppend {
     keep: usize,
     /// The dictionary this append brings.
     dict: Option<Arc<Dict>>,
-    /// The CRC of the offsets after it, when it changes them.
-    off_crc: Option<crc32fast::Hasher>,
 }
 
 /// The block infos of an archive, by number.
@@ -255,16 +248,6 @@ impl Blocks {
         let pfx = open_rw(&dir.join(BLOCKS_PFX), meta.count * 8)?;
         let mut bytes = vec![0u8; (meta.full_chunks() * 8) as usize];
         off.read_exact_at(&mut bytes, 0)?;
-        let mut off_crc = crc32fast::Hasher::new();
-        off_crc.update(&bytes);
-        let crc = off_crc.clone().finalize();
-        if meta.off_crc.is_some_and(|want| want != crc) {
-            return Err(corrupt(format!("{BLOCKS_OFF} fails its checksum")));
-        }
-        let meta = BlocksMeta {
-            off_crc: Some(crc),
-            ..meta
-        };
         let offsets = bytes
             .chunks_exact(8)
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
@@ -282,7 +265,6 @@ impl Blocks {
             state: RwLock::new(BlocksState {
                 meta,
                 offsets,
-                off_crc,
                 dict: Arc::new(Dict::new(0, dict)),
             }),
             cache: QuickCache::with_weighter(
@@ -402,7 +384,6 @@ impl Blocks {
         }
         write_dict(&self.dir, BLOCKS_DICT, &raw)?;
         Ok(Some(BlocksAppend {
-            off_crc: None,
             meta: BlocksMeta { dict: true, ..meta },
             offsets: Vec::new(),
             keep,
@@ -420,14 +401,9 @@ impl Blocks {
         blocks: &[BlockRec],
         level: i32,
     ) -> Result<BlocksAppend, Error> {
-        let (meta, keep, dict, mut off_crc) = {
+        let (meta, keep, dict) = {
             let st = self.state.read().unwrap();
-            (
-                st.meta,
-                st.offsets.len(),
-                st.dict.clone(),
-                st.off_crc.clone(),
-            )
+            (st.meta, st.offsets.len(), st.dict.clone())
         };
         if blocks.is_empty() {
             return Ok(BlocksAppend {
@@ -435,7 +411,6 @@ impl Blocks {
                 offsets: Vec::new(),
                 keep,
                 dict: None,
-                off_crc: None,
             });
         }
         if meta.count > 0 && first != meta.first + meta.count {
@@ -479,7 +454,6 @@ impl Blocks {
         at += out.len() as u64;
         let off_bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
         self.off.write_all_at(&off_bytes, keep as u64 * 8)?;
-        off_crc.update(&off_bytes);
         let mut prefixes = Vec::with_capacity(blocks.len() * 8);
         for b in blocks {
             prefixes.extend_from_slice(&b.0[..8]);
@@ -495,12 +469,10 @@ impl Blocks {
                 dat_len: at,
                 tail,
                 dict: meta.dict,
-                off_crc: Some(off_crc.clone().finalize()),
             },
             offsets,
             keep,
             dict: None,
-            off_crc: Some(off_crc),
         })
     }
 
@@ -518,14 +490,9 @@ impl Blocks {
         };
         let keep = (count / BLOCK_CHUNK) as usize;
         let rest = (count % BLOCK_CHUNK) as usize;
-        let mut off_crc = crc32fast::Hasher::new();
-        for packed in self.state.read().unwrap().offsets.iter().take(keep) {
-            off_crc.update(&packed.to_le_bytes());
-        }
         let mut new = BlocksMeta {
             count,
             tail: 0,
-            off_crc: Some(off_crc.clone().finalize()),
             ..meta
         };
         if rest > 0 {
@@ -551,7 +518,6 @@ impl Blocks {
             offsets: Vec::new(),
             keep,
             dict: None,
-            off_crc: Some(off_crc),
         })
     }
 
@@ -565,9 +531,6 @@ impl Blocks {
         st.meta = append.meta;
         if let Some(dict) = append.dict {
             st.dict = dict;
-        }
-        if let Some(off_crc) = append.off_crc {
-            st.off_crc = off_crc;
         }
         if cut {
             // What the files held after it must not come back with a later
@@ -588,15 +551,10 @@ pub(crate) struct CodesMeta {
     pub(crate) dat_len: u64,
     /// Whether codes are written with the dictionary in `code.dict`.
     pub(crate) dict: bool,
-    /// CRC32 of the valid part of `code.idx`; `None` in the manifest of a
-    /// build that kept none.
-    pub(crate) idx_crc: Option<u32>,
 }
 
 struct CodesState {
     meta: CodesMeta,
-    /// The CRC of `code.idx`, to go on from.
-    idx_crc: crc32fast::Hasher,
     /// First 8 bytes of the hash and where the code is, sorted.
     sorted: Vec<(u64, u64)>,
     /// Those added since the table was sorted last.
@@ -611,8 +569,6 @@ pub(crate) struct CodesAppend {
     pub(crate) meta: CodesMeta,
     entries: Vec<(u64, u64)>,
     dict: Option<Arc<Dict>>,
-    /// The CRC of the index after it, when it adds to it.
-    idx_crc: Option<crc32fast::Hasher>,
 }
 
 /// Contract code by hash.
@@ -663,13 +619,11 @@ impl Codes {
         let dat = open_rw(&dir.join(CODE_DAT), meta.dat_len)?;
         let idx = open_rw(&dir.join(CODE_IDX), meta.count * CODE_ENTRY)?;
         let mut sorted = Vec::with_capacity(meta.count as usize);
-        let mut idx_crc = crc32fast::Hasher::new();
         let mut buf = vec![0u8; (CODE_ENTRY as usize) << 14];
         let mut at = 0u64;
         while at < meta.count * CODE_ENTRY {
             let n = (meta.count * CODE_ENTRY - at).min(buf.len() as u64) as usize;
             idx.read_exact_at(&mut buf[..n], at)?;
-            idx_crc.update(&buf[..n]);
             for e in buf[..n].chunks_exact(CODE_ENTRY as usize) {
                 let offset = u64::from_le_bytes(e[32..40].try_into().unwrap());
                 let len = u32::from_le_bytes(e[40..44].try_into().unwrap());
@@ -681,14 +635,6 @@ impl Codes {
             at += n as u64;
         }
         sorted.sort_unstable();
-        let crc = idx_crc.clone().finalize();
-        if meta.idx_crc.is_some_and(|want| want != crc) {
-            return Err(corrupt(format!("{CODE_IDX} fails its checksum")));
-        }
-        let meta = CodesMeta {
-            idx_crc: Some(crc),
-            ..meta
-        };
         let dict = if meta.dict {
             std::fs::read(dir.join(CODE_DICT))?
         } else {
@@ -700,7 +646,6 @@ impl Codes {
             idx,
             state: RwLock::new(CodesState {
                 meta,
-                idx_crc,
                 sorted,
                 recent: HashMap::new(),
                 recent_len: 0,
@@ -798,7 +743,6 @@ impl Codes {
         }
         write_dict(&self.dir, CODE_DICT, &raw)?;
         Ok(Some(CodesAppend {
-            idx_crc: None,
             meta: CodesMeta { dict: true, ..meta },
             entries: Vec::new(),
             dict: Some(Arc::new(Dict::new(0, raw))),
@@ -841,9 +785,9 @@ impl Codes {
         codes: impl IntoIterator<Item = (&'a [u8; 32], &'a [u8])>,
         level: i32,
     ) -> Result<CodesAppend, Error> {
-        let (meta, dict, mut idx_crc) = {
+        let (meta, dict) = {
             let st = self.state.read().unwrap();
-            (st.meta, st.dict.clone(), st.idx_crc.clone())
+            (st.meta, st.dict.clone())
         };
         let mut seen: HashMap<[u8; 32], ()> = HashMap::new();
         let mut new: Vec<(&[u8; 32], &[u8])> = Vec::new();
@@ -857,7 +801,6 @@ impl Codes {
                 meta,
                 entries: Vec::new(),
                 dict: None,
-                idx_crc: None,
             });
         }
         let raw: Vec<&[u8]> = new.iter().map(|(_, code)| *code).collect();
@@ -883,7 +826,6 @@ impl Codes {
         self.dat.write_all_at(&out, at)?;
         at += out.len() as u64;
         self.idx.write_all_at(&idx, meta.count * CODE_ENTRY)?;
-        idx_crc.update(&idx);
         self.dat.sync_data()?;
         self.idx.sync_data()?;
         Ok(CodesAppend {
@@ -891,11 +833,9 @@ impl Codes {
                 count: meta.count + entries.len() as u64,
                 dat_len: at,
                 dict: meta.dict,
-                idx_crc: Some(idx_crc.clone().finalize()),
             },
             entries,
             dict: None,
-            idx_crc: Some(idx_crc),
         })
     }
 
@@ -905,9 +845,6 @@ impl Codes {
         st.meta = append.meta;
         if let Some(dict) = append.dict {
             st.dict = dict;
-        }
-        if let Some(idx_crc) = append.idx_crc {
-            st.idx_crc = idx_crc;
         }
         st.recent_len += append.entries.len();
         for (p, packed) in append.entries {
@@ -1186,22 +1123,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The tables of the block and code files are checked against the
-    /// checksums the manifest has of them, and a code is not taken from a
-    /// place that holds another.
+    /// A code is not taken from a place that holds another: an index entry
+    /// that points elsewhere is an error, not a missing code.
     #[test]
-    fn damaged_indexes_are_errors() {
+    fn a_code_index_that_points_elsewhere_is_an_error() {
         let dir = dir("side-damage");
-        let flip = |name: &str, at: u64| {
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(dir.join(name))
-                .unwrap();
-            let mut b = [0u8; 1];
-            f.read_exact_at(&mut b, at).unwrap();
-            f.write_all_at(&[b[0] ^ 0x10], at).unwrap();
-        };
         let codes = Codes::open(&dir, CodesMeta::default()).unwrap();
         let batch: Vec<_> = (0..50).map(sample_code).collect();
         let append = codes
@@ -1209,38 +1135,23 @@ mod tests {
             .unwrap();
         let meta = append.meta;
         codes.publish(append);
-        assert!(meta.idx_crc.is_some());
         drop(codes);
         // The offset of the fourth code.
-        flip(CODE_IDX, 3 * CODE_ENTRY + 33);
-        assert!(Codes::open(&dir, meta).is_err());
-        // A manifest without the checksum: the lookup still tells.
-        let unchecked = Codes::open(
-            &dir,
-            CodesMeta {
-                idx_crc: None,
-                ..meta
-            },
-        )
-        .unwrap();
-        assert!(unchecked.get(&sample_code(3).0).is_err());
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(CODE_IDX))
+            .unwrap();
+        let at = 3 * CODE_ENTRY + 33;
+        let mut b = [0u8; 1];
+        f.read_exact_at(&mut b, at).unwrap();
+        f.write_all_at(&[b[0] ^ 0x10], at).unwrap();
+        let codes = Codes::open(&dir, meta).unwrap();
+        assert!(codes.get(&sample_code(3).0).is_err());
         assert_eq!(
-            unchecked.get(&sample_code(4).0).unwrap(),
+            codes.get(&sample_code(4).0).unwrap(),
             Some(sample_code(4).1)
         );
-        drop(unchecked);
-
-        let block = |n: u64| -> BlockRec { ([n as u8 + 1; 32], Arc::from(vec![n as u8; 60])) };
-        let blocks = Blocks::open(&dir, BlocksMeta::default(), 1 << 20).unwrap();
-        let recs: Vec<BlockRec> = (0..100).map(block).collect();
-        let append = blocks.append(0, &recs, LEVEL).unwrap();
-        let meta = append.meta;
-        blocks.publish(append).unwrap();
-        assert!(meta.off_crc.is_some());
-        drop(blocks);
-        assert!(Blocks::open(&dir, meta, 1 << 20).is_ok());
-        flip(BLOCKS_OFF, 9);
-        assert!(Blocks::open(&dir, meta, 1 << 20).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

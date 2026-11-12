@@ -415,10 +415,6 @@ impl ManifestData {
             let text = |i: usize| -> Result<String, Error> {
                 f.get(i).map(|s| s.to_string()).ok_or_else(bad)
             };
-            // A checksum, which a manifest of an earlier build leaves out.
-            let crc = |i: usize| -> Result<Option<u32>, Error> {
-                f.get(i).map(|s| s.parse().map_err(|_| bad())).transpose()
-            };
             match f.first().copied() {
                 None => {}
                 Some("next_fid") => m.next_fid = num(1)? as u32,
@@ -482,7 +478,6 @@ impl ManifestData {
                         dat_len: num(3)?,
                         tail: num(4)?,
                         dict: num(5)? == 1,
-                        off_crc: crc(6)?,
                     }
                 }
                 Some("codes") => {
@@ -490,7 +485,6 @@ impl ManifestData {
                         count: num(1)?,
                         dat_len: num(2)?,
                         dict: num(3)? == 1,
-                        idx_crc: crc(4)?,
                     }
                 }
                 Some(_) => return Err(bad()),
@@ -529,22 +523,13 @@ impl ManifestData {
             s += &format!("filter {fid} {} {slots} {name}\n", hex(address));
         }
         let b = &self.blocks;
-        let crc = |c: Option<u32>| c.map_or(String::new(), |c| format!(" {c}"));
         s += &format!(
-            "blocks {} {} {} {} {}{}\n",
-            b.first,
-            b.count,
-            b.dat_len,
-            b.tail,
-            b.dict as u8,
-            crc(b.off_crc)
+            "blocks {} {} {} {} {}\n",
+            b.first, b.count, b.dat_len, b.tail, b.dict as u8
         );
         s += &format!(
-            "codes {} {} {}{}\n",
-            self.codes.count,
-            self.codes.dat_len,
-            self.codes.dict as u8,
-            crc(self.codes.idx_crc)
+            "codes {} {} {}\n",
+            self.codes.count, self.codes.dat_len, self.codes.dict as u8
         );
         s
     }
@@ -2187,10 +2172,6 @@ impl Store {
         };
         let blocks = Blocks::open(dir, m.blocks, opts.block_cache_bytes)?;
         let codes = Codes::open(dir, m.codes)?;
-        // With the checksums of their indexes, which a manifest of an
-        // earlier build does not have yet.
-        view.blocks = blocks.meta();
-        view.codes = codes.meta();
         for (slot, entry) in base_slots.into_iter().zip(&m.base) {
             let b = slot.into_inner().unwrap().expect("opened");
             view.base[entry.0].push(Arc::new(b));

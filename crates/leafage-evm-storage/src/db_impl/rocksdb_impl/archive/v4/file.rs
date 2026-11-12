@@ -138,16 +138,6 @@ thread_local! {
     });
 }
 
-/// Whether lookups read page files with `O_DIRECT` (`ARCHIVE_V4_DIRECT_IO=1`).
-/// By default they go through the kernel's page cache, which holds the
-/// stored pages the store's own cache of decompressed pages has no room
-/// for, sizes itself to the memory that is free, and outlives the process.
-/// With `O_DIRECT` the store's cache is all there is: `--db-cache` must
-/// then be most of the memory.
-fn direct_io() -> bool {
-    std::env::var("ARCHIVE_V4_DIRECT_IO").is_ok_and(|v| v.trim() == "1")
-}
-
 /// Open `path` for reads with `O_DIRECT`; `None` where the filesystem has
 /// none (tmpfs).
 fn open_direct(path: &Path) -> Result<Option<File>, Error> {
@@ -228,12 +218,14 @@ pub(crate) struct PageFile {
     pub(crate) storage: bool,
     /// Path without extension.
     pub(crate) base: PathBuf,
-    /// For lookups: one page at a place of its own.
+    /// For lookups: one page at a place of its own, through the kernel's
+    /// page cache. It holds the stored pages the store's own cache of
+    /// decompressed pages has no room for, sizes itself to the memory that
+    /// is free, and outlives the process.
     file: File,
-    direct: bool,
-    /// For reads front to back (merges, rewrites, filter builds): always
-    /// direct where the filesystem can, so that passing over a file does
-    /// not fill the kernel's page cache with it.
+    /// For reads front to back (merges, rewrites, filter builds): direct
+    /// where the filesystem can, so that passing over a file does not fill
+    /// the kernel's page cache with it.
     seq: File,
     pub(crate) index: Index,
     pub(crate) dict: Arc<Dict>,
@@ -255,16 +247,10 @@ impl PageFile {
             Some(f) => f,
             None => File::open(&path)?,
         };
-        let (file, direct) = match direct_io().then(|| open_direct(&path)).transpose()? {
-            Some(Some(f)) => (f, true),
-            _ => {
-                let f = File::open(&path)?;
-                // Lookups read single pages all over the file: no readahead.
-                // Advice only.
-                unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
-                (f, false)
-            }
-        };
+        let file = File::open(&path)?;
+        // Lookups read single pages all over the file: no readahead. Advice
+        // only.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
         let len = file.metadata()?.len();
         if len != index.data_len() {
             return Err(corrupt(format!(
@@ -277,7 +263,6 @@ impl PageFile {
             storage,
             base: base.to_path_buf(),
             file,
-            direct,
             seq,
             index,
             dict,
@@ -288,31 +273,23 @@ impl PageFile {
         self.index.data_len()
     }
 
-    /// Read `[off, end)` into `buf` (aligned if the file is direct) and
-    /// return where `off` lies in it.
+    /// Read `[off, end)` into `buf`.
     fn read_range<'a>(
         &self,
         buf: &'a mut AlignedBuf,
         off: u64,
         end: u64,
     ) -> Result<&'a [u8], Error> {
-        let (start, aend) = if self.direct {
-            (
-                off & !(ALIGN as u64 - 1),
-                (end + ALIGN as u64 - 1) & !(ALIGN as u64 - 1),
-            )
-        } else {
-            (off, end)
-        };
-        let b = buf.slice((aend - start) as usize);
-        let got = read_at(&self.file, b, start)?;
-        if (got as u64) < end - start {
+        let b = buf.slice((end - off) as usize);
+        let got = read_at(&self.file, b, off)?;
+        if (got as u64) < end - off {
             return Err(corrupt(format!("{:?}: short read at {off}", self.base)));
         }
-        Ok(&b[(off - start) as usize..(end - start) as usize])
+        Ok(b)
     }
 
-    /// Read and decompress page `c` from the device.
+    /// Read and decompress page `c`: from the kernel's page cache, or the
+    /// device.
     pub(crate) fn read_page(&self, c: usize) -> Result<Arc<[u8]>, Error> {
         let (off, end) = self.index.range(c);
         READ_CTX.with(|ctx| {
