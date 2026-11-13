@@ -37,6 +37,9 @@ use tracing::{info, warn};
 /// `keccak256(rlp([]))`, the header field every Era debank header carries.
 const EMPTY_UNCLES: &str = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347";
 
+/// The zero `miner` of a debank header (20 bytes).
+const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+
 /// `leafage-evm archive-import-postgres` command
 #[derive(Debug, clap::Parser)]
 pub struct Command {
@@ -117,7 +120,7 @@ impl Command {
             "importing block {} ({:#x}) into {:?}",
             meta.number, meta.hash, self.db_path
         );
-        let block_info = self.build_block_info(&meta)?;
+        let block_info = Self::build_block_info(&meta)?;
 
         let outcome = self.copy_state(&archive, &mut client, &meta).await;
         connection_task.abort();
@@ -263,7 +266,7 @@ impl Command {
     /// Build the `BlockInfo` the way the producer writes it into S3: the
     /// fields it can compute, everything else defaulted (`state_root` is zero
     /// on every Era debank header).
-    fn build_block_info(&self, meta: &MiniblockMeta) -> Result<BlockInfo> {
+    fn build_block_info(meta: &MiniblockMeta) -> Result<BlockInfo> {
         if meta.logs_bloom.len() != 256 {
             warn!(
                 "block {} has a {}-byte logs_bloom; writing an empty one",
@@ -280,7 +283,9 @@ impl Command {
             "hash": meta.hash,
             "parentHash": meta.parent_hash,
             "sha3Uncles": EMPTY_UNCLES,
-            "miner": H256::ZERO,
+            // A 20-byte address, not a hash: `H256::ZERO` here is 32 bytes and
+            // alloy rejects it with "invalid string length".
+            "miner": ZERO_ADDRESS,
             "stateRoot": H256::ZERO,
             "transactionsRoot": H256::ZERO,
             "receiptsRoot": H256::ZERO,
@@ -436,7 +441,7 @@ fn parse_decimal(text: &str) -> Result<U256> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_decimal;
+    use super::*;
 
     #[test]
     fn parses_postgres_numeric_text() {
@@ -445,5 +450,34 @@ mod tests {
         assert_eq!(parse_decimal("0.000").unwrap(), 0u64);
         assert_eq!(parse_decimal("0xff").unwrap(), 255u64);
         assert!(parse_decimal("x").is_err());
+    }
+
+    /// The header JSON must round-trip through alloy's `Block`; a field of the
+    /// wrong width (a 32-byte hash in the 20-byte `miner`) fails here rather
+    /// than after the state copy has run.
+    #[test]
+    fn builds_a_block_info_alloy_accepts() {
+        let meta = MiniblockMeta {
+            number: 0,
+            hash: H256::repeat_byte(0x11),
+            parent_hash: H256::ZERO,
+            timestamp: 0,
+            base_fee: U256::ZERO,
+            gas_limit: 0,
+            gas_used: 0,
+            logs_bloom: vec![0u8; 256],
+        };
+        let info = Command::build_block_info(&meta).unwrap();
+        assert_eq!(info.header.hash, meta.hash);
+        assert_eq!(info.header.inner.number, 0);
+        assert_eq!(info.header.inner.parent_hash, H256::ZERO);
+        assert_eq!(info.header.inner.beneficiary.as_slice(), &[0u8; 20]);
+        assert_eq!(info.header.inner.timestamp, 0);
+        assert_eq!(info.header.inner.base_fee_per_gas, Some(0));
+
+        // A short bloom falls back to empty instead of failing.
+        let mut short = meta;
+        short.logs_bloom.clear();
+        assert!(Command::build_block_info(&short).is_ok());
     }
 }
