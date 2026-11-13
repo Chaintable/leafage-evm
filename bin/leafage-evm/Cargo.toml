@@ -32,6 +32,7 @@ alloy.workspace = true
 alloy-primitives = { workspace = true, features = ["asm-keccak"] }
 rocksdb = { workspace = true, features = ["jemalloc"] }
 rdkafka.workspace = true
+tokio-postgres.workspace = true
 aws-sdk-s3.workspace = true
 aws-config.workspace = true
 flate2.workspace = true

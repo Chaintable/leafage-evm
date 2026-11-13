@@ -1,6 +1,6 @@
 use crate::{
     archive_clear_deleted, archive_init, archive_scan, archive_udt, compact, db_migrate,
-    force_compact, pipeline_export, put_code, rewind, standalone,
+    force_compact, import_postgres, pipeline_export, put_code, rewind, standalone,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -33,6 +33,10 @@ pub(crate) enum Commands {
     /// Initialize archive database from S3 and RPC
     #[command(name = "archive-init")]
     ArchiveInit(archive_init::Command),
+    /// Seed an archive's first block (e.g. block 0) from a ZKsync node's
+    /// Postgres database, for chains with no stateDiff object for that block
+    #[command(name = "archive-import-postgres")]
+    ArchiveImportPostgres(import_postgres::Command),
     /// Compact database to optimize storage
     #[command(name = "compact")]
     Compact(compact::Command),
@@ -66,6 +70,7 @@ impl Commands {
             Commands::Standalone(mut cmd) => cmd.run().await,
             Commands::DBMigrate(mut cmd) => cmd.run().await,
             Commands::ArchiveInit(mut cmd) => cmd.run().await,
+            Commands::ArchiveImportPostgres(mut cmd) => cmd.run().await,
             Commands::Compact(mut cmd) => cmd.run().await,
             Commands::ForceCompact(mut cmd) => cmd.run().await,
             Commands::Rewind(mut cmd) => cmd.run().await,
