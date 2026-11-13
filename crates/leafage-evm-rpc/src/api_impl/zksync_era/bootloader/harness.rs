@@ -81,6 +81,7 @@ pub fn execute_bootloader<DB: DatabaseRef>(
     tx: &TransactionData,
     env: &BootloaderEnv,
     gas_limit: u64,
+    settlement_layer: u64,
 ) -> Result<BootloaderExecutionOutput, EVMError<DB::Error, InvalidTransaction>> {
     let mut world = EraStorageWorld::new(db);
     world.set_expected_caller(tx.from);
@@ -108,11 +109,12 @@ pub fn execute_bootloader<DB: DatabaseRef>(
     vm.current_frame().set_stack_pointer(0);
     vm.current_frame().set_heap_bound(u32::MAX);
     vm.current_frame().set_aux_heap_bound(u32::MAX);
-    vm.current_frame().set_exception_handler(INITIAL_FRAME_FORMAL_EH_LOCATION);
+    vm.current_frame()
+        .set_exception_handler(INITIAL_FRAME_FORMAL_EH_LOCATION);
 
     // Populate initial bootloader memory in heap
     let trusted_gas_limit = U256::from(MAX_L2_TX_GAS_LIMIT).min(tx.gas_limit);
-    let memory = layout::build_bootloader_memory(tx, env, trusted_gas_limit);
+    let memory = layout::build_bootloader_memory(tx, env, trusted_gas_limit, settlement_layer);
     for (slot, value) in memory {
         let start_address = (slot as u32) * 32;
         vm.write_heap_u256(HeapId::FIRST, start_address, value);
@@ -150,9 +152,11 @@ pub fn execute_bootloader<DB: DatabaseRef>(
                         let bootloader_refund =
                             read_heap_word(&vm, VM_HOOK_PARAMS_START_POSITION as usize).as_u64();
                         let gas_spent_on_pubdata =
-                            read_heap_word(&vm, (VM_HOOK_PARAMS_START_POSITION + 1) as usize).as_u64();
+                            read_heap_word(&vm, (VM_HOOK_PARAMS_START_POSITION + 1) as usize)
+                                .as_u64();
                         let gas_per_pubdata_byte =
-                            read_heap_word(&vm, (VM_HOOK_PARAMS_START_POSITION + 2) as usize).low_u32();
+                            read_heap_word(&vm, (VM_HOOK_PARAMS_START_POSITION + 2) as usize)
+                                .low_u32();
 
                         let pubdata_published =
                             vm.world_diff().pubdata_costs().iter().sum::<i32>().max(0) as u32;
@@ -168,7 +172,7 @@ pub fn execute_bootloader<DB: DatabaseRef>(
                             pubdata_published,
                         );
 
-                        let refund_slot = OPERATOR_REFUNDS_OFFSET;
+                        let refund_slot = MEDIUM_INTEROP_OPERATOR_REFUNDS_OFFSET;
                         vm.write_heap_u256(
                             HeapId::FIRST,
                             (refund_slot as u32) * 32,
