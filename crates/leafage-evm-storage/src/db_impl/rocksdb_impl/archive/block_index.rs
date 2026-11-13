@@ -197,6 +197,103 @@ struct Recent {
     last: Option<(u32, H256)>,
 }
 
+/// Where the hashes of the canonical blocks are: CF `3`, or the block files
+/// of a schema v4 archive.
+pub(super) trait BlockHashes: Sync {
+    /// The newest block.
+    fn last(&self) -> Result<Option<(u64, H256)>, Error>;
+    /// The hash of block `number`.
+    fn hash(&self, number: u64) -> Result<Option<H256>, Error>;
+    /// The blocks in `[from, to)`, in order. Of each hash only the first 8
+    /// bytes need to be right: the index is built from those.
+    fn scan(
+        &self,
+        from: u64,
+        to: u64,
+        f: &mut dyn FnMut(u64, H256) -> Result<(), Error>,
+    ) -> Result<(), Error>;
+}
+
+impl BlockHashes for DB {
+    fn last(&self) -> Result<Option<(u64, H256)>, Error> {
+        last_block(self)
+    }
+
+    fn hash(&self, number: u64) -> Result<Option<H256>, Error> {
+        let cf = self
+            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
+            .unwrap();
+        Ok(self
+            .get_pinned_cf(cf, encode_block_num(number))?
+            .map(|hash| H256::from_slice(&hash)))
+    }
+
+    fn scan(
+        &self,
+        from: u64,
+        to: u64,
+        f: &mut dyn FnMut(u64, H256) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let cf = self
+            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
+            .unwrap();
+        let mut opts = scan_options();
+        opts.set_iterate_lower_bound(encode_block_num(from));
+        if to != u64::MAX {
+            opts.set_iterate_upper_bound(encode_block_num(to));
+        }
+        for item in self.iterator_cf_opt(cf, opts, IteratorMode::Start) {
+            let (number, hash) = item?;
+            f(block_number(&number), H256::from_slice(&hash))?;
+        }
+        Ok(())
+    }
+}
+
+impl BlockHashes for super::v4::Store {
+    fn last(&self) -> Result<Option<(u64, H256)>, Error> {
+        // The head, or the last block below it that has a hash: a block
+        // written with its versions only has none.
+        let Some(head) = self.head() else {
+            return Ok(None);
+        };
+        let mut to = head + 1;
+        while to > 0 {
+            let from = to.saturating_sub(4096);
+            let mut last = None;
+            self.scan_block_prefixes(from, to, &mut |number, _| {
+                last = Some(number);
+                Ok(())
+            })?;
+            if let Some(number) = last {
+                if let Some(hash) = self.block_hash(number)? {
+                    return Ok(Some((number, H256::from(hash))));
+                }
+            }
+            to = from;
+        }
+        Ok(None)
+    }
+
+    fn hash(&self, number: u64) -> Result<Option<H256>, Error> {
+        Ok(self.block_hash(number)?.map(H256::from))
+    }
+
+    fn scan(
+        &self,
+        from: u64,
+        to: u64,
+        f: &mut dyn FnMut(u64, H256) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        // The block files keep the first 8 bytes of each hash.
+        self.scan_block_prefixes(from, to, &mut |number, prefix| {
+            let mut hash = H256::ZERO;
+            hash.0[..8].copy_from_slice(&prefix.to_be_bytes());
+            f(number, hash)
+        })
+    }
+}
+
 pub(super) struct BlockIndex {
     shards: Vec<RwLock<Arc<Shard>>>,
     recent: RwLock<Recent>,
@@ -245,17 +342,13 @@ impl BlockIndex {
 
     /// The index of the archive in `dir`: loaded from its file and completed
     /// from CF `3`, or rebuilt from CF `3` and saved.
-    pub(super) fn open(db: &DB, dir: &Path) -> Result<Self, Error> {
+    pub(super) fn open(db: &(impl BlockHashes + ?Sized), dir: &Path) -> Result<Self, Error> {
         let start = Instant::now();
         let file = dir.join(FILE);
-        let blocks = last_block(db)?.map_or(0, |(number, _)| number + 1);
+        let blocks = db.last()?.map_or(0, |(number, _)| number + 1);
         let loaded = match load(&file) {
             Ok(Some((k, shards, last))) => {
-                let cf = db
-                    .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
-                    .unwrap();
-                let saved = db.get_pinned_cf(cf, encode_block_num(u64::from(last.0)))?;
-                if saved.as_deref() != Some(last.1.as_slice()) {
+                if db.hash(u64::from(last.0))? != Some(last.1) {
                     warn!(target: "rocksdb", last = last.0, "archive block index file ends at a block CF 3 no longer has, rebuilding");
                     None
                 } else if k + 1 < bucket_bits(blocks) {
@@ -287,7 +380,7 @@ impl BlockIndex {
     /// The index of the archive in `dir`, built from CF `3` and saved. The
     /// move from CF 2 uses it: a file left by a failed move is not kept up
     /// to date while the archive runs on CF 2.
-    pub(super) fn rebuild(db: &DB, dir: &Path) -> Result<Self, Error> {
+    pub(super) fn rebuild(db: &(impl BlockHashes + ?Sized), dir: &Path) -> Result<Self, Error> {
         let start = Instant::now();
         let file = dir.join(FILE);
         let mut index = Self::build(db)?;
@@ -300,8 +393,8 @@ impl BlockIndex {
 
     /// Index every block of CF `3`, scanning ranges of block numbers in
     /// parallel.
-    pub(super) fn build(db: &DB) -> Result<Self, Error> {
-        let last = last_block(db)?;
+    pub(super) fn build(db: &(impl BlockHashes + ?Sized)) -> Result<Self, Error> {
+        let last = db.last()?;
         let blocks = last.map_or(0, |(number, _)| number + 1);
         let k = bucket_bits(blocks);
         let per = blocks.div_ceil(SCAN_THREADS as u64).max(1);
@@ -310,20 +403,13 @@ impl BlockIndex {
             let scans: Vec<_> = (0..SCAN_THREADS as u64)
                 .map(|i| {
                     s.spawn(move || -> Result<Vec<Vec<(u32, u32)>>, Error> {
-                        let cf = db
-                            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
-                            .unwrap();
-                        let mut opts = scan_options();
-                        opts.set_iterate_lower_bound(encode_block_num(i * per));
-                        opts.set_iterate_upper_bound(encode_block_num((i + 1) * per));
                         let mut shards = vec![Vec::new(); SHARDS];
-                        for item in db.iterator_cf_opt(cf, opts, IteratorMode::Start) {
-                            let (number, hash) = item?;
-                            let (hash, number) =
-                                entry(&H256::from_slice(&hash), block_number(&number))?;
+                        db.scan(i * per, (i + 1) * per, &mut |number, hash| {
+                            let (hash, number) = entry(&hash, number)?;
                             let p = prefix(&hash);
                             shards[shard_of(p)].push((code(p, k), number));
-                        }
+                            Ok(())
+                        })?;
                         Ok(shards)
                     })
                 })
@@ -371,25 +457,31 @@ impl BlockIndex {
     }
 
     /// Index the blocks of CF `3` from `from` on; returns how many.
-    fn index_from(&self, db: &DB, from: u64) -> Result<usize, Error> {
-        let cf = db
-            .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
-            .unwrap();
-        let mut opts = scan_options();
-        opts.set_iterate_lower_bound(encode_block_num(from));
+    fn index_from(&self, db: &(impl BlockHashes + ?Sized), from: u64) -> Result<usize, Error> {
         let mut blocks = 0;
         let mut batch = Vec::new();
-        for item in db.iterator_cf_opt(cf, opts, IteratorMode::Start) {
-            let (number, hash) = item?;
-            batch.push(entry(&H256::from_slice(&hash), block_number(&number))?);
+        // The last block of a batch is remembered with its whole hash.
+        let whole = |batch: &mut Vec<(H256, u32)>| -> Result<(), Error> {
+            if let Some(last) = batch.last_mut() {
+                last.0 = db.hash(u64::from(last.1))?.ok_or_else(|| {
+                    Error::UnSupported(format!("block {} is gone while it is indexed", last.1))
+                })?;
+            }
+            Ok(())
+        };
+        db.scan(from, u64::MAX, &mut |number, hash| {
+            batch.push(entry(&hash, number)?);
             if batch.len() == MERGE_AT {
                 blocks += batch.len();
+                whole(&mut batch)?;
                 self.note(&batch)?;
                 batch.clear();
                 self.merge(false);
             }
-        }
+            Ok(())
+        })?;
         blocks += batch.len();
+        whole(&mut batch)?;
         self.note(&batch)?;
         if blocks >= MERGE_AT {
             self.merge(true);
@@ -819,6 +911,19 @@ impl DataBaseRef {
         index: &BlockIndex,
         hash: H256,
     ) -> Result<Option<BlockInfo>, Error> {
+        if let Some(store) = &self.v4 {
+            for number in index.candidates(&hash) {
+                let start = Instant::now();
+                let block = store.block(number)?;
+                STORAGE_METRICS
+                    .read_block_by_number_latency
+                    .record(start.elapsed().as_secs_f64());
+                if let Some((_, info)) = block.filter(|block| block.0 == hash.0) {
+                    return decode_block_info(hash, &info).map(Some);
+                }
+            }
+            return Ok(None);
+        }
         let cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())

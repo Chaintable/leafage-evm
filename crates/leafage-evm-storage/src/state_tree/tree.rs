@@ -240,6 +240,10 @@ where
         }
     }
 
+    fn has_block(&self, hash: H256) -> bool {
+        self.index.load().hash_diff_map.contains_key(&hash)
+    }
+
     fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error> {
         let latest_statedb = self
             .db
@@ -465,6 +469,71 @@ mod tests {
 
         drop(numbered_handle);
         drop(latest_handle);
+        drop(tree);
+        let _ = std::fs::remove_dir_all(&db_path);
+    }
+
+    /// The tree is on a branch that the chain abandoned two blocks ago: the
+    /// canonical branch, applied oldest first, takes over the head.
+    #[test]
+    fn a_longer_branch_applied_from_its_fork_point_becomes_the_head() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path =
+            std::env::temp_dir().join(format!("leafage-branch-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&db_path);
+
+        let db =
+            MultiStorage::open(&db_path, 64, StorageKind::Rocksdb, false, false, false).unwrap();
+        StateDBWrapper(
+            db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .unwrap()
+                .unwrap(),
+        )
+        .update_block(
+            block_info(0, hash(0xa0), H256::ZERO),
+            BlockStorageDiff::default(),
+        )
+        .unwrap();
+        let tree = StateTree::new(db, StateTreeConfig::new(16, 100, 100, 100, true)).unwrap();
+        let head = |tree: &StateTree<MultiStorage>| {
+            tree.state_at(BlockId::Number(BlockNumberOrTag::Latest))
+                .unwrap()
+                .unwrap()
+                .block_info()
+                .unwrap()
+                .header
+                .hash
+        };
+        let apply = |number, block, parent| {
+            tree.update_block(
+                block_info(number, hash(block), hash(parent)),
+                BlockStorageDiff::default(),
+            )
+        };
+
+        // The abandoned branch.
+        apply(1, 0xb1, 0xa0).unwrap();
+        apply(2, 0xb2, 0xb1).unwrap();
+        assert!(tree.has_block(hash(0xa0)) && tree.has_block(hash(0xb2)));
+
+        // The block after it is of the other branch, and has no parent here.
+        assert!(!tree.has_block(hash(0xa2)));
+        assert!(matches!(
+            apply(3, 0xa3, 0xa2),
+            Err(Error::ParentBlockHashNotFound(..))
+        ));
+        assert_eq!(head(&tree), hash(0xb2));
+
+        apply(1, 0xa1, 0xa0).unwrap();
+        assert_eq!(head(&tree), hash(0xb2));
+        apply(2, 0xa2, 0xa1).unwrap();
+        apply(3, 0xa3, 0xa2).unwrap();
+        assert_eq!(head(&tree), hash(0xa3));
+        assert!(tree.has_block(hash(0xa3)) && tree.has_block(hash(0xb2)));
+
         drop(tree);
         let _ = std::fs::remove_dir_all(&db_path);
     }

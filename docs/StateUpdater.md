@@ -68,8 +68,7 @@ The updater mode is selected based on CLI parameters:
 │  4. Apply updates to StateTree                              │
 │     └── tree.update_block(block_info, block_diff)           │
 │                                                             │
-│  5. Commit offset after persistence                         │
-│     └── write_offset(offset_dir, offset + 1)                │
+│  5. Forget the blocks the database has taken over           │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -87,23 +86,26 @@ override the chain default, including `block-hash` for Arb Classic. See
 `docs/DataSpec.md` for details and `StateDiffKey::resolve()` in
 `bin/leafage-evm/src/utils.rs` for default selection.
 
-### Offset Management
+### Start position
 
-KafkaUpdater maintains Kafka consumer offset for crash recovery:
+KafkaUpdater keeps no Kafka offset between runs:
 
 ```
 Startup:
-  1. Read persisted offset from offset_dir
-  2. Fetch Kafka watermarks (lowest, latest)
-  3. Decision:
-     ├── bundle_bucket_name set ──► Sync from bundle/block storage, start from latest
-     ├── offset >= lowest ──► Resume from offset
-     └── offset < lowest or missing ──► Sync from S3, start from latest
+  1. Fetch Kafka watermarks (lowest, latest)
+  2. Start consuming at the latest offset
+  3. Sync the blocks between the database head and the first
+     notification from S3 (bundle/block storage), then follow Kafka
 ```
 
-Bundle-enabled nodes always perform the startup catch-up even when the saved
-Kafka offset is still within retention. A valid but old notification can refer
-to source objects already deleted by the compactor.
+The head a node opens on is not always the block it last took from Kafka: a
+rewind moves it, a snapshot sets it, and a schema v4 archive opens at its
+last flushed block (`docs/ArchiveSchemaV4.md`). An offset that does not
+follow the head fails every update, and a valid but old notification can
+refer to source objects already deleted by the compactor. Earlier versions
+saved the offset of the last persisted block in `offset_dir`; `standalone`
+removes that file at start so that a downgraded node does not resume from
+it.
 
 For an empty database, initialization follows the same storage preference:
 the configured genesis block is read from compacted bundle storage first, with
@@ -165,7 +167,7 @@ Kafka + S3 config file (`--kafka-s3-config`):
 | `bucket_name` | S3 bucket for state diffs |
 | `bundle_bucket_name` | Optional S3 bucket for compacted Header and StateDiff bundles; empty disables bundle reads |
 | `outer_bucket_name` | S3 bucket for block info |
-| `offset_dir` | Directory to persist Kafka offset |
+| `offset_dir` | No longer used (accepted for existing configurations); the offset file of an earlier version there is removed at start |
 | `s3_chain_id` | Chain identifier in S3 paths |
 | `version` | Data version in S3 paths |
 

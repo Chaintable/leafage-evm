@@ -9,7 +9,7 @@ use aws_sdk_s3::{config::timeout::TimeoutConfig, Client};
 use futures::stream::StreamExt;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{
-    read_offset, write_offset, BlockContext, EvmStorageRead, EvmStorageWrite,
+    BlockContext, EvmStorageRead, EvmStorageWrite,
 };
 use leafage_evm_types::{
     BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, KafkaBlockChangeNotification,
@@ -30,13 +30,12 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::{sync::watch, task::JoinSet, time};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
 struct BlockContextWithOffset {
     block_diff: BlockStorageDiff,
     block_info: BlockInfo,
-    offset: i64,
 }
 
 /// Builds the librdkafka configuration for the updater consumer.
@@ -218,16 +217,64 @@ where
         .context(format!("s3 get block info failed, {block_hash}"))
     }
 
-    fn clear(
-        &self,
-        presist_block_num: u64,
-        presist_block_hash: H256,
-    ) -> Option<BlockContextWithOffset> {
+    fn clear(&self, presist_block_num: u64, presist_block_hash: H256) {
         let mut blocks = self.hash_to_blockctx.lock().unwrap();
-        let presist_block = blocks.remove(&presist_block_hash);
+        blocks.remove(&presist_block_hash);
         blocks.retain(|_, block| block.block_info.header.number >= presist_block_num);
+    }
 
-        presist_block
+    /// Apply a block, first making sure that it connects to the tree.
+    ///
+    /// The by-number index can name a block of an abandoned branch: its fork
+    /// mark is written by another service and can be missing. Such a block
+    /// connects, and so may its successors, until the first block of the
+    /// canonical branch arrives and finds its parent absent. The blocks
+    /// between that block and the tree are then read by hash, which names
+    /// exactly one block, and applied oldest first: the tree takes them as a
+    /// reorg, and the abandoned blocks stay a side branch that is never
+    /// committed.
+    async fn update_block_connected(
+        &self,
+        block_info: BlockInfo,
+        block_diff: BlockStorageDiff,
+    ) -> Result<()> {
+        let mut missing = Vec::new();
+        let mut parent_hash = block_info.header.parent_hash;
+        // A block the tree has is taken again without its parent, which may
+        // have left the tree since.
+        while !self.tree.has_block(block_info.header.hash) && !self.tree.has_block(parent_hash) {
+            // Deeper than the tree, the abandoned branch is in the database:
+            // that takes a rewind, not a reorg.
+            anyhow::ensure!(
+                missing.len() < self.max_diff_depth,
+                "block {} {} does not connect to the state tree within {} blocks",
+                block_info.header.number,
+                block_info.header.hash,
+                self.max_diff_depth
+            );
+            let ancestor = s3_get_block_info_and_diff_by_hash(
+                &self.s3_client,
+                &self.kafka_s3_cfg.bucket_name,
+                &self.kafka_s3_cfg.s3_chain_id,
+                &self.kafka_s3_cfg.version,
+                self.state_diff_key,
+                parent_hash,
+            )
+            .await
+            .with_context(|| format!("read the missing ancestor {parent_hash}"))?;
+            parent_hash = ancestor.0.header.parent_hash;
+            missing.push(ancestor);
+        }
+        if !missing.is_empty() {
+            warn!(target:"updater", "block {} {} did not connect to the tree: applying {} ancestors read by hash, from block {}",
+                block_info.header.number, block_info.header.hash, missing.len(), missing.last().unwrap().0.header.number);
+        }
+        for (ancestor_info, ancestor_diff) in missing.into_iter().rev() {
+            info!(target:"updater", "update from s3 by hash, block number {}, hash {}, parent hash {}", ancestor_info.header.number, ancestor_info.header.hash, ancestor_info.header.parent_hash);
+            self.tree.update_block(ancestor_info, ancestor_diff)?;
+        }
+        self.tree.update_block(block_info, block_diff)?;
+        Ok(())
     }
 
     async fn prepare_update(&self, messages: &[impl Message]) -> Result<Vec<KafkaBlockContext>> {
@@ -329,7 +376,6 @@ where
                 let block_ctx_with_offset = BlockContextWithOffset {
                     block_diff,
                     block_info,
-                    offset,
                 };
 
                 block_contexts.push((new_block.hash, block_ctx_with_offset));
@@ -377,7 +423,7 @@ where
             match res {
                 Ok((block_info, block_diff)) => {
                     info!(target:"updater", "update block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
-                    self.tree.update_block(block_info.clone(), block_diff)?;
+                    self.update_block_connected(block_info, block_diff).await?;
                 }
                 Err(e) => {
                     error!(target: "etl", "Join error: {}", e);
@@ -414,8 +460,7 @@ where
                 self.bundle_range_size_mib,
                 |block_info, block_diff| async move {
                     info!(target:"updater", "update bundle block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
-                    self.tree.update_block(block_info, block_diff)?;
-                    Ok(())
+                    self.update_block_connected(block_info, block_diff).await
                 },
             )
             .await?;
@@ -456,7 +501,7 @@ where
                 )
                 .await?;
             info!(target:"updater", "update first per-block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
-            self.tree.update_block(block_info, block_diff)?;
+            self.update_block_connected(block_info, block_diff).await?;
             if next_block_number == end_block_number {
                 return Ok(());
             }
@@ -561,33 +606,13 @@ where
                 }
             }
         }
-        // A reorg deeper than the buffer would leave the by-number hand-off
-        // block on a stale branch: the oldest backfilled block then links to a
-        // parent that isn't in the tree, and update_block would fail with an
-        // opaque ParentBlockHashNotFound. Detect it here and report the real
-        // cause (and the fix) instead. The chain anchor is the oldest block's
-        // parent_hash, so no extra S3 read is needed.
-        if let Some((oldest, _)) = backfill.last() {
-            let tree_anchor_hash = self
-                .tree
-                .state_at(BlockId::Number(BlockNumberOrTag::Number(by_number_target)))?
-                .map(|s| s.block_info())
-                .transpose()?
-                .map(|b| b.header.hash);
-            if tree_anchor_hash != Some(oldest.header.parent_hash) {
-                return Err(anyhow::anyhow!(
-                    "S3 catch-up hand-off mismatch at block {}: by-number anchor {:?} != Kafka chain parent {}; \
-                     reorg is deeper than --catchup-safe-depth ({}), increase it",
-                    by_number_target,
-                    tree_anchor_hash,
-                    oldest.header.parent_hash,
-                    depth
-                ));
-            }
-        }
+        // A reorg deeper than the buffer leaves the by-number hand-off block
+        // on an abandoned branch: the oldest backfilled block then links to a
+        // parent that is not in the tree, and the walk goes on below the
+        // buffer (see `update_block_connected`).
         for (block_info, block_diff) in backfill.into_iter().rev() {
             info!(target:"updater", "update from s3 by hash, block number {}, hash {}, parent hash {}", block_info.header.number, block_info.header.hash, block_info.header.parent_hash);
-            self.tree.update_block(block_info, block_diff)?;
+            self.update_block_connected(block_info, block_diff).await?;
         }
         Ok(())
     }
@@ -609,23 +634,19 @@ where
             let new_accounts_num = block_storage_diff.new_accounts.len();
             let deleted_accounts_num = block_storage_diff.deleted_accounts.len();
             let new_codes_num = block_storage_diff.new_codes.len();
-            self.tree.update_block(block_info, block_storage_diff)?;
+            self.update_block_connected(block_info, block_storage_diff)
+                .await?;
             info!(target:"updater", "update block hash {}, block num {}, new accounts num {}, deleted accounts num {}, new codes num {}",
                                         block_hash, block_num, new_accounts_num, deleted_accounts_num, new_codes_num);
         }
-        self.commit_offset()
+        self.forget_committed()
     }
 
-    fn commit_offset(&self) -> Result<()> {
+    /// Drop the contexts of the blocks the database has taken over.
+    fn forget_committed(&self) -> Result<()> {
         let presist_block = self.tree.last_committed_block()?.unwrap();
-        let presist_block_num = presist_block.header.number;
-        let presist_block_hash = presist_block.header.hash;
-        // clear block context before presist block
-        let presist_block = self.clear(presist_block_num, presist_block_hash);
-        if let Some(presist_block) = presist_block {
-            debug!(target:"updater", "clear block hash {}, block num {}", presist_block.block_info.header.hash, presist_block.block_info.header.number);
-            write_offset(&self.kafka_s3_cfg.offset_dir, presist_block.offset + 1)?;
-        }
+        debug!(target:"updater", "clear up to block hash {}, block num {}", presist_block.header.hash, presist_block.header.number);
+        self.clear(presist_block.header.number, presist_block.header.hash);
         Ok(())
     }
 
@@ -641,9 +662,14 @@ where
         return Ok((low, high - 1));
     }
 
+    /// Start at the end of the Kafka stream: the blocks between the
+    /// database's head and the first message come from S3 (see
+    /// [`Self::update_from_s3`]). No offset is kept between runs. The head a
+    /// node opens on is not always the block it last took from Kafka (a
+    /// rewind, a schema v4 archive that lost its memtable, a snapshot), and
+    /// an offset that does not follow the head fails every update.
     async fn init_offset(&mut self) {
-        let offset = read_offset(&self.kafka_s3_cfg.offset_dir).ok();
-        let (lowest_offset, latest_offset) = loop {
+        let (_, latest_offset) = loop {
             match self.get_offset().await {
                 Ok(v) => break v,
                 Err(e) => {
@@ -652,36 +678,10 @@ where
                 }
             }
         };
-        match offset {
-            Some(offset)
-                if offset >= lowest_offset && !self.kafka_s3_cfg.bundle_bucket_name.is_empty() =>
-            {
-                // A still-valid Kafka offset can nevertheless point at source
-                // objects already removed by the compactor. With bundle
-                // storage enabled, catch up from the latest notification via
-                // bundle/block reads first, then resume live Kafka updates.
-                info!(target: "updater", "kafka offset {} is valid, but bundle storage is enabled; catching up from bundle/block storage", offset);
-                self.read_from_kafka = false;
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
-            }
-            Some(offset) if offset >= lowest_offset => {
-                self.set_offset(offset).expect("Failed to set offset");
-                info!(target: "updater", "kafka updater start with offset {}", offset);
-            }
-            Some(offset) => {
-                info!(target: "updater", "offset {} is smaller than lowest offset {}, will read from s3/rpc", offset, lowest_offset);
-                self.read_from_kafka = false;
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
-            }
-            None => {
-                info!(target: "updater", "kafka updater start with no offset, will read from s3/rpc");
-                self.read_from_kafka = false;
-                self.set_offset(latest_offset)
-                    .expect("Failed to set latest offset");
-            }
-        }
+        info!(target: "updater", "kafka updater starts at offset {latest_offset}, catching up from s3/rpc");
+        self.read_from_kafka = false;
+        self.set_offset(latest_offset)
+            .expect("Failed to set latest offset");
     }
 
     /// Whether the node has caught up with the chain head after applying
@@ -784,7 +784,7 @@ where
                             loop {
                                 if let Err(e) = self.update_from_kafka(&msgs).await {
                                     error!(target:"updater", "Failed to update: {:?}", e);
-                                    self.commit_offset().expect("Failed to commit offset");
+                                    self.forget_committed().expect("Failed to clear committed blocks");
                                     time::sleep(time::Duration::from_secs(1)).await
                                 } else {
                                     break;
@@ -811,6 +811,7 @@ mod tests {
     use flate2::{write::GzEncoder, Compression};
     use rdkafka::message::{OwnedMessage, Timestamp};
     use std::io::Write;
+    use std::sync::Arc;
 
     struct UnusedTree;
     impl EvmStorageRead for UnusedTree {
@@ -925,7 +926,6 @@ mod tests {
                     contexts[&block.hash].block_diff.deleted_accounts.len(),
                     block.block_number as usize
                 );
-                assert_eq!(contexts[&block.hash].offset, 42);
             }
         }
         updater.hash_to_blockctx.lock().unwrap().clear();
@@ -941,6 +941,165 @@ mod tests {
             .unwrap()
             .iter()
             .all(|(key, _)| !key.contains(&H256::ZERO.to_string())));
+        server.abort();
+    }
+
+    /// A tree that only knows which blocks it has: enough for the order
+    /// blocks are applied in.
+    #[derive(Default)]
+    struct ChainTree {
+        blocks: Mutex<Vec<H256>>,
+    }
+    impl EvmStorageRead for ChainTree {
+        type Error = std::io::Error;
+        type StateDB = leafage_evm_storage::StateDBWrapper<leafage_evm_storage::MDBXStateDB>;
+        fn state_at(&self, _: BlockId) -> std::result::Result<Option<Self::StateDB>, Self::Error> {
+            panic!("applying a block must not read the database");
+        }
+    }
+    impl EvmStorageWrite for ChainTree {
+        type Error = std::io::Error;
+        fn update_block(
+            &self,
+            block: BlockInfo,
+            _: BlockStorageDiff,
+        ) -> std::result::Result<(), Self::Error> {
+            let mut blocks = self.blocks.lock().unwrap();
+            if blocks.contains(&block.header.hash) {
+                return Ok(());
+            }
+            if !blocks.contains(&block.header.parent_hash) {
+                return Err(std::io::Error::other("parent block hash not found"));
+            }
+            blocks.push(block.header.hash);
+            Ok(())
+        }
+        fn last_committed_block(&self) -> std::result::Result<Option<BlockInfo>, Self::Error> {
+            panic!("applying a block must not read the database");
+        }
+        fn has_block(&self, hash: H256) -> bool {
+            self.blocks.lock().unwrap().contains(&hash)
+        }
+    }
+
+    fn block(number: u64, hash: u8, parent: u8) -> BlockInfo {
+        let mut block = BlockInfo::default();
+        block.header.number = number;
+        block.header.hash = H256::from([hash; 32]);
+        block.header.parent_hash = H256::from([parent; 32]);
+        block
+    }
+
+    /// An updater over `tree` whose S3 holds `blocks` under their hashes.
+    async fn chain_updater(
+        tree: ChainTree,
+        blocks: &[BlockInfo],
+        max_diff_depth: usize,
+    ) -> (
+        Updater<ChainTree>,
+        Arc<Mutex<Vec<(String, Option<String>)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut objects = HashMap::new();
+        for block in blocks {
+            objects.insert(format!("56/v1/{}/block", block.header.hash), gzip(block));
+            objects.insert(
+                format!("56/v1/{}/stateDiff", block.header.hash),
+                alloy_rlp::encode(BlockStorageDiff::default()),
+            );
+        }
+        let state = MockS3::with_objects(objects);
+        let requests = state.requests.clone();
+        let (client, server) = mock_client(state).await;
+        let updater = Updater {
+            rpc_client: None,
+            kafka_s3_cfg: KafkaS3Config {
+                s3_chain_id: "56".into(),
+                version: "v1".into(),
+                bucket_name: "source".into(),
+                ..Default::default()
+            },
+            state_diff_key: StateDiffKey::BlockHash,
+            consumer: ClientConfig::new()
+                .set("group.id", "connect-test")
+                .create()
+                .unwrap(),
+            s3_client: client,
+            tree,
+            max_diff_depth,
+            hash_to_blockctx: Mutex::new(HashMap::new()),
+            read_from_kafka: true,
+            init_task_queue_size: 2,
+            catchup_safe_depth: 0,
+            bundle_range_size_mib: 32,
+            read_from_bundle: AtomicBool::new(false),
+            catchup_max_lag: Duration::from_secs(10),
+        };
+        (updater, requests, server)
+    }
+
+    /// The by-number index named two blocks of an abandoned branch (11 and
+    /// 12 below): the canonical block after them brings its branch along.
+    #[tokio::test]
+    async fn a_block_whose_parent_is_missing_brings_its_ancestors_by_hash() {
+        let tree = ChainTree::default();
+        // 380, then the abandoned 381 and 382.
+        *tree.blocks.lock().unwrap() = vec![
+            H256::from([10; 32]),
+            H256::from([11; 32]),
+            H256::from([12; 32]),
+        ];
+        let (c381, c382, c383) = (block(381, 21, 10), block(382, 22, 21), block(383, 23, 22));
+        let (updater, requests, server) =
+            chain_updater(tree, &[c381.clone(), c382.clone()], 8).await;
+
+        updater
+            .update_block_connected(c383.clone(), BlockStorageDiff::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            updater.tree.blocks.lock().unwrap()[3..],
+            [c381.header.hash, c382.header.hash, c383.header.hash]
+        );
+
+        // A block that connects reads nothing, and neither does one the tree
+        // has, whatever became of its parent.
+        requests.lock().unwrap().clear();
+        updater
+            .update_block_connected(block(384, 24, 23), BlockStorageDiff::default())
+            .await
+            .unwrap();
+        updater
+            .update_block_connected(block(380, 10, 9), BlockStorageDiff::default())
+            .await
+            .unwrap();
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(updater.tree.blocks.lock().unwrap().len(), 7);
+        server.abort();
+    }
+
+    /// A branch that leaves the tree below its depth is not followed: the
+    /// blocks it abandons are in the database.
+    #[tokio::test]
+    async fn ancestors_are_followed_no_deeper_than_the_tree() {
+        let tree = ChainTree::default();
+        *tree.blocks.lock().unwrap() = vec![H256::from([10; 32])];
+        let chain = [block(381, 21, 10), block(382, 22, 21), block(383, 23, 22)];
+        let (updater, _, server) = chain_updater(tree, &chain, 2).await;
+
+        let err = updater
+            .update_block_connected(block(384, 24, 23), BlockStorageDiff::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not connect"), "{err}");
+        assert_eq!(updater.tree.blocks.lock().unwrap().len(), 1);
+
+        // Within the depth it is.
+        updater
+            .update_block_connected(chain[2].clone(), BlockStorageDiff::default())
+            .await
+            .unwrap();
+        assert_eq!(updater.tree.blocks.lock().unwrap().len(), 4);
         server.abort();
     }
 

@@ -1,5 +1,14 @@
 # Archive rewind
 
+> The updater no longer keeps a Kafka offset between runs
+> (`docs/StateUpdater.md`, "Start position"): every start catches up from
+> S3. The offset file this document mentions is one left by an earlier
+> version; rewind still removes it, so that a downgraded node does not
+> resume from it. A schema v4 archive is rewound by writing the files that
+> reach above the target again without what comes after it
+> (`docs/ArchiveSchemaV4.md`, "Rewind").
+
+
 `rewind --archive` **deletes future archive state and block indexes in place** by
 default. Stop every database user before running it:
 

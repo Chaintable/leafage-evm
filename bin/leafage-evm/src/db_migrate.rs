@@ -1,7 +1,7 @@
 use anyhow::{bail, Ok, Result};
 use clap::Parser;
 use leafage_evm_storage::{
-    read_offset, write_offset, ArchiveRocksDBStorage, DBSource, StorageKind,
+    ArchiveRocksDBStorage, DBSource, StorageKind,
 };
 use std::path::PathBuf;
 /// `leafage-evm migrate` command
@@ -102,12 +102,6 @@ impl Command {
                 self.reencode_jobs,
                 self.reencode_buffer_mb,
             )?;
-            // Carry the resync offset over, same as the normal migration.
-            let offset =
-                read_offset(&format!("{}/offset", self.src.to_str().unwrap())).unwrap_or_default();
-            if offset != 0 {
-                write_offset(&format!("{}/offset", self.dst.to_str().unwrap()), offset)?;
-            }
             return Ok(());
         }
 
@@ -123,11 +117,6 @@ impl Command {
             self.dst_kind,
             self.cache_size,
         )?;
-        let offset =
-            read_offset(&format!("{}/offset", self.src.to_str().unwrap())).unwrap_or_default();
-        if offset != 0 {
-            write_offset(&format!("{}/offset", self.dst.to_str().unwrap()), offset)?;
-        }
         db_source.migrate()?;
         Ok(())
     }
