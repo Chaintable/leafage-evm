@@ -7,6 +7,7 @@ mod bundle;
 mod compact;
 mod db_migrate;
 mod force_compact;
+mod import_postgres;
 mod initializer;
 mod pipeline_export;
 mod put_code;
