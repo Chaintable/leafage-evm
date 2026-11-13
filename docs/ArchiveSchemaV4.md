@@ -159,7 +159,8 @@ The file ends with a CRC32.
 
 - The **base** is a list of files per kind in key order, each holding every
   version of its key range up to a block `hi` of its own. A file is closed
-  at the first key boundary past 8 GiB, so a key's versions are in one file.
+  at the first key boundary past `ARCHIVE_V4_BASE_FILE_MB` (2 GiB), so a
+  key's versions are in one file.
 - A **segment** holds every version of a run of blocks, one file per kind,
   with a blocked bloom filter of its keys in memory (10 bits per key). A
   segment whose blocks every base file of its kind holds is deleted.
@@ -325,7 +326,7 @@ for one.
 
 When the delta exceeds `ARCHIVE_V4_DELTA_PERCENT` (4 %) of the base and
 `ARCHIVE_V4_DELTA_MIN_MB`, or its filters take more than
-`ARCHIVE_V4_DELTA_FILTER_MB` (512), a background thread folds it into the
+`ARCHIVE_V4_DELTA_FILTER_MB` (1024), a background thread folds it into the
 base, one base file at a time: it merges the file with the versions of its
 key range from every segment above the file's block, writes new files, and
 swaps them in. Pages no new version falls into are copied as stored: they
@@ -334,9 +335,8 @@ again (the new file keeps the old one's dictionary). The file furthest
 behind goes first, of either kind. A segment is removed when every base
 file of its kind holds it: in a first pass at the end of the kind's files,
 until when its versions are on disk twice. A pass so needs free space for
-the delta once more and for one base file: about 35 GiB on bsc at the
-default limits, 55 with `ARCHIVE_V4_DELTA_FILTER_MB=1024`, returned when
-the pass ends.
+the delta once more and for one base file: about 50 GiB on bsc at the
+default limits, returned when the pass ends.
 
 A pass records the block it folds up to in the manifest when it starts
 (`pass <kind> <block>`). A node that stops during a pass loses the file
@@ -366,27 +366,37 @@ it goes. On bsc `ARCHIVE_V4_REWRITE_MBPS=1.2` with
 day at 0.6 MB/s all the time, instead of the whole base in a day every
 two weeks; the delta is then a round's worth at all times (50 – 70 GiB,
 so `ARCHIVE_V4_DELTA_FILTER_MB=1536` for its filters), the merges share
-the rate, and a base file of 8 GiB takes four hours, which a node that
-restarts loses: write the archive with `ARCHIVE_V4_BASE_FILE_MB=2048` for
-this. These figures follow from the code; no node has run this way yet.
+the rate, and a base file of 2 GiB takes an hour, which a node that
+restarts loses (four hours for a file of 8 GiB, the default until the
+2 GiB archive under Results was measured). These figures follow from the
+code; no node has run this way yet.
 
 A pass writes the whole base again, so the rewrite costs `base / delta`
 bytes written per byte of history, against 4.7 for the segments. On bsc
 (a block every 0.45 s, about 800 versions each: 1.9 GiB of history a day)
-the filter limit is reached first: the delta's filters take about 20 MiB
-per GiB of delta (measured on a node following the chain: 332 MiB for
-15.8 GB; on the prototype 993 MiB for 52 GiB), so 512 MiB stands for a
-delta of about 26 GiB, 2.2 % of the base and two weeks of blocks. That is
-46 bytes written per byte of history, about 90 GiB a day on average, all of
-it in the day of a pass. The rewrite is an estimate from these
-settings: no node has run long enough to start one by itself. A production
-v3 replica writes 58 – 75 GiB a day to its volume (CloudWatch, November
-2026).
+the two limits are reached together: the delta's filters take about
+20 MiB per GiB of delta (measured on a node following the chain: 332 MiB
+for 15.8 GB; on the prototype 993 MiB for 52 GiB), so 1024 MiB stands for
+a delta of about 51 GiB, and 4 % of the base is 48 GiB: 25 days of blocks.
+That is 25 bytes written per byte of history, about 48 GiB a day on
+average, all of it in the day of a pass; with the segments and flushes
+about 57 GiB a day. The rewrite is an estimate from these settings: no
+node has run long enough to start one by itself. A production v3 replica
+writes 58 – 75 GiB a day to its volume (CloudWatch, November 2026).
 
-To rewrite less often, raise `ARCHIVE_V4_DELTA_FILTER_MB` (and
-`ARCHIVE_V4_DELTA_PERCENT` beyond 4): 1024 lets the delta reach 4 %, 2048
-about 8 %. The filter limit is reserved from the budget when the store
-opens, so each step takes that much from the page cache.
+| `ARCHIVE_V4_DELTA_FILTER_MB` / `_PERCENT` | Delta at a pass | A pass every | Rewritten per day, averaged |
+|---|---|---|---|
+| 512 / 4 (the default until the results below) | 26 GiB | 13.5 days | 90 GiB |
+| 1024 / 4 | 48 GiB | 25 days | 48 GiB |
+| 1536 / 6 | 72 GiB | 38 days | 32 GiB |
+| 2048 / 8 | 96 GiB | 50 days | 24 GiB |
+
+Each step saves less than the one before and keeps a larger delta, which
+lookups pay for in filters to probe: the nodes under Results had a delta
+of 18 GiB at most. The filter limit is reserved from `--db-cache` when the
+store opens, so each step takes 512 MiB from the store's page cache
+(4.6 GiB of 8192 MiB on bsc at the default) unless `--db-cache` is raised
+by as much.
 
 A bulk load (`archive-init`) runs the same store with the rewrite
 unthrottled and only when the delta is half of the base, and folds
@@ -498,9 +508,9 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 | `ARCHIVE_V4_FLUSH_MB` / `ARCHIVE_V4_FLUSH_BLOCKS` | 512 / 4800 | memtable size and age at which it becomes a segment |
 | `ARCHIVE_V4_TIERS` | 8 | segments of a level merged into one |
 | `ARCHIVE_V4_DELTA_PERCENT` / `ARCHIVE_V4_DELTA_MIN_MB` | 4 / 4096 | delta size, relative to the base and absolute, that starts a base rewrite |
-| `ARCHIVE_V4_DELTA_FILTER_MB` | 512 | segment filter memory that starts one |
+| `ARCHIVE_V4_DELTA_FILTER_MB` | 1024 | segment filter memory that starts one; reserved from `--db-cache` |
 | `ARCHIVE_V4_REWRITE_MBPS` | 32 | device IO of segment merges and base rewrites together, read plus written (0: no limit); about 1.2 for even writes on bsc ("Base rewrite") |
-| `ARCHIVE_V4_BASE_FILE_MB` | 8192 | size at which a base file is closed |
+| `ARCHIVE_V4_BASE_FILE_MB` | 2048 | size at which a base file is closed: what a rewrite that is interrupted loses, and the free space a pass needs beside the delta. A larger file of an older archive is cut when a pass rewrites it |
 | `ARCHIVE_V4_BASE_ZSTD_LEVEL` | 3 | zstd level of base files (15 – 19: about 3 % smaller, 5 – 10 times slower to write) |
 | `ARCHIVE_V4_BLOCK_CACHE_MB` | 64 | memory for decoded chunks of block infos |
 
@@ -561,6 +571,27 @@ archive 1292 GiB (−25.7 %).
 `archive-v4 verify` read 40,000 random keys at 1,080,000 heights and 40,000
 absent keys in 13 min: no difference from v3.
 
+That conversion wrote base files of 8 GiB, the default then. With
+`ARCHIVE_V4_BASE_FILE_MB=2048`, the default now, from the v3 archive at
+block 133,112,708 (final build):
+
+| | 8 GiB files | 2 GiB files |
+|---|---|---|
+| Versions, account + storage | 32.67 G + 72.81 G | 32.99 G + 73.69 G |
+| Base files | 200 | 646 (1.87 GiB on average, the largest 2.94) |
+| Account and storage history | 1193 GiB, 12.1 bytes per version | 1206 GiB, 12.1 bytes per version |
+| Index in memory | 1.89 GiB | 2.21 GiB |
+| Open, cold | 21 s | 20 s |
+| Conversion | 4 h 25 min | 5 h 26 min |
+| Memory of the conversion's container, at most | 18.8 GiB | 56 GiB of a limit of 64 |
+
+The verification with slots inside large contracts (12,636 of the 40,000
+keys) found no difference in 14 min. The index is a sixth larger, taken
+from `--db-cache`: the store's page cache is 5.08 GiB instead of 5.40 of
+8192 MiB (with 512 MiB reserved for segment filters, the default then). Why the second conversion took an hour and three times the
+memory more was not looked into; the container's figure counts page cache
+in use, and the two ran different builds on a source two days apart.
+
 ### Block infos and code against RocksDB
 
 The same 132,964,228 block infos and 5,621,228 codes, in v3's column
@@ -618,10 +649,10 @@ v3's writes come in bursts of compaction: the three hours before these
 wrote 84 GiB a day, the 6.6 hours together 71, which is what the
 production replicas write. v4 flushed five times (one segment per kind and
 36 minutes, 2 – 4 M versions in 2 – 4 s) and merged eight segments into one
-once. No base rewrite ran, and none is due for two weeks; averaged over
-its period it adds the 90 GiB a day estimated under *Base rewrite*, or 48
-with `ARCHIVE_V4_DELTA_FILTER_MB=1024` (a pass every 25 days, when the
-delta is 4 % of the base), in the day of each pass.
+once. No base rewrite ran, and none is due for 25 days (two weeks at the
+filter limit of 512 MiB these nodes ran with); averaged over its period it
+adds the 48 GiB a day estimated under *Base rewrite*, in the day of each
+pass.
 
 ### Lookups alone
 
@@ -760,6 +791,63 @@ device reads are as many as with `O_DIRECT` and a fifth fewer bytes.
 Against v3 (0.376 ms, p99 17.3 ms, 0.280 reads per request) the final
 build is at −19 % CPU, −50 % p99 and −56 % device reads.
 
-Not measured here: a base rewrite on a serving node (covered by tests and
-by the store-level runs of the study), and more than ten minutes of
-traffic.
+### The final build, and base files of 2 GiB
+
+The same run at 4500 requests/s on the final build (rewind to any block,
+paced merges, the updater that follows parent hashes), twice on the archive
+with 8 GiB base files and twice on the one converted with 2 GiB files, the
+node at the head with 11 – 22 segments:
+
+| | 8 GiB files | 2 GiB files |
+|---|---|---|
+| CPU ms / request | 0.273, 0.283 | 0.280, 0.273 |
+| Latency p50 / p90 ms | 0.31 / 0.64, 0.32 / 0.64 | 0.31 / 0.61, 0.30 / 0.60 |
+| Latency p99 / p99.9 ms | 3.50 / 17.9, 3.39 / 16.8 | 2.59 / 14.7, 2.45 / 14.8 |
+| Device reads / request | 0.122 | 0.123 |
+| Read from the device | 4.4 GiB | 4.4 GiB |
+| Pages the store read / request | 0.330 | 0.340 |
+| Memory: process + page cache | 10.1 + 19.3 GiB | 10.1 + 19.4 GiB |
+| Cold start, requests/s on 16 connections | 15,300, 15,300 | 11,500, 15,400 |
+
+The size of the base files does not show. The first cold start on the
+2 GiB archive came right after the node had caught up 73,000 blocks from
+the conversion's head, eleven segments in two minutes and their merges;
+the second is the node as the others were. Each archive's node answered
+200,000 of the captured requests (1,036,115 calls) as the v3 node beside it
+did.
+
+**The p99 of the runs before these is not the nodes' alone.** The bench
+host runs another workload that takes two cores or more for 75 – 100 s
+about every 12.5 minutes. In those windows requests wait three to ten times
+as long for a CPU: the p99 of a 30 s window goes from 2 – 3 ms to 7 – 25 ms
+and CPU per request up by 10 – 30 %. A run of 785 s meets one or none, so a
+p99 over a whole run (17.3 ms for v3, 8.7 ms and 3.4 ms for v4 builds
+above) says as much about where the stretch fell as about the build. CPU
+per request and device reads per request are moved little by it, and the
+comparisons with v3 stand on those; v3 was not run again on the final
+build.
+
+**A base rewrite under this load**, forced on the 8 GiB archive by lowering
+its threshold, at the default 32 MB/s: in 17 minutes it rewrote four
+account base files of about 3.5 GiB, 250 – 280 s each, with new versions in
+about 95 % of their pages. In the windows without the other workload:
+
+| | no rewrite | rewriting |
+|---|---|---|
+| Latency p50 ms | 0.32 | 0.31 – 0.33 |
+| Latency p99 ms | 2.0 – 3.3 | 2.3 – 4.0 |
+| Cores used by the node | 1.27 | about 0.55 more, the rewrite thread |
+| Account / storage lookup, mean | 8.4 / 49.7 µs | 9.9 / 50.4 µs |
+| Device reads / request | 0.122 | 0.138 |
+
+CPU per request served is unchanged. A cold start during the rewrite took
+13,500 requests/s. In the windows with the other workload, giving the
+rewrite thread the idle scheduling class or a core of its own changed
+nothing: what requests wait for there is not the rewrite.
+
+**Rewind** on this archive: 3000 blocks back, to a block inside a segment,
+took 8 s and rewrote 4 files of 0.13 GiB together.
+
+Not measured here: a rewrite pass to its end on a serving node (no node has
+run long enough to start one by itself; covered by tests and by the
+store-level runs of the study), and more than ten minutes of traffic.

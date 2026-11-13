@@ -19,7 +19,7 @@ pub struct Command {
 enum Action {
     /// Rewrite a v3 archive as schema v4 into a new directory. The source
     /// is opened read-only. `ARCHIVE_V4_BASE_ZSTD_LEVEL` (default 3) and
-    /// `ARCHIVE_V4_BASE_FILE_MB` (default 8192) shape the files written.
+    /// `ARCHIVE_V4_BASE_FILE_MB` (default 2048) shape the files written.
     Convert {
         /// The v3 archive database.
         #[arg(long, value_name = "PATH")]
