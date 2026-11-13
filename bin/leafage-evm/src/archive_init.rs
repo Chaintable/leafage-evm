@@ -1,4 +1,4 @@
-use crate::bundle::{bundle_end, s3_read_bundle, BundleReadArgs};
+use crate::bundle::{bundle_end, bundle_id, s3_read_bundle, s3_read_header_bundle, BundleReadArgs};
 use crate::utils::{
     s3_get_block_info_and_diff_by_number, s3_get_block_info_and_diff_by_number_for_genesis,
     s3_get_block_info_and_diff_by_number_with_parent_state_root, StateDiffKey,
@@ -67,9 +67,11 @@ pub struct Command {
     #[arg(long, value_name = "PATH")]
     db_path: PathBuf,
 
-    /// The RPC address for fetching block info
+    /// The RPC address for fetching block info. Optional: without it the
+    /// per-block path resolves block hashes through the S3 number index, and
+    /// `--headers-only` needs it only for the blocks past the last bundle.
     #[arg(long, value_name = "URL")]
-    rpc_addr: String,
+    rpc_addr: Option<String>,
 
     /// S3 bucket name for block diff
     #[arg(long)]
@@ -102,6 +104,24 @@ pub struct Command {
     /// End block number (inclusive)
     #[arg(long)]
     end_block: u64,
+
+    /// Refetch block infos only (no state diff reads, no account/storage
+    /// writes) for `--start-block..=--end-block` and rewrite them in the
+    /// archive. The resume pointer is left untouched. Use it to repair
+    /// headers that were archived from a node whose `eth_getBlockByNumber`
+    /// reports a zero `gasUsed`.
+    #[arg(long, default_value = "false")]
+    headers_only: bool,
+
+    /// First block for `--headers-only` (default: 0).
+    #[arg(long, default_value_t = 0)]
+    start_block: u64,
+
+    /// With `--headers-only`, write block infos for blocks above the archive
+    /// head. Refused by default: a block the archive has not synced yet must
+    /// not appear to exist.
+    #[arg(long, default_value = "false")]
+    allow_ahead: bool,
 
     /// Storage type (rocksdb or mdbx)
     #[arg(long, default_value = "rocksdb")]
@@ -882,8 +902,8 @@ impl Command {
     pub async fn run(&mut self) -> Result<()> {
         let state_diff_key = StateDiffKey::resolve(self.state_diff_key, &self.s3_chain_id);
         info!(target: "archive_init", %state_diff_key, "Starting archive initialization");
-        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {}, end_block: {}, max_tasks: {}, db_type: {:?}, inverted_block_encoding: {}",
-              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type, self.inverted_block_encoding);
+        info!(target: "archive_init", "db_path: {:?}, rpc_addr: {:?}, end_block: {}, max_tasks: {}, db_type: {:?}, inverted_block_encoding: {}, headers_only: {}",
+              self.db_path, self.rpc_addr, self.end_block, self.max_tasks, self.db_type, self.inverted_block_encoding, self.headers_only);
 
         // Fix the versioned-key encoding before any key is encoded (fetchers
         // call encode_account_key / encode_storage_key off the writer thread).
@@ -908,8 +928,12 @@ impl Command {
             .await;
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
-        // Initialize RPC client
-        let rpc_client = HttpClientBuilder::default().build(&self.rpc_addr)?;
+        // Initialize RPC client (optional: bundles and the S3 number index
+        // need none)
+        let rpc_client = match self.rpc_addr.as_deref() {
+            Some(addr) => Some(HttpClientBuilder::default().build(addr)?),
+            None => None,
+        };
 
         if matches!(self.db_type, StorageKind::Rocksdb) {
             crate::archive_udt::prepare_archive_schema(
@@ -970,6 +994,10 @@ impl Command {
                 .map_err(|e| anyhow::anyhow!("failed to write encoding marker: {e}"))?;
         }
 
+        if self.headers_only {
+            return self.refresh_headers(&db, s3_client, rpc_client).await;
+        }
+
         // Determine start block (support resume)
         let (start_block, parent_state_root) = self.get_start_block(&db)?;
 
@@ -985,7 +1013,7 @@ impl Command {
         let overall_start = Instant::now();
 
         // Capture variables for the fetcher async block
-        let rpc_client = Some(rpc_client);
+        let rpc_client = rpc_client;
         let bucket = self.s3_bucket.clone();
         let bundle_bucket = self.s3_bundle_bucket.clone();
         let bundle_range_size_mib = self.bundle_read.bundle_range_size_mib;
@@ -1318,6 +1346,209 @@ impl Command {
         }
 
         Ok(())
+    }
+
+    /// Rewrite block infos in `--start-block..=--end-block`, leaving state and
+    /// the resume pointer alone.
+    ///
+    /// Every body field the archive serves comes from the stored `BlockInfo`,
+    /// so a header archived from a node that reports a zero `gasUsed` keeps
+    /// answering zero until it is refetched from a source that carries the
+    /// real value. `--s3-bundle-bucket` holds a whole chain's headers as
+    /// ~1000-block gzip objects (`232/b8becb11/{bundle}/block`), which is
+    /// minutes of reads instead of one RPC call per block; `--rpc-addr` covers
+    /// the blocks past the last bundle.
+    async fn refresh_headers(
+        &self,
+        db: &Arc<ArchiveStorage>,
+        s3_client: Client,
+        rpc_client: Option<HttpClient>,
+    ) -> Result<()> {
+        if self.start_block > self.end_block {
+            anyhow::bail!(
+                "--start-block ({}) must not be greater than --end-block ({})",
+                self.start_block,
+                self.end_block
+            );
+        }
+        let head = db
+            .read_block_info(db.read_latest_block_hash()?)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the archive has no head block yet; run a normal archive-init first"
+                )
+            })?;
+        let head_number = head.header.number;
+        if self.end_block > head_number {
+            if !self.allow_ahead {
+                anyhow::bail!(
+                    "--end-block ({}) is above the archive head ({}); a block the archive has \
+                     not synced must not appear to exist. Pass --allow-ahead to override",
+                    self.end_block,
+                    head_number
+                );
+            }
+            warn!(target: "archive_init",
+                "writing block infos above the archive head ({head_number}) up to {}", self.end_block);
+        }
+
+        let total = self.end_block - self.start_block + 1;
+        info!(target: "archive_init",
+            "Refreshing block infos {}..={} ({total} blocks); header bundles: {:?}, rpc: {:?}",
+            self.start_block, self.end_block, self.s3_bundle_bucket, self.rpc_addr);
+        let started = Instant::now();
+        let mut written = 0u64;
+        let mut next = self.start_block;
+
+        // 1. Compacted header bundles: one gzip object per 1000 blocks.
+        if !self.s3_bundle_bucket.is_empty() {
+            while next <= self.end_block {
+                let id = bundle_id(next);
+                let Some(headers) = s3_read_header_bundle(
+                    &s3_client,
+                    &self.s3_bundle_bucket,
+                    &self.s3_chain_id,
+                    &self.s3_version,
+                    id,
+                )
+                .await?
+                else {
+                    info!(target: "archive_init",
+                        "Header bundle {id} is missing; switching to per-block reads from block {next}");
+                    break;
+                };
+
+                let bundle_last = bundle_end(next).min(self.end_block);
+                let mut batch = db.prepare_write_batch()?;
+                let mut last = next.saturating_sub(1);
+                for info in headers {
+                    let number = info.header.number;
+                    if number < next || number > bundle_last {
+                        continue;
+                    }
+                    // A bundle that disagrees with the archive about a block's
+                    // hash is a different chain; never overwrite in that case.
+                    if let Some(stored) = Self::stored_hash(db, number)? {
+                        if stored != info.header.hash {
+                            anyhow::bail!(
+                                "header bundle {id} block {number} has hash {:#x}, the archive \
+                                 holds {stored:#x}; refusing to rewrite",
+                                info.header.hash
+                            );
+                        }
+                    }
+                    db.write_block_hash(&mut batch, number, info.header.hash)?;
+                    db.write_block_info(&mut batch, info)?;
+                    last = number;
+                    written += 1;
+                }
+                db.commit_sync(batch)?;
+
+                let elapsed = started.elapsed().as_secs_f64();
+                info!(target: "archive_init",
+                    "Refreshed block infos through {last} (bundle {id}) | {written}/{total} ({:.0} blk/s)",
+                    written as f64 / elapsed.max(f64::EPSILON));
+                if last < next {
+                    info!(target: "archive_init",
+                        "Header bundle {id} holds no blocks in {next}..={bundle_last}; stopping the bundle pass");
+                    break;
+                }
+                next = last + 1;
+            }
+        }
+
+        // 2. Past the last bundle: block info from the RPC, one block at a time.
+        if next <= self.end_block {
+            let rpc = rpc_client.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "blocks {next}..={} are past the last header bundle; pass --rpc-addr to fetch them",
+                    self.end_block
+                )
+            })?;
+            while next <= self.end_block {
+                let chunk_to = (next + self.checkpoint_interval.max(1) - 1).min(self.end_block);
+                // Keep the fan-out modest: this hits one RPC.
+                let concurrency = self.max_tasks.clamp(1, 32);
+                let infos = stream::iter(next..=chunk_to)
+                    .map(|number| {
+                        let rpc = rpc.clone();
+                        let s3 = s3_client.clone();
+                        let bucket = self.s3_bucket.clone();
+                        let outer_bucket = self.s3_outer_bucket.clone();
+                        let chain_id = self.s3_chain_id.clone();
+                        let version = self.s3_version.clone();
+                        async move {
+                            // Block info only: no stateDiff object is read.
+                            let mut last_error = String::new();
+                            for attempt in 1..=MAX_RETRIES {
+                                match crate::utils::s3_get_block_info_by_number(
+                                    &Some(rpc.clone()),
+                                    &s3,
+                                    &bucket,
+                                    &outer_bucket,
+                                    &chain_id,
+                                    &version,
+                                    number,
+                                )
+                                .await
+                                {
+                                    Ok(info) => return Ok(info),
+                                    Err(e) => {
+                                        last_error = e.to_string();
+                                        if attempt < MAX_RETRIES {
+                                            sleep(RETRY_DELAY).await;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(anyhow::anyhow!(
+                                "Block {number} header fetch failed after {MAX_RETRIES} attempts: {last_error}"
+                            ))
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let mut batch = db.prepare_write_batch()?;
+                for info in infos {
+                    let number = info.header.number;
+                    if let Some(stored) = Self::stored_hash(db, number)? {
+                        if stored != info.header.hash {
+                            anyhow::bail!(
+                                "block {number} has hash {:#x} from the RPC, the archive holds \
+                                 {stored:#x}; refusing to rewrite",
+                                info.header.hash
+                            );
+                        }
+                    }
+                    db.write_block_hash(&mut batch, number, info.header.hash)?;
+                    db.write_block_info(&mut batch, info)?;
+                    written += 1;
+                }
+                db.commit_sync(batch)?;
+
+                let elapsed = started.elapsed().as_secs_f64();
+                info!(target: "archive_init",
+                    "Refreshed block infos {next}..={chunk_to} | {written}/{total} ({:.0} blk/s)",
+                    written as f64 / elapsed.max(f64::EPSILON));
+                next = chunk_to + 1;
+            }
+        }
+
+        info!(target: "archive_init",
+            "Refreshed {written} block infos in {:.1}s. State and the resume pointer were not touched.",
+            started.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Hash the archive already has for `block_num`, if any.
+    fn stored_hash(db: &Arc<ArchiveStorage>, block_num: u64) -> Result<Option<H256>> {
+        let hash = match db.as_ref() {
+            ArchiveStorage::RocksDB(rdb) => rdb.read_block_hash(block_num)?,
+            ArchiveStorage::MDBX(mdbx) => mdbx.read_block_hash(block_num)?,
+        };
+        Ok((hash != H256::ZERO).then_some(hash))
     }
 
     /// Get the start block number, checking for existing data to support resume

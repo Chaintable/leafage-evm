@@ -314,7 +314,7 @@ async fn read_s3_object(s3_client: &Client, bucket_name: &str, key: &str) -> Res
     unreachable!("the finite object read loop always returns")
 }
 
-fn bundle_id(block_number: u64) -> u64 {
+pub(crate) fn bundle_id(block_number: u64) -> u64 {
     if block_number == 0 {
         0
     } else {
@@ -336,6 +336,46 @@ fn bundle_key(s3_chain_id: &str, version: &str, bundle_id: u64, resource: &str) 
     } else {
         format!("{s3_chain_id}/{version}/{bundle_id}/{resource}")
     }
+}
+
+/// Read one bundle's Header object on its own.
+///
+/// [`s3_read_bundle`] gates on the StateDiff bundle: it returns `None` before
+/// touching the headers when a chain has header bundles but no StateDiff
+/// bundles (Lens). Callers that only need headers — rewriting archived block
+/// infos from compacted headers — use this instead.
+///
+/// `Ok(None)` means the Header bundle object does not exist, i.e. the bundle
+/// range covered by this bucket has ended.
+pub(crate) async fn s3_read_header_bundle(
+    s3_client: &Client,
+    bucket_name: &str,
+    s3_chain_id: &str,
+    version: &str,
+    bundle_id: u64,
+) -> Result<Option<Vec<BlockInfo>>> {
+    let key = bundle_key(s3_chain_id, version, bundle_id, "block");
+    let object = match s3_client
+        .get_object()
+        .bucket(bucket_name)
+        .key(&key)
+        .send()
+        .await
+    {
+        Ok(object) => object,
+        Err(error) if is_not_found(&error) => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("get Header bundle s3://{bucket_name}/{key}"))
+        }
+    };
+    let bytes = object
+        .body
+        .collect()
+        .await
+        .with_context(|| format!("read Header bundle body s3://{bucket_name}/{key}"))?
+        .into_bytes();
+    Ok(Some(decode_bundle_headers(bundle_id, &bytes)?))
 }
 
 fn is_not_found(error: &SdkError<GetObjectError>) -> bool {
