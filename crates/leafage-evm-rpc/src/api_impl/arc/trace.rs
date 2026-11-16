@@ -99,7 +99,8 @@ impl ArcSubcallTraceSidecar {
             };
             node.trace.output = completion.child_output;
             node.trace.gas_used = completion.child_gas_used;
-            node.trace.gas_limit = completion.child_gas_limit;
+            // Match Arc Writer's trace_child_call budget. The actual execution budget
+            // includes account access costs and must not replace this trace field.
             node.trace.success = effective_status.is_ok();
             node.trace.status = Some(effective_status);
         }
@@ -186,8 +187,20 @@ mod tests {
     }
 
     #[test]
-    fn raw_child_fields_and_failure_priority_are_applied_for_both_phases() {
+    fn child_outcome_preserves_writer_trace_budget_for_both_phases() {
         for (child_status, final_status, phase, expected_status) in [
+            (
+                InstructionResult::Return,
+                InstructionResult::Return,
+                ArcSubcallTraceCompletionPhase::BeforeFrameEnd,
+                InstructionResult::Return,
+            ),
+            (
+                InstructionResult::Return,
+                InstructionResult::Return,
+                ArcSubcallTraceCompletionPhase::AfterFrameEnd,
+                InstructionResult::Return,
+            ),
             (
                 InstructionResult::Revert,
                 InstructionResult::Return,
@@ -216,8 +229,8 @@ mod tests {
             let trace = &inspector.traces().nodes()[0].trace;
             assert_eq!(trace.output.as_ref(), b"raw-child");
             assert_eq!(trace.gas_used, 17);
-            assert_eq!(trace.gas_limit, 23);
-            assert!(!trace.success);
+            assert_eq!(trace.gas_limit, 202);
+            assert_eq!(trace.success, expected_status.is_ok());
             assert_eq!(trace.status, Some(expected_status));
         }
     }
