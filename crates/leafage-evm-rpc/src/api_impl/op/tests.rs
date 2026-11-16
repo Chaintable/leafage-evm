@@ -421,8 +421,9 @@ fn op_mainnet_calls_run_the_block_fork() {
 
 /// Other chains with a built-in schedule follow it too: on Soneium (1868) and Unichain
 /// (130) CLZ halts on the last pre-Karst block and runs on the Karst block. Cyber (7560)
-/// and Fraxtal (252) have not reached Karst, so CLZ still halts at their head. A chain
-/// without a schedule keeps the configured spec (Karst) at the same height.
+/// and Fraxtal (252) have not reached Karst, so CLZ still halts at their head. Mode
+/// (34443), BOB (60808) and World Chain (480) each switch at their own Karst block. A
+/// chain without a schedule keeps the configured spec (Karst) at the same height.
 #[test]
 fn scheduled_op_stack_chains_run_the_block_fork() {
     let api_for = |chain_id: u64| -> ApiImpl<(), OpSpecId, NoneEvmCustomConfig> {
@@ -464,6 +465,12 @@ fn scheduled_op_stack_chains_run_the_block_fork() {
     let uni_karst = at(52_778_042, 1_783_526_401);
     let cyber_head = at(40_686_578, 1_794_801_723);
     let fraxtal_head = at(43_995_519, 1_794_801_749);
+    let mode_pre_karst = at(41_679_408, 1_783_526_399);
+    let mode_karst = at(41_679_409, 1_783_526_401);
+    let bob_pre_karst = at(38_658_606, 1_790_179_199);
+    let bob_karst = at(38_658_607, 1_790_179_201);
+    let world_pre_karst = at(35_328_180, 1_789_991_999);
+    let world_karst = at(35_328_181, 1_789_992_001);
     for inspect in [false, true] {
         for (chain_id, block, runs) in [
             (1868, &pre_karst, false),
@@ -472,7 +479,13 @@ fn scheduled_op_stack_chains_run_the_block_fork() {
             (130, &uni_karst, true),
             (7560, &cyber_head, false),
             (252, &fraxtal_head, false),
-            (480, &pre_karst, true),
+            (34443, &mode_pre_karst, false),
+            (34443, &mode_karst, true),
+            (60808, &bob_pre_karst, false),
+            (60808, &bob_karst, true),
+            (480, &world_pre_karst, false),
+            (480, &world_karst, true),
+            (5000, &pre_karst, true),
         ] {
             let api = api_for(chain_id);
             let req = CallRequest {
