@@ -177,7 +177,9 @@ impl<DB> ApiCore for OpApiImpl<DB> where DB: Sync + Send + 'static {}
 mod tests {
     use super::*;
     use leafage_evm_chains::op::mainnet::OP_MAINNET_CHAIN_ID;
-    use leafage_evm_chains::op::schedule::{SONEIUM_CHAIN_ID, UNICHAIN_CHAIN_ID};
+    use leafage_evm_chains::op::schedule::{
+        CYBER_CHAIN_ID, FRAXTAL_CHAIN_ID, SONEIUM_CHAIN_ID, UNICHAIN_CHAIN_ID,
+    };
     use leafage_evm_types::U256;
 
     fn block(number: u64, timestamp: u64) -> BlockEnv {
@@ -269,6 +271,37 @@ mod tests {
             assert_eq!(actual.spec, spec);
             assert_eq!(actual.gas_params, CfgEnv::new_with_spec(spec).gas_params);
         }
+    }
+
+    /// Cyber and Fraxtal have not reached Karst: their head runs an older fork, and
+    /// the EIP-7825 estimate cap does not apply there.
+    #[test]
+    fn chains_behind_karst_run_their_own_head_fork() {
+        let head = block(40_686_578, 1_794_801_723);
+        for (chain_id, spec) in [
+            (CYBER_CHAIN_ID, OpSpecId::HOLOCENE),
+            (FRAXTAL_CHAIN_ID, OpSpecId::ISTHMUS),
+        ] {
+            let mut cfg = op_mainnet_cfg();
+            cfg.chain_id = chain_id;
+            let actual = block_cfg(&cfg, &head);
+            assert_eq!(actual.spec, spec, "chain {chain_id}");
+            assert_eq!(actual.gas_params, CfgEnv::new_with_spec(spec).gas_params);
+            assert_eq!(
+                api(cfg).consensus_tx_gas_limit_cap(SpecId::OSAKA, &head),
+                u64::MAX,
+                "chain {chain_id}"
+            );
+        }
+        // Fraxtal before Ecotone runs Canyon.
+        let mut cfg = op_mainnet_cfg();
+        cfg.chain_id = FRAXTAL_CHAIN_ID;
+        let canyon = block_cfg(&cfg, &block(5_099_244, 1_717_009_199));
+        assert_eq!(canyon.spec, OpSpecId::CANYON);
+        assert_eq!(
+            canyon.gas_params,
+            CfgEnv::new_with_spec(OpSpecId::CANYON).gas_params
+        );
     }
 
     #[test]
