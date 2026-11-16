@@ -224,7 +224,8 @@ impl DebugInspector {
             index: tx_context.as_ref().and_then(|c| c.tx_index.map(|i| i as u64)),
             block_hash: tx_context.as_ref().and_then(|c| c.block_hash),
             block_number: Some(block_env.number().saturating_to()),
-            base_fee: Some(block_env.basefee()),
+            // The trace builders do not consume this optional Alloy metadata field.
+            base_fee: block_env.basefee().try_into().ok(),
             ..Default::default()
         };
 

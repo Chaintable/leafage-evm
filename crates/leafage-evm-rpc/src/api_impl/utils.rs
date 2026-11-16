@@ -78,7 +78,7 @@ pub fn apply_block_overrides<DB>(
     db: &mut CacheDB<DB>,
     env: &mut BlockEnv,
     mut latest_header: Header,
-) -> Option<Header> {
+) -> RpcResult<Option<Header>> {
     let mut header = None;
 
     if let Some(number) = overrides.number {
@@ -135,10 +135,12 @@ pub fn apply_block_overrides<DB>(
         env.prevrandao = Some(random);
     }
     if let Some(base_fee) = base_fee {
-        env.basefee = base_fee.saturating_to();
+        env.basefee = base_fee
+            .try_into()
+            .map_err(|_| invalid_params_rpc_err("baseFeePerGas exceeds u128"))?;
     }
 
-    header
+    Ok(header)
 }
 
 /// Applies the given state overrides (a set of [`AccountOverride`]) to the [`CacheDB`].

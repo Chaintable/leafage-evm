@@ -157,6 +157,14 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 | `--historical-rpc` | - | Historical RPC endpoint for pre-fork queries (e.g., OP pre-bedrock) |
 | `--historical-height` | - | Fork height threshold for historical RPC forwarding |
 
+For Cosmos chains, configure additional native precompile addresses with:
+
+```bash
+--evm-type=cosmos --evm-custom-config='{"unsupported_precompiles":["0x0000000000000000000000000000000000001000","0x0000000000000000000000000000000000001003"]}'
+```
+
+The list defaults to empty and adds to the built-in unsupported addresses and the existing `native_token` option. Direct and nested calls to these addresses return `-39008` (`UnsupportedPrecompile`) so a gateway configured for native fallback can retry the request. Leafage itself does not forward these calls. The list applies at all block heights; the native endpoint must support the requested historical state.
+
 For Celo L2 mainnet, use `--evm-type=celo --chain-cfg=42220`. Execution selects Granite / Isthmus / Jovian at the requested block and includes the CELO native transfer precompile (`0xfd`) and the 64 KiB code limit. This mode reuses OP fee handling; Celo-specific fee distribution, `feeCurrency` / CIP-64 and Celo L1 execution are not yet supported. Fixed-fork overrides are not accepted.
 
 ### Kafka + S3 Configuration

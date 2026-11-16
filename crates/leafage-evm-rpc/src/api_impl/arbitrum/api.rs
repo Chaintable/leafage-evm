@@ -137,7 +137,7 @@ impl<DB> ArbitrumApiImpl<DB> {
         // Nitro lowers the basefee to 0 only for unpriced messages
         // (`internal/ethapi/api.go` doCall); priced simulations keep the real
         // basefee so the BASEFEE / GASPRICE opcodes observe it.
-        if tx.effective_gas_price(block_env.basefee as u128) == 0 {
+        if tx.effective_gas_price(block_env.basefee) == 0 {
             evm_block_env.basefee = 0;
         }
         evm_block_env.difficulty = U256::ONE;

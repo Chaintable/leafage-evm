@@ -411,7 +411,7 @@ where
             evm.inner
                 .ctx
                 .tx()
-                .effective_gas_price(evm.inner.ctx.block().basefee() as u128),
+                .effective_gas_price(evm.inner.ctx.block().basefee()),
         ),
         tx_origin: evm.inner.ctx.tx().caller(),
         reentrant: reentrant as u32,

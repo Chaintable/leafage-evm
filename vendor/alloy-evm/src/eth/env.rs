@@ -89,7 +89,7 @@ impl EvmEnv<SpecId> {
             difficulty: if is_merge_active { U256::ZERO } else { input.difficulty },
             prevrandao: if is_merge_active { input.mix_hash } else { None },
             gas_limit: input.gas_limit,
-            basefee: input.base_fee_per_gas,
+            basefee: input.base_fee_per_gas.into(),
             blob_excess_gas_and_price,
             slot_num: input.slot_number.unwrap_or_default(),
         };

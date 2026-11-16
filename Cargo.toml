@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rocksdb = { git = "https://github.com/rust-rocksdb/rust-rocksdb", rev = "a4f178d0ca668c4b48d993ab8aef6f4004780f23", features = ["jemalloc"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 thiserror = "1.0"
 async-trait = "0.1"
 anyhow = "1.0"
@@ -152,7 +152,7 @@ rstest = "0.26.1"
 opt-level = 3
 debug = true
 
-# Pinned execution dependencies for the Stable development branch.
+# Stable's base fee exceeds u64; keep the existing execution machinery.
 [patch.crates-io]
 revm-context = { path = "vendor/revm-context" }
 revm-context-interface = { path = "vendor/revm-context-interface" }

@@ -154,7 +154,11 @@ where
                 block_hash: Some(block.header.hash),
                 block_number: Some(block.header.number),
                 block_timestamp: Some(block.header.timestamp),
-                base_fee: block.header.base_fee_per_gas,
+                // Trace metadata only; execution uses the full-width BlockEnv fee.
+                base_fee: block
+                    .header
+                    .base_fee_per_gas
+                    .and_then(|fee| fee.try_into().ok()),
             };
             tx_index += 1;
             if let Some(last_res) = pre_results.last() {

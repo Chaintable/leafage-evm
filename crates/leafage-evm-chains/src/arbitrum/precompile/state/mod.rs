@@ -189,7 +189,7 @@ impl<'a, DB: Database> ArbStorage<'a, ArbitrumContext<DB>> {
             .unwrap_or_default()
     }
 
-    pub(in crate::arbitrum::precompile) fn current_l2_basefee(&self) -> u64 {
+    pub(in crate::arbitrum::precompile) fn current_l2_basefee(&self) -> u128 {
         self.context
             .chain()
             .current_l2_basefee()
@@ -570,7 +570,7 @@ mod tests {
     use revm::state::AccountInfo;
     use revm::{Context, MainContext};
 
-    fn context_without_loaded_account(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
+    fn context_without_loaded_account(basefee: u128) -> ArbitrumContext<CacheDB<EmptyDB>> {
         Context::mainnet()
             .with_tx(ArbitrumTxEnv::default())
             .with_block(BlockEnv {
@@ -582,7 +582,7 @@ mod tests {
             .with_chain(ArbitrumExecutionContext::default())
     }
 
-    fn context(basefee: u64) -> ArbitrumContext<CacheDB<EmptyDB>> {
+    fn context(basefee: u128) -> ArbitrumContext<CacheDB<EmptyDB>> {
         let mut context = context_without_loaded_account(basefee);
         context
             .journal_mut()
