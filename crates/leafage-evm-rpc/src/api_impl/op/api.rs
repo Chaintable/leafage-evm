@@ -178,7 +178,8 @@ mod tests {
     use super::*;
     use leafage_evm_chains::op::mainnet::OP_MAINNET_CHAIN_ID;
     use leafage_evm_chains::op::schedule::{
-        CYBER_CHAIN_ID, FRAXTAL_CHAIN_ID, SONEIUM_CHAIN_ID, UNICHAIN_CHAIN_ID,
+        BOB_CHAIN_ID, CYBER_CHAIN_ID, FRAXTAL_CHAIN_ID, MODE_CHAIN_ID, SONEIUM_CHAIN_ID,
+        UNICHAIN_CHAIN_ID, WORLD_CHAIN_ID,
     };
     use leafage_evm_types::U256;
 
@@ -301,6 +302,63 @@ mod tests {
         assert_eq!(
             canyon.gas_params,
             CfgEnv::new_with_spec(OpSpecId::CANYON).gas_params
+        );
+    }
+
+    /// Mode follows OP Mainnet's timestamps; BOB and World Chain reached Jovian and
+    /// Karst later, and the EIP-7825 estimate cap starts with each chain's own Karst.
+    #[test]
+    fn mode_bob_world_follow_their_own_forks() {
+        let cap = revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+        for (timestamp, expected) in [
+            // After OP Mainnet's Jovian, before BOB's and World Chain's.
+            (
+                1_770_000_001,
+                [
+                    (MODE_CHAIN_ID, OpSpecId::JOVIAN, u64::MAX),
+                    (BOB_CHAIN_ID, OpSpecId::ISTHMUS, u64::MAX),
+                    (WORLD_CHAIN_ID, OpSpecId::ISTHMUS, u64::MAX),
+                ],
+            ),
+            // After OP Mainnet's Karst, before World Chain's (09-21) and BOB's (09-23).
+            (
+                1_785_000_001,
+                [
+                    (MODE_CHAIN_ID, OpSpecId::KARST, cap),
+                    (BOB_CHAIN_ID, OpSpecId::JOVIAN, u64::MAX),
+                    (WORLD_CHAIN_ID, OpSpecId::JOVIAN, u64::MAX),
+                ],
+            ),
+            // World Chain is on Karst, BOB two days short of it.
+            (
+                1_790_000_001,
+                [
+                    (MODE_CHAIN_ID, OpSpecId::KARST, cap),
+                    (BOB_CHAIN_ID, OpSpecId::JOVIAN, u64::MAX),
+                    (WORLD_CHAIN_ID, OpSpecId::KARST, cap),
+                ],
+            ),
+        ] {
+            let block_env = block(30_000_000, timestamp);
+            for (chain_id, spec, estimate_cap) in expected {
+                let mut cfg = op_mainnet_cfg();
+                cfg.chain_id = chain_id;
+                let actual = block_cfg(&cfg, &block_env);
+                assert_eq!(actual.spec, spec, "chain {chain_id} at {timestamp}");
+                assert_eq!(actual.gas_params, CfgEnv::new_with_spec(spec).gas_params);
+                assert_eq!(
+                    api(cfg).consensus_tx_gas_limit_cap(SpecId::OSAKA, &block_env),
+                    estimate_cap,
+                    "chain {chain_id} at {timestamp}"
+                );
+            }
+        }
+        // Mode starts on Regolith.
+        let mut cfg = op_mainnet_cfg();
+        cfg.chain_id = MODE_CHAIN_ID;
+        assert_eq!(
+            block_cfg(&cfg, &block(2_412_408, 1_704_992_399)).spec,
+            OpSpecId::REGOLITH
         );
     }
 
