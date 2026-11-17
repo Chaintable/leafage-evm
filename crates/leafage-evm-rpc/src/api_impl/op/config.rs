@@ -22,8 +22,8 @@ struct OpCustomConfig {
 ///
 /// `op_spec_id` is an OP fork name (e.g. "Jovian"); omitted keeps Karst (Osaka rules).
 /// On a chain with a built-in fork schedule (OP Mainnet, Soneium, Unichain, Cyber, Fraxtal,
-/// Mode, BOB, World Chain; see `leafage_evm_chains::op::schedule`) each call runs the fork
-/// of its block instead.
+/// Mode, BOB, World Chain, Manta Pacific, Katana; see `leafage_evm_chains::op::schedule`)
+/// each call runs the fork of its block instead.
 /// Without an initcode override, revm uses 2 * code size, matching geth.
 pub fn build_op_custom_config(json: Option<&str>) -> Result<CfgEnv<OpSpecId>> {
     let json = json.unwrap_or("{}");

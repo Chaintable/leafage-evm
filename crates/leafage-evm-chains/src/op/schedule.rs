@@ -4,8 +4,9 @@
 //! times. A chain listed here executes each call under the fork of its block; a
 //! chain that is not listed keeps the configured spec.
 //!
-//! Timestamps come from the superchain-registry (`superchain/configs/mainnet`)
-//! and each chain's boundaries were checked against its public RPC.
+//! Timestamps come from the superchain-registry (`superchain/configs/mainnet`), or
+//! from the chain's own node configuration where a schedule says so, and each
+//! chain's boundaries were checked against its public RPC.
 //!
 //! A schedule ends at the chain's latest activated fork. When a chain schedules a
 //! new fork, add it here before it activates: until then its calls keep running
@@ -26,6 +27,8 @@ pub const FRAXTAL_CHAIN_ID: u64 = 252;
 pub const MODE_CHAIN_ID: u64 = 34443;
 pub const BOB_CHAIN_ID: u64 = 60808;
 pub const WORLD_CHAIN_ID: u64 = 480;
+pub const MANTA_CHAIN_ID: u64 = 169;
+pub const KATANA_CHAIN_ID: u64 = 747474;
 
 /// A chain that started after Bedrock: `genesis` rules from block 0, then each
 /// `(activation timestamp, fork)` in ascending order.
@@ -136,6 +139,35 @@ const WORLD: TimestampSchedule = TimestampSchedule {
     ],
 };
 
+/// Manta Pacific: Regolith at genesis (2023-09-09). Canyon, Delta and Ecotone
+/// activated together (2024-09-19); Fjord, Granite, Holocene and Isthmus followed two
+/// hours apart on 2026-09-16. Isthmus is its latest fork: no Jovian or Karst yet.
+/// Manta is not in the superchain-registry; the times are the `--override.*` values
+/// its op-node runs with.
+const MANTA: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::REGOLITH,
+    forks: &[
+        (1_726_783_200, OpSpecId::ECOTONE),
+        (1_789_560_000, OpSpecId::FJORD),
+        (1_789_567_200, OpSpecId::GRANITE),
+        (1_789_574_400, OpSpecId::HOLOCENE),
+        (1_789_581_600, OpSpecId::ISTHMUS),
+    ],
+};
+
+/// Katana: Canyon..Holocene at genesis (2025-05-08). Isthmus is at OP Mainnet's
+/// timestamp; Jovian (2026-03-09) and Karst (2026-09-23) are Katana's own. Katana is
+/// not in the superchain-registry; the times are its `rollup.json` and the
+/// `--override.*` values its op-node runs with.
+const KATANA: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::HOLOCENE,
+    forks: &[
+        (OP_MAINNET_ISTHMUS_TIMESTAMP, OpSpecId::ISTHMUS),
+        (1_773_066_601, OpSpecId::JOVIAN),
+        (1_790_179_201, OpSpecId::KARST),
+    ],
+};
+
 /// The fork active on `chain_id` at `(block_number, timestamp)`, or `None` for a
 /// chain without a built-in schedule.
 pub fn op_stack_spec_at(chain_id: u64, block_number: u64, timestamp: u64) -> Option<OpSpecId> {
@@ -148,6 +180,8 @@ pub fn op_stack_spec_at(chain_id: u64, block_number: u64, timestamp: u64) -> Opt
         MODE_CHAIN_ID => Some(MODE.spec_at(timestamp)),
         BOB_CHAIN_ID => Some(BOB.spec_at(timestamp)),
         WORLD_CHAIN_ID => Some(WORLD.spec_at(timestamp)),
+        MANTA_CHAIN_ID => Some(MANTA.spec_at(timestamp)),
+        KATANA_CHAIN_ID => Some(KATANA.spec_at(timestamp)),
         _ => None,
     }
 }
@@ -177,6 +211,8 @@ mod tests {
         assert_boundaries(&MODE);
         assert_boundaries(&BOB);
         assert_boundaries(&WORLD);
+        assert_boundaries(&MANTA);
+        assert_boundaries(&KATANA);
     }
 
     /// Real boundary blocks (number, header timestamp) from each chain.
@@ -430,6 +466,47 @@ mod tests {
             (BOB_CHAIN_ID, &bob[..]),
             (WORLD_CHAIN_ID, &world[..]),
         ] {
+            for &(block, timestamp, spec) in blocks {
+                assert_eq!(
+                    op_stack_spec_at(chain_id, block, timestamp),
+                    Some(spec),
+                    "chain {chain_id} block {block}"
+                );
+            }
+        }
+    }
+
+    /// Real boundary blocks of Manta Pacific (10s blocks) and Katana (1s blocks): the
+    /// last block before each fork and its first block.
+    #[test]
+    fn manta_katana_boundary_blocks() {
+        use OpSpecId::*;
+        let manta = [
+            (1, 1_694_223_969, REGOLITH),
+            (3_255_924, 1_726_783_199, REGOLITH),
+            // Canyon, Delta and Ecotone in one block.
+            (3_255_925, 1_726_783_209, ECOTONE),
+            (9_533_604, 1_789_559_999, ECOTONE),
+            (9_533_605, 1_789_560_009, FJORD),
+            (9_534_324, 1_789_567_199, FJORD),
+            (9_534_325, 1_789_567_209, GRANITE),
+            (9_535_044, 1_789_574_399, GRANITE),
+            (9_535_045, 1_789_574_409, HOLOCENE),
+            (9_535_764, 1_789_581_599, HOLOCENE),
+            (9_535_765, 1_789_581_609, ISTHMUS),
+            // 2026-11-16, after OP Mainnet's Karst: Manta is still on Isthmus.
+            (10_059_354, 1_794_817_499, ISTHMUS),
+        ];
+        let katana = [
+            (1, 1_746_742_812, HOLOCENE),
+            (63_589, 1_746_806_400, HOLOCENE),
+            (63_590, 1_746_806_401, ISTHMUS),
+            (26_323_789, 1_773_066_600, ISTHMUS),
+            (26_323_790, 1_773_066_601, JOVIAN),
+            (43_436_389, 1_790_179_200, JOVIAN),
+            (43_436_390, 1_790_179_201, KARST),
+        ];
+        for (chain_id, blocks) in [(MANTA_CHAIN_ID, &manta[..]), (KATANA_CHAIN_ID, &katana[..])] {
             for &(block, timestamp, spec) in blocks {
                 assert_eq!(
                     op_stack_spec_at(chain_id, block, timestamp),

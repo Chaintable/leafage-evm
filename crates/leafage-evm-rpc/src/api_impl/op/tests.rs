@@ -422,7 +422,8 @@ fn op_mainnet_calls_run_the_block_fork() {
 /// Other chains with a built-in schedule follow it too: on Soneium (1868) and Unichain
 /// (130) CLZ halts on the last pre-Karst block and runs on the Karst block. Cyber (7560)
 /// and Fraxtal (252) have not reached Karst, so CLZ still halts at their head. Mode
-/// (34443), BOB (60808) and World Chain (480) each switch at their own Karst block. A
+/// (34443), BOB (60808), World Chain (480) and Katana (747474) each switch at their own
+/// Karst block. Manta Pacific (169) stops at Isthmus, so CLZ still halts at its head. A
 /// chain without a schedule keeps the configured spec (Karst) at the same height.
 #[test]
 fn scheduled_op_stack_chains_run_the_block_fork() {
@@ -471,6 +472,9 @@ fn scheduled_op_stack_chains_run_the_block_fork() {
     let bob_karst = at(38_658_607, 1_790_179_201);
     let world_pre_karst = at(35_328_180, 1_789_991_999);
     let world_karst = at(35_328_181, 1_789_992_001);
+    let manta_head = at(10_059_354, 1_794_817_499);
+    let katana_pre_karst = at(43_436_389, 1_790_179_200);
+    let katana_karst = at(43_436_390, 1_790_179_201);
     for inspect in [false, true] {
         for (chain_id, block, runs) in [
             (1868, &pre_karst, false),
@@ -485,6 +489,9 @@ fn scheduled_op_stack_chains_run_the_block_fork() {
             (60808, &bob_karst, true),
             (480, &world_pre_karst, false),
             (480, &world_karst, true),
+            (169, &manta_head, false),
+            (747474, &katana_pre_karst, false),
+            (747474, &katana_karst, true),
             (5000, &pre_karst, true),
         ] {
             let api = api_for(chain_id);

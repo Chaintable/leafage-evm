@@ -178,8 +178,8 @@ mod tests {
     use super::*;
     use leafage_evm_chains::op::mainnet::OP_MAINNET_CHAIN_ID;
     use leafage_evm_chains::op::schedule::{
-        BOB_CHAIN_ID, CYBER_CHAIN_ID, FRAXTAL_CHAIN_ID, MODE_CHAIN_ID, SONEIUM_CHAIN_ID,
-        UNICHAIN_CHAIN_ID, WORLD_CHAIN_ID,
+        BOB_CHAIN_ID, CYBER_CHAIN_ID, FRAXTAL_CHAIN_ID, KATANA_CHAIN_ID, MANTA_CHAIN_ID,
+        MODE_CHAIN_ID, SONEIUM_CHAIN_ID, UNICHAIN_CHAIN_ID, WORLD_CHAIN_ID,
     };
     use leafage_evm_types::U256;
 
@@ -360,6 +360,81 @@ mod tests {
             block_cfg(&cfg, &block(2_412_408, 1_704_992_399)).spec,
             OpSpecId::REGOLITH
         );
+    }
+
+    /// Manta Pacific stops at Isthmus, so its head has no EIP-7825 estimate cap; Katana
+    /// reaches Jovian and Karst at its own times.
+    #[test]
+    fn manta_katana_follow_their_own_forks() {
+        let cap = revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+        for (chain_id, block_env, spec, estimate_cap) in [
+            (
+                MANTA_CHAIN_ID,
+                block(3_255_924, 1_726_783_199),
+                OpSpecId::REGOLITH,
+                u64::MAX,
+            ),
+            (
+                MANTA_CHAIN_ID,
+                block(3_255_925, 1_726_783_209),
+                OpSpecId::ECOTONE,
+                u64::MAX,
+            ),
+            (
+                MANTA_CHAIN_ID,
+                block(9_535_765, 1_789_581_609),
+                OpSpecId::ISTHMUS,
+                u64::MAX,
+            ),
+            // 2026-11-16, after OP Mainnet's Karst.
+            (
+                MANTA_CHAIN_ID,
+                block(10_059_354, 1_794_817_499),
+                OpSpecId::ISTHMUS,
+                u64::MAX,
+            ),
+            (
+                KATANA_CHAIN_ID,
+                block(1, 1_746_742_812),
+                OpSpecId::HOLOCENE,
+                u64::MAX,
+            ),
+            (
+                KATANA_CHAIN_ID,
+                block(26_323_790, 1_773_066_601),
+                OpSpecId::JOVIAN,
+                u64::MAX,
+            ),
+            // After OP Mainnet's Karst, before Katana's.
+            (
+                KATANA_CHAIN_ID,
+                block(43_436_389, 1_790_179_200),
+                OpSpecId::JOVIAN,
+                u64::MAX,
+            ),
+            (
+                KATANA_CHAIN_ID,
+                block(43_436_390, 1_790_179_201),
+                OpSpecId::KARST,
+                cap,
+            ),
+        ] {
+            let mut cfg = op_mainnet_cfg();
+            cfg.chain_id = chain_id;
+            let actual = block_cfg(&cfg, &block_env);
+            assert_eq!(
+                actual.spec, spec,
+                "chain {chain_id} block {}",
+                block_env.number
+            );
+            assert_eq!(actual.gas_params, CfgEnv::new_with_spec(spec).gas_params);
+            assert_eq!(
+                api(cfg).consensus_tx_gas_limit_cap(SpecId::OSAKA, &block_env),
+                estimate_cap,
+                "chain {chain_id} block {}",
+                block_env.number
+            );
+        }
     }
 
     #[test]
