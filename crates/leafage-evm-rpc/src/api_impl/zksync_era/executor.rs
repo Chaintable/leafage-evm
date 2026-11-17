@@ -354,6 +354,15 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
     let fair_l2_gas_price = base_fee;
     let fair_pubdata_price = gas_per_pubdata_byte * fair_l2_gas_price;
 
+    // The MediumInterop bootloader takes the settlement layer from the fee
+    // params; the simulate path reads it from SystemContext slot 273.
+    let settlement_layer: u64 = db
+        .storage_ref(sys_ctx, AlloyU256::from(273))
+        .unwrap_or_default()
+        .try_into()
+        .unwrap_or(0);
+    let settlement_layer = if settlement_layer > 0 { settlement_layer } else { 1 };
+
     let (sim_block_number, sim_block_timestamp, prev_block_hash) = {
         let slot9 = db.storage_ref(sys_ctx, AlloyU256::from(9)).unwrap_or_default();
         let s9_bytes = slot9.to_be_bytes::<32>();
@@ -464,6 +473,7 @@ pub fn estimate_era_gas<DB: DatabaseRef>(
         env,
         gas_per_pubdata_byte,
         acceptable_overestimation,
+        settlement_layer,
         cancel_token,
     );
 

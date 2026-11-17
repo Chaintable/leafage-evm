@@ -15,6 +15,7 @@ pub struct GasEstimator<'a, DB> {
     env: BootloaderEnv,
     gas_per_pubdata_byte: u64,
     acceptable_overestimation: u64,
+    settlement_layer: u64,
     cancel_token: CancellationToken,
 }
 
@@ -25,6 +26,7 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
         env: BootloaderEnv,
         gas_per_pubdata_byte: u64,
         acceptable_overestimation: u64,
+        settlement_layer: u64,
         cancel_token: CancellationToken,
     ) -> Self {
         Self {
@@ -33,6 +35,7 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
             env,
             gas_per_pubdata_byte,
             acceptable_overestimation,
+            settlement_layer,
             cancel_token,
         }
     }
@@ -45,8 +48,14 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
         let mut tx = self.tx.clone();
         tx.gas_limit = U256::from(forced_gas_limit);
 
-        execute_bootloader(self.db, &tx, &self.env, forced_gas_limit)
-            .map_err(|e| format!("Bootloader execution error: {:?}", e))
+        execute_bootloader(
+            self.db,
+            &tx,
+            &self.env,
+            forced_gas_limit,
+            self.settlement_layer,
+        )
+        .map_err(|e| format!("Bootloader execution error: {:?}", e))
     }
 
     pub fn step(&self, tx_gas_limit: u64) -> Result<BootloaderExecutionOutput, String> {
@@ -61,7 +70,10 @@ impl<'a, DB: DatabaseRef> GasEstimator<'a, DB> {
         match &initial_output.result {
             ExecutionResult::Success { .. } => {}
             ExecutionResult::Revert { output, .. } => {
-                return Err(format!("Execution reverted: 0x{}", alloy::primitives::hex::encode(output.as_ref())));
+                return Err(format!(
+                    "Execution reverted: 0x{}",
+                    alloy::primitives::hex::encode(output.as_ref())
+                ));
             }
             ExecutionResult::Halt { reason, .. } => {
                 return Err(format!("Execution halted: {:?}", reason));
