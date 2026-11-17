@@ -37,26 +37,40 @@ use tracing::{info, warn};
 /// File in the database directory naming the archive schema.
 pub(crate) const SCHEMA_FILE: &str = "LEAFAGE_ARCHIVE_SCHEMA";
 const SCHEMA_V3: &str = "3";
+const SCHEMA_V4: &str = "4";
 const COMPARATOR: &str = "leveldb.BytewiseComparator.u64ts";
 /// Versioned SST files roll at key boundaries past this size, the CFs'
 /// `target_file_size_base`.
-const ROLL_BYTES: u64 = 128 << 20;
+pub(super) const ROLL_BYTES: u64 = 128 << 20;
 /// Threads of the rewind trim's compactions (the serving archive uses 4).
 const TRIM_SUBCOMPACTIONS: u32 = 8;
 /// Batch only enough cache misses to amortize MultiGet's setup allocations.
 pub(super) const MIN_MULTIGET_KEYS: usize = 8;
 
-/// Whether the archive at `path` is schema v3.
-pub(crate) fn is_udt_archive(path: &Path) -> Result<bool, Error> {
+/// The schema the archive at `path` declares in its schema file: `Some(3)`,
+/// `Some(4)`, or `None` without one (v1 or v2, told apart by the encoding
+/// marker).
+pub(crate) fn schema_file(path: &Path) -> Result<Option<u32>, Error> {
     match std::fs::read_to_string(path.join(SCHEMA_FILE)) {
-        Ok(s) if s.trim() == SCHEMA_V3 => Ok(true),
+        Ok(s) if s.trim() == SCHEMA_V3 => Ok(Some(3)),
+        Ok(s) if s.trim() == SCHEMA_V4 => Ok(Some(4)),
         Ok(s) => Err(Error::UnSupported(format!(
             "unknown archive schema {:?} in {SCHEMA_FILE}",
             s.trim()
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Whether the archive at `path` is schema v3.
+pub(crate) fn is_udt_archive(path: &Path) -> Result<bool, Error> {
+    Ok(schema_file(path)? == Some(3))
+}
+
+/// Whether the archive at `path` is schema v4.
+pub fn is_v4_archive(path: &Path) -> Result<bool, Error> {
+    Ok(schema_file(path)? == Some(4))
 }
 
 /// The on-disk layout of a new RocksDB archive's account and storage
@@ -69,12 +83,14 @@ pub enum ArchiveSchema {
     V2,
     /// Block as a RocksDB user-defined timestamp.
     V3,
+    /// Versions in page files outside RocksDB (`docs/ArchiveSchemaV4.md`).
+    V4,
 }
 
 impl ArchiveSchema {
-    /// Whether the versioned keys use the inverted block encoding. A v3
-    /// archive records the inverted marker too: its write path encodes keys
-    /// as v2 does before splitting off the block.
+    /// Whether the versioned keys use the inverted block encoding. A v3 or
+    /// v4 archive records the inverted marker too: its write path encodes
+    /// keys as v2 does before splitting off the block.
     pub fn inverted(self) -> bool {
         self != Self::V1
     }
@@ -88,7 +104,8 @@ impl std::str::FromStr for ArchiveSchema {
             "v1" => Ok(Self::V1),
             "v2" => Ok(Self::V2),
             "v3" => Ok(Self::V3),
-            _ => Err(format!("unknown archive schema {s:?} (v1, v2 or v3)")),
+            "v4" => Ok(Self::V4),
+            _ => Err(format!("unknown archive schema {s:?} (v1, v2, v3 or v4)")),
         }
     }
 }
@@ -99,6 +116,7 @@ impl std::fmt::Display for ArchiveSchema {
             Self::V1 => "v1",
             Self::V2 => "v2",
             Self::V3 => "v3",
+            Self::V4 => "v4",
         })
     }
 }
@@ -108,12 +126,18 @@ impl std::fmt::Display for ArchiveSchema {
 /// that follows creates v3 column families. Returns whether the database is
 /// new; an existing one keeps its own schema and is left untouched.
 pub fn init_archive_schema(path: &Path, schema: ArchiveSchema) -> Result<bool, Error> {
-    if path.join("CURRENT").exists() {
+    // An archive is there: a RocksDB, or the store of a schema v4 one.
+    if path.join("CURRENT").exists()
+        || (is_v4_archive(path)? && super::v4::Store::exists(&path.join(super::v4::STORE_DIR)))
+    {
         return Ok(false);
     }
     std::fs::create_dir_all(path)?;
     if schema == ArchiveSchema::V3 {
-        write_schema_file(path)?;
+        write_schema_file(path, SCHEMA_V3)?;
+    } else if schema == ArchiveSchema::V4 {
+        super::v4::Store::create(&path.join(super::v4::STORE_DIR))?;
+        write_schema_file(path, SCHEMA_V4)?;
     } else {
         // Left by an earlier start that asked for v3 and stopped before
         // RocksDB created the database.
@@ -125,11 +149,11 @@ pub fn init_archive_schema(path: &Path, schema: ArchiveSchema) -> Result<bool, E
     Ok(true)
 }
 
-fn write_schema_file(path: &Path) -> Result<(), Error> {
+pub(crate) fn write_schema_file(path: &Path, schema: &str) -> Result<(), Error> {
     let tmp = path.join(format!("{SCHEMA_FILE}.tmp"));
     {
         let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(format!("{SCHEMA_V3}\n").as_bytes())?;
+        f.write_all(format!("{schema}\n").as_bytes())?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path.join(SCHEMA_FILE))?;
@@ -550,7 +574,7 @@ enum Task {
     },
 }
 
-fn open_read_only(path: &Path, udt: bool) -> Result<DB, Error> {
+pub(super) fn open_read_only(path: &Path, udt: bool) -> Result<DB, Error> {
     let mut opts = Options::default();
     opts.set_max_open_files(
         std::env::var("ROCKSDB_MAX_OPEN_FILE")
@@ -579,7 +603,7 @@ fn open_read_only(path: &Path, udt: bool) -> Result<DB, Error> {
     )?)
 }
 
-fn scan_options(lo: Option<u8>, hi: Option<u8>) -> ReadOptions {
+pub(super) fn scan_options(lo: Option<u8>, hi: Option<u8>) -> ReadOptions {
     let mut ro = ReadOptions::default();
     ro.set_verify_checksums(false);
     ro.set_total_order_seek(true);
@@ -883,7 +907,7 @@ impl DataBaseRef {
         dst.flush()?;
         drop(dst);
         let _ = std::fs::remove_dir(&tmp_dir);
-        write_schema_file(dst_path)?;
+        write_schema_file(dst_path, SCHEMA_V3)?;
         info!(target: "migrate", "udt convert: done in {}: {report:?}", fmt_hms(start.elapsed().as_secs_f64()));
         Ok(report)
     }
@@ -1025,7 +1049,7 @@ pub fn verify_udt_against_v2(
     Ok(report)
 }
 
-fn hex(b: &[u8]) -> String {
+pub(super) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -1592,13 +1616,13 @@ mod tests {
                 // No version above the target is left anywhere.
                 let all = UdtReader::new(u64::MAX);
                 for a in addrs() {
-                    let account = all.get(db.db, StorageTypeColumn::AddressToAccount, a.as_slice());
+                    let account = all.get(db.db.get(), StorageTypeColumn::AddressToAccount, a.as_slice());
                     assert!(account.unwrap().is_none_or(|f| f.block <= target));
                     for s in slots() {
                         let mut key = [0u8; 64];
                         key[..32].copy_from_slice(a.as_slice());
                         key[32..].copy_from_slice(s.as_slice());
-                        let slot = all.get(db.db, StorageTypeColumn::AddressToStorage, &key);
+                        let slot = all.get(db.db.get(), StorageTypeColumn::AddressToStorage, &key);
                         assert!(slot.unwrap().is_none_or(|f| f.block <= target));
                     }
                 }

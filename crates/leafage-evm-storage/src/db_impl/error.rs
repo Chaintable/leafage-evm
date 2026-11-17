@@ -24,6 +24,10 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
     #[error("iterator timed out for block {0}")]
     IteratorTimedOut(u64),
+    /// A damaged or inconsistent file of the schema v4 archive store, or a
+    /// failure of its background work.
+    #[error("archive v4 error, {0}")]
+    ArchiveV4(String),
 }
 
 impl DBErrorMarker for Error {}

@@ -3,6 +3,7 @@ mod archive_init;
 mod archive_clear_deleted;
 mod archive_scan;
 mod archive_udt;
+mod archive_v4;
 mod bundle;
 mod compact;
 mod db_migrate;

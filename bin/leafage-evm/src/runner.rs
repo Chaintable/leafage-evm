@@ -1,6 +1,6 @@
 use crate::{
-    archive_clear_deleted, archive_init, archive_scan, archive_udt, compact, db_migrate,
-    force_compact, pipeline_export, put_code, rewind, standalone,
+    archive_clear_deleted, archive_init, archive_scan, archive_udt, archive_v4, compact,
+    db_migrate, force_compact, pipeline_export, put_code, rewind, standalone,
 };
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -52,6 +52,9 @@ pub(crate) enum Commands {
     /// Offline tools for archive schema v3 (timestamped versions)
     #[command(name = "archive-udt")]
     ArchiveUdt(archive_udt::Command),
+    /// Offline tools for archive schema v4 (versions in page files)
+    #[command(name = "archive-v4")]
+    ArchiveV4(archive_v4::Command),
     /// Write contract code missing from an archive DB (offline repair)
     #[command(name = "put-code")]
     PutCode(put_code::Command),
@@ -72,6 +75,7 @@ impl Commands {
             Commands::ArchiveScan(mut cmd) => cmd.run().await,
             Commands::ArchiveClearDeleted(mut cmd) => cmd.run().await,
             Commands::ArchiveUdt(mut cmd) => cmd.run().await,
+            Commands::ArchiveV4(mut cmd) => cmd.run().await,
             Commands::PutCode(mut cmd) => cmd.run().await,
             Commands::PipelineExport(mut cmd) => cmd.run().await,
         }

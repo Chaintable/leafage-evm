@@ -412,6 +412,13 @@ pub trait EvmStorageWrite {
     ) -> Result<(), Self::Error>;
 
     fn last_committed_block(&self) -> Result<Option<BlockInfo>, Self::Error>;
+
+    /// Whether `hash` is a block that [`Self::update_block`] takes as a
+    /// parent, or again without effect. An implementation that cannot tell
+    /// says `true` and leaves it to `update_block`.
+    fn has_block(&self, _hash: H256) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

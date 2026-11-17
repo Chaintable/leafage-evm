@@ -30,6 +30,8 @@ dashmap.workspace = true
 ahash.workspace = true
 arc-swap.workspace = true
 crc32fast.workspace = true
+zstd.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

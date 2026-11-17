@@ -21,8 +21,10 @@ pub use rocksdb;
 #[cfg(test)]
 pub(crate) use rocksdb_impl::ARCHIVE_DB_TEST_LOCK;
 pub use rocksdb_impl::{
-    init_archive_schema, verify_udt_against_v2, ArchiveRocksDBStorage, ArchiveSchema,
-    ArchiveStateDB, BulkColumn, RocksDBStorage, UdtConvertReport, UdtVerifyReport,
+    init_archive_schema, is_archive_schema_v4, replay_get_trace, verify_udt_against_v2,
+    verify_v4_against_v3, ArchiveRocksDBStorage, ArchiveSchema, ArchiveStateDB, BulkColumn,
+    RocksDBStorage, UdtConvertReport, UdtVerifyReport, V4ConvertReport, V4ReplayReport,
+    V4VerifyReport,
 };
 pub(crate) use rocksdb_impl::{
     state_account_value, state_block_num_key, state_sst_writer_options, state_storage_key, SstSink,

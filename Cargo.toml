@@ -148,6 +148,8 @@ criterion = "0.5"
 ahash = "0.8"
 arc-swap = "1.7"
 crc32fast = "1.4"
+zstd = { version = "0.13", features = ["zdict_builder"] }
+libc = "0.2"
 
 # for test
 metrics-util = "0.19"
