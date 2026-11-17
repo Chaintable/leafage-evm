@@ -78,8 +78,8 @@ pub struct Command {
     /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
     /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules);
     /// chains with a built-in fork schedule, OP Mainnet 10, Soneium 1868, Unichain 130,
-    /// Cyber 7560, Fraxtal 252, Mode 34443, BOB 60808 and World Chain 480, follow it per
-    /// block instead),
+    /// Cyber 7560, Fraxtal 252, Mode 34443, BOB 60808, World Chain 480, Manta Pacific 169
+    /// and Katana 747474, follow it per block instead),
     /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
     /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
     ///
