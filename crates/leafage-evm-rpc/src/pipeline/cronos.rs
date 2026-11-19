@@ -105,6 +105,9 @@ fn ethermint_sstore<D: Database>(
     })
 }
 
+mod releases;
+pub use releases::CronosRelease;
+
 /// Cronos mainnet genesis sets london_block to 2^63. The v0.7.0
 /// upgrade handler sets it to zero and enables the fee market at Huygen.
 /// v1 and later require independently verified execution rules.
@@ -112,34 +115,42 @@ fn ethermint_sstore<D: Database>(
 pub enum CronosEra {
     BeforeHuygen,
     Huygen,
+    HuygenHotfix,
 }
 
 impl CronosEra {
     pub fn at_height(height: u64) -> Option<Self> {
-        match height {
-            1..2_693_800 => Some(Self::BeforeHuygen),
-            2_693_800..6_542_800 => Some(Self::Huygen),
-            _ => None,
-        }
+        CronosRelease::at_height(height)?.rules
     }
 
     pub fn version(self) -> &'static str {
         match self {
-            Self::BeforeHuygen => "ethermint-transient-v2",
-            Self::Huygen => "ethermint-statedb-v2",
+            Self::BeforeHuygen => "ethermint-transient-v3",
+            Self::Huygen => "ethermint-huygen-v3",
+            Self::HuygenHotfix => "ethermint-huygen-hotfix-v3",
         }
     }
 
     pub fn spec(self, base_fee: Option<u64>) -> Result<SpecId> {
         let spec = match self {
             Self::BeforeHuygen => SpecId::BERLIN,
-            Self::Huygen => SpecId::LONDON,
+            Self::Huygen | Self::HuygenHotfix => SpecId::LONDON,
         };
         ensure!(
             base_fee.is_some() == (spec == SpecId::LONDON),
             "baseFeePerGas inconsistent with Cronos mainnet {self:?}"
         );
         Ok(spec)
+    }
+}
+
+/// v0.6 marks suicide in transient state; v0.7 deletes code by shared hash.
+/// Neither lifecycle is represented by the standard CacheDB account deletion.
+#[derive(Debug)]
+pub struct LegacySelfdestruct;
+impl std::fmt::Display for LegacySelfdestruct {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("historical SELFDESTRUCT state transition is not implemented")
     }
 }
 
@@ -267,6 +278,11 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
         })?;
         warm = handler.warm;
         let state = evm.ctx.journaled_state.finalize();
+        if era != CronosEra::HuygenHotfix
+            && state.values().any(|account| account.is_selfdestructed())
+        {
+            return Err(anyhow!("tx {index} {hash}").context(LegacySelfdestruct));
+        }
         ensure!(
             result.is_success() == receipt.status(),
             "tx {index} {hash} status: replay {}, receipt {}",
@@ -475,7 +491,9 @@ mod era_tests {
             (1, Some(CronosEra::BeforeHuygen)),
             (2_693_799, Some(CronosEra::BeforeHuygen)),
             (2_693_800, Some(CronosEra::Huygen)),
-            (6_542_799, Some(CronosEra::Huygen)),
+            (3_982_499, Some(CronosEra::Huygen)),
+            (3_982_500, Some(CronosEra::HuygenHotfix)),
+            (6_542_799, Some(CronosEra::HuygenHotfix)),
             (6_542_800, None),
         ] {
             assert_eq!(CronosEra::at_height(height), era);

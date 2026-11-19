@@ -41,7 +41,7 @@ fn event_hashes(events: &[Value]) -> Result<Vec<B256>> {
         let attributes = event["attributes"]
             .as_array()
             .context("missing ethereum_tx attributes")?;
-        // Huygen started emitting an ante event with the same hash.
+        // Some binaries also emit an ante event with the same hash.
         // The execution event also includes the transaction amount.
         if !attributes.iter().any(|attr| {
             attr["key"].as_str().is_some_and(|key| {

@@ -12,7 +12,7 @@ use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
     rpc_params,
 };
-use leafage_evm_rpc::{CronosArchiveRead, CronosEra};
+use leafage_evm_rpc::{CronosArchiveRead, CronosEra, CronosRelease};
 use leafage_evm_storage::{
     BlockIndex, EvmStorageRead, MultiStorage, StateTree, StateTreeConfig, StorageKind,
 };
@@ -146,7 +146,7 @@ impl Command {
         let tree = StateTree::new(db, StateTreeConfig::new(128, 10000, 100000, 10000, true))?;
         let mut counts = BTreeMap::new();
         for height in self.from_block..=self.to_block {
-            let report = match self.block(&evm, &comet, &tree, height).await {
+            let mut report = match self.block(&evm, &comet, &tree, height).await {
                 Ok(report) => report,
                 Err(err) if err.is::<CronosArchiveRead>() || err.is::<std::io::Error>() => {
                     return Err(err.context(format!("replaying block {height}")));
@@ -159,6 +159,7 @@ impl Command {
                     json!({"height":height, "status":status, "detail":format!("{err:#}")})
                 }
             };
+            report["release"] = json!(CronosRelease::at_height(height));
             *counts
                 .entry(
                     report["status"]
@@ -194,6 +195,7 @@ impl Command {
             || report["hash"] != json!(hash)
             || report["parent"] != json!(parent)
             || report["block_file"] != name
+            || report["release"] != json!(CronosRelease::at_height(height))
             || report["rule"] != version
         {
             return Ok(None);
@@ -429,7 +431,11 @@ impl Command {
                 Ok(file) => file,
                 Err(err) if err.is::<CronosArchiveRead>() => return Err(err),
                 Err(err) => {
-                    report["status"] = json!("execution_mismatch");
+                    report["status"] = if err.is::<leafage_evm_rpc::LegacySelfdestruct>() {
+                        json!("rules_uncovered")
+                    } else {
+                        json!("execution_mismatch")
+                    };
                     report["evm_block"] = serde_json::to_value(&block)?;
                     report["comet_block"] = tm;
                     report["comet_results"] = results;
