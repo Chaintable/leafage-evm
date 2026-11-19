@@ -18,7 +18,7 @@ pub use archive::udt::{
     init_archive_schema, verify_udt_against_v2, ArchiveSchema, UdtConvertReport, UdtVerifyReport,
 };
 pub use archive::v4::convert::{
-    replay_get_trace, verify_v4_against_v3, V4ConvertReport, V4ReplayReport, V4VerifyReport,
+    replay_get_trace, verify_v4_against_source, V4ConvertReport, V4ReplayReport, V4VerifyReport,
 };
 pub use archive::{DataBaseRef as ArchiveRocksDBStorage, StateDB as ArchiveStateDB};
 
