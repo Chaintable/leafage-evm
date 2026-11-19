@@ -1,13 +1,15 @@
-//! Offline conversion of a schema v3 archive to schema v4, and the check of
-//! the result against its source (`docs/ArchiveSchemaV4.md`, "Conversion").
+//! Offline conversion of a RocksDB archive (schema v1, v2 or v3) to schema
+//! v4, and the check of the result against its source
+//! (`docs/ArchiveSchemaV4.md`, "Conversion").
 
 use super::super::block_index;
 use super::super::udt::{
-    self, encode_ts, hex, open_read_only, scan_options, write_schema_file, SCHEMA_FILE,
+    self, encode_ts, hex, open_read_only, scan_options, write_schema_file, ArchiveSchema,
+    SCHEMA_FILE,
 };
 use super::super::{
-    decode_archive_header, decode_cached_account, fmt_hms, shard_bounds, DataBaseRef,
-    StorageTypeColumn,
+    decode_archive_header, decode_cached_account, encode_block_num, fmt_hms, shard_bounds,
+    DataBaseRef, StorageTypeColumn, ENCODING_MARKER_KEY,
 };
 use super::codec::{key_len, Val};
 use super::file::{self, Dict, PageWriter, Rec};
@@ -26,10 +28,12 @@ use tracing::{info, warn};
 const DICT_NAMES: [&str; 2] = ["convert-account.dict", "convert-storage.dict"];
 /// Places in the key space sampled to train a kind's dictionary.
 const DICT_SAMPLES: u64 = 2000;
-/// Versions of one key held in memory by the conversion. The source sorts a
-/// key's versions newest first and v4 wants them oldest first; a key with
-/// more versions than this (an account that changes in every block has one
-/// per block of the chain) is read again in block windows of this many.
+/// Versions of one key held in memory by the conversion. A v2 or v3 source
+/// sorts a key's versions newest first and v4 wants them oldest first; a key
+/// with more versions than this (an account that changes in every block has
+/// one per block of the chain) is read again in block windows of this many.
+/// A v1 source sorts them oldest first, and they are passed on in windows
+/// as they are read.
 #[cfg(not(test))]
 const KEY_WINDOW: usize = 1 << 18;
 #[cfg(test)]
@@ -38,7 +42,7 @@ const KEY_WINDOW: usize = 12;
 #[cfg(test)]
 static KEY_PASSES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Records and bytes written by [`DataBaseRef::convert_udt_to_v4`].
+/// Records and bytes written by [`DataBaseRef::convert_to_v4`].
 #[derive(Debug, Default, Clone)]
 pub struct V4ConvertReport {
     /// Account versions.
@@ -47,6 +51,9 @@ pub struct V4ConvertReport {
     pub storage: u64,
     /// Versions above the source's head, left behind.
     pub above_head: u64,
+    /// Pointers to the latest version of a key that early v1 archives wrote
+    /// beside each version (block `u64::MAX`), left behind.
+    pub sentinels: u64,
     /// Records of the other column families.
     pub other: u64,
     /// Base files written, and their bytes.
@@ -77,22 +84,144 @@ fn all_versions(mut ro: ReadOptions) -> ReadOptions {
     ro
 }
 
-/// The key and block of the version an all-versions iterator is on.
-fn version_key(raw: &[u8], k: usize) -> Result<(&[u8], u64), Error> {
-    // The key, its 8-byte timestamp, then RocksDB's sequence trailer.
-    if raw.len() < k + 8 {
+/// The key and block of the record an iterator over a versioned CF of a
+/// `schema` archive is on. No block: the record is not a version but the
+/// pointer to the latest one that early v1 archives wrote beside each
+/// (block `u64::MAX`), stale since.
+fn version_key(schema: ArchiveSchema, raw: &[u8], k: usize) -> Result<(&[u8], Option<u64>), Error> {
+    if schema == ArchiveSchema::V3 {
+        // The key, its 8-byte timestamp, then RocksDB's sequence trailer.
+        if raw.len() < k + 8 {
+            return Err(Error::UnSupported(format!(
+                "unexpected schema v3 key of {} bytes",
+                raw.len()
+            )));
+        }
+        return Ok((
+            &raw[..k],
+            Some(u64::from_le_bytes(raw[k..k + 8].try_into().unwrap())),
+        ));
+    }
+    // The key, then a 32-byte tail that ends in the block (v1) or in
+    // `u64::MAX` less the block (v2).
+    if raw.len() != k + 32 {
         return Err(Error::UnSupported(format!(
-            "unexpected schema v3 key of {} bytes",
+            "unexpected schema {schema} key of {} bytes",
             raw.len()
         )));
     }
-    Ok((
-        &raw[..k],
-        u64::from_le_bytes(raw[k..k + 8].try_into().unwrap()),
-    ))
+    let tail = u64::from_be_bytes(raw[k + 24..].try_into().unwrap());
+    let block = if schema == ArchiveSchema::V1 {
+        (tail != u64::MAX).then_some(tail)
+    } else {
+        Some(u64::MAX - tail)
+    };
+    Ok((&raw[..k], block))
 }
 
-/// A schema v3 value as a v4 one.
+/// Places of each versioned CF whose keys tell a v1 archive from a v2 one,
+/// and records read at each.
+const TAIL_SAMPLES: u64 = 64;
+const TAIL_SAMPLE_RUN: usize = 32;
+
+/// Whether the RocksDB archive `db`, one without a schema file, is v1 or
+/// v2. Its keys tell: a block number is far below 2^63, so the tail of a
+/// version is below it on v1 and above it on v2. The encoding marker, which
+/// an archive from before the marker does not have, must agree with them.
+fn tail_schema(db: &DB) -> Result<ArchiveSchema, Error> {
+    let marker = match db.cf_handle(StorageTypeColumn::LatestBlockHash.to_str()) {
+        Some(cf) => db
+            .get_cf(cf, ENCODING_MARKER_KEY)?
+            .and_then(|v| v.first().copied())
+            .map(|b| b == 1),
+        None => None,
+    };
+    // A tail of `u64::MAX` is either: v1's pointer to the latest version,
+    // or block 0 on v2.
+    let (mut ascending, mut inverted, mut ends) = (0u64, 0u64, 0u64);
+    for storage in [false, true] {
+        let k = key_len(storage);
+        let col = if storage {
+            StorageTypeColumn::AddressToStorage
+        } else {
+            StorageTypeColumn::AddressToAccount
+        };
+        let Some(cf) = db.cf_handle(col.to_str()) else {
+            continue;
+        };
+        let mut ro = ReadOptions::default();
+        ro.set_total_order_seek(true);
+        ro.fill_cache(false);
+        let mut iter = db.raw_iterator_cf_opt(cf, ro);
+        for i in 0..TAIL_SAMPLES {
+            iter.seek((i * (u64::MAX / TAIL_SAMPLES)).to_be_bytes());
+            for _ in 0..TAIL_SAMPLE_RUN {
+                let Some(raw) = iter.key() else {
+                    break;
+                };
+                if raw.len() != k + 32 {
+                    return Err(Error::UnSupported(format!(
+                        "unexpected key of {} bytes in {col} of the source",
+                        raw.len()
+                    )));
+                }
+                match u64::from_be_bytes(raw[k + 24..].try_into().unwrap()) {
+                    u64::MAX => ends += 1,
+                    tail if tail >> 63 == 0 => ascending += 1,
+                    _ => inverted += 1,
+                }
+                iter.next();
+            }
+            iter.status()?;
+        }
+    }
+    let inverted = match (ascending > 0, inverted > 0, marker) {
+        (true, true, _) => {
+            return Err(Error::UnSupported(format!(
+                "the source's keys are in both block encodings \
+                 ({ascending} ascending, {inverted} inverted of those sampled)"
+            )))
+        }
+        (true, false, Some(true)) | (false, true, Some(false)) => {
+            return Err(Error::UnSupported(format!(
+                "the source's encoding marker says inverted: {}, its keys say otherwise \
+                 ({ascending} ascending, {inverted} inverted of those sampled)",
+                marker == Some(true)
+            )))
+        }
+        (true, false, _) => false,
+        (false, true, _) => true,
+        (false, false, Some(marker)) => marker,
+        // Versions of block 0 alone are an inverted archive's; one without
+        // versions converts the same either way.
+        (false, false, None) => ends > 0,
+    };
+    Ok(if inverted {
+        ArchiveSchema::V2
+    } else {
+        ArchiveSchema::V1
+    })
+}
+
+/// Open the RocksDB archive at `path` read-only: the database, and the
+/// schema its versioned column families are in.
+fn open_source(path: &Path) -> Result<(DB, ArchiveSchema), Error> {
+    match udt::schema_file(path)? {
+        Some(3) => Ok((open_read_only(path, true)?, ArchiveSchema::V3)),
+        Some(_) => Err(Error::UnSupported(format!(
+            "{} is a schema v4 archive already",
+            path.display()
+        ))),
+        None => {
+            let db = open_read_only(path, false)?;
+            let schema = tail_schema(&db)?;
+            Ok((db, schema))
+        }
+    }
+}
+
+/// A value of a versioned CF (the same in v1, v2 and v3, but for the leading
+/// zeros of a slot's) as a v4 one.
 fn version_value(storage: bool, value: &[u8]) -> Result<Val, Error> {
     if storage {
         if value.len() > 32 {
@@ -113,14 +242,18 @@ fn version_value(storage: bool, value: &[u8]) -> Result<Val, Error> {
     }
 }
 
-/// Reads a timestamped CF key by key: each key's versions, oldest first.
+/// Reads a versioned CF of a RocksDB archive key by key: each key's
+/// versions, oldest first.
 struct KeyVersions<'a> {
     db: &'a DB,
+    schema: ArchiveSchema,
     iter: DBRawIteratorWithThreadMode<'a, DB>,
     storage: bool,
     /// Versions above this block are skipped and counted.
     head: u64,
     above_head: u64,
+    /// Pointers to the latest version (v1), skipped and counted.
+    sentinels: u64,
     /// The current key's versions; their `key` is the key.
     versions: Vec<Rec>,
     /// Of a key read in windows: one window, and the newest block of each
@@ -131,19 +264,26 @@ struct KeyVersions<'a> {
 }
 
 impl<'a> KeyVersions<'a> {
-    fn new(db: &'a DB, storage: bool, ro: ReadOptions, head: u64) -> Self {
+    fn new(db: &'a DB, schema: ArchiveSchema, storage: bool, ro: ReadOptions, head: u64) -> Self {
         let col = if storage {
             StorageTypeColumn::AddressToStorage
         } else {
             StorageTypeColumn::AddressToAccount
         };
         let cf = db.cf_handle(col.to_str()).unwrap();
+        let ro = if schema == ArchiveSchema::V3 {
+            all_versions(ro)
+        } else {
+            ro
+        };
         Self {
             db,
-            iter: db.raw_iterator_cf_opt(cf, all_versions(ro)),
+            schema,
+            iter: db.raw_iterator_cf_opt(cf, ro),
             storage,
             head,
             above_head: 0,
+            sentinels: 0,
             versions: Vec::new(),
             window: Vec::new(),
             cuts: Vec::new(),
@@ -160,6 +300,30 @@ impl<'a> KeyVersions<'a> {
         self.db.cf_handle(col.to_str()).unwrap()
     }
 
+    /// An iterator on the version of `key` at block `hi`, of a source that
+    /// sorts versions newest first (v2, v3). On v3 it ends below block
+    /// `lo`.
+    fn window_iter(&self, key: &[u8], lo: u64, hi: u64) -> DBRawIteratorWithThreadMode<'a, DB> {
+        let mut ro = ReadOptions::default();
+        ro.set_verify_checksums(false);
+        ro.set_total_order_seek(true);
+        ro.set_readahead_size(2 << 20);
+        ro.fill_cache(false);
+        if self.schema == ArchiveSchema::V3 {
+            ro.set_timestamp(encode_ts(hi));
+            ro.set_iter_start_ts(encode_ts(lo));
+            let mut iter = self.db.raw_iterator_cf_opt(self.cf(), ro);
+            iter.seek(key);
+            iter
+        } else {
+            let mut iter = self.db.raw_iterator_cf_opt(self.cf(), ro);
+            let mut from = key.to_vec();
+            from.extend_from_slice(&encode_block_num(u64::MAX - hi));
+            iter.seek(&from);
+            iter
+        }
+    }
+
     /// Pass every version up to the head of the key the iterator is on to
     /// `sink`, oldest first, and move past the key. `sink` is called once,
     /// or for a key with more than [`KEY_WINDOW`] versions once per window
@@ -171,12 +335,14 @@ impl<'a> KeyVersions<'a> {
         self.versions.clear();
         self.cuts.clear();
         let k = key_len(self.storage);
+        let oldest_first = self.schema == ArchiveSchema::V1;
         let mut key = [0u8; 64];
         let mut have = false;
-        // Versions up to the head.
+        // Versions up to the head, and those of them passed on.
         let mut n = 0usize;
+        let mut passed = 0usize;
         while let Some(raw) = self.iter.key() {
-            let (user, block) = version_key(raw, k)?;
+            let (user, block) = version_key(self.schema, raw, k)?;
             if have && user != &key[..k] {
                 break;
             }
@@ -184,19 +350,35 @@ impl<'a> KeyVersions<'a> {
             have = true;
             let value = self.iter.value().unwrap_or(&[]);
             self.bytes += (raw.len() + value.len()) as u64;
-            if block > self.head {
-                self.above_head += 1;
-            } else {
-                if n < KEY_WINDOW {
-                    self.versions.push(Rec {
-                        key,
-                        block,
-                        val: version_value(self.storage, value)?,
-                    });
-                } else if n.is_multiple_of(KEY_WINDOW) {
-                    self.cuts.push(block);
+            match block {
+                None => self.sentinels += 1,
+                Some(block) if block > self.head => self.above_head += 1,
+                Some(block) => {
+                    if oldest_first {
+                        // In the order wanted: a full window goes on at once.
+                        if self.versions.len() == KEY_WINDOW {
+                            passed += self.versions.len();
+                            sink(&self.versions)?;
+                            self.versions.clear();
+                            #[cfg(test)]
+                            KEY_PASSES[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.versions.push(Rec {
+                            key,
+                            block,
+                            val: version_value(self.storage, value)?,
+                        });
+                    } else if n < KEY_WINDOW {
+                        self.versions.push(Rec {
+                            key,
+                            block,
+                            val: version_value(self.storage, value)?,
+                        });
+                    } else if n.is_multiple_of(KEY_WINDOW) {
+                        self.cuts.push(block);
+                    }
+                    n += 1;
                 }
-                n += 1;
             }
             self.iter.next();
         }
@@ -204,29 +386,21 @@ impl<'a> KeyVersions<'a> {
         if !have {
             return Ok(false);
         }
-        // The windows below the newest one, oldest first: each is read
-        // with the timestamp bounds of its blocks.
-        let mut passed = self.versions.len();
+        passed += self.versions.len();
+        // Of a source that sorts newest first, the windows below the newest
+        // one, oldest first: each is read again from its newest block down.
         for i in (0..self.cuts.len()).rev() {
             let lo = match self.cuts.get(i + 1) {
                 Some(&older) => older + 1,
                 None => 0,
             };
-            let mut ro = ReadOptions::default();
-            ro.set_verify_checksums(false);
-            ro.set_total_order_seek(true);
-            ro.set_readahead_size(2 << 20);
-            ro.fill_cache(false);
-            ro.set_timestamp(encode_ts(self.cuts[i]));
-            ro.set_iter_start_ts(encode_ts(lo));
-            let mut iter = self.db.raw_iterator_cf_opt(self.cf(), ro);
-            iter.seek(&key[..k]);
+            let mut iter = self.window_iter(&key[..k], lo, self.cuts[i]);
             self.window.clear();
             while let Some(raw) = iter.key() {
-                let (user, block) = version_key(raw, k)?;
-                if user != &key[..k] {
+                let (user, block) = version_key(self.schema, raw, k)?;
+                let Some(block) = block.filter(|&block| user == &key[..k] && block >= lo) else {
                     break;
-                }
+                };
                 self.window.push(Rec {
                     key,
                     block,
@@ -242,28 +416,31 @@ impl<'a> KeyVersions<'a> {
             KEY_PASSES[1].fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(test)]
-        KEY_PASSES[usize::from(!self.cuts.is_empty())].fetch_add(1, Ordering::Relaxed);
+        KEY_PASSES[usize::from(n > KEY_WINDOW)].fetch_add(1, Ordering::Relaxed);
         if passed != n {
             return Err(Error::UnSupported(format!(
                 "key {} has {n} versions but {passed} in block windows",
                 hex(&key[..k])
             )));
         }
-        // Newest first in the source.
-        self.versions.reverse();
+        if !oldest_first {
+            self.versions.reverse();
+        }
         sink(&self.versions)?;
         Ok(true)
     }
 
     /// Load the versions of the key the iterator is on, at most `cap` of
-    /// them (the newest), and move past the key. `false` at the end.
+    /// them (the newest), oldest first, and move past the key. `false` at
+    /// the end.
     fn next_key(&mut self, cap: usize) -> Result<bool, Error> {
         self.versions.clear();
         let k = key_len(self.storage);
+        let oldest_first = self.schema == ArchiveSchema::V1;
         let mut key = [0u8; 64];
         let mut have = false;
         while let Some(raw) = self.iter.key() {
-            let (user, block) = version_key(raw, k)?;
+            let (user, block) = version_key(self.schema, raw, k)?;
             if have && user != &key[..k] {
                 break;
             }
@@ -271,31 +448,49 @@ impl<'a> KeyVersions<'a> {
             have = true;
             let value = self.iter.value().unwrap_or(&[]);
             self.bytes += (raw.len() + value.len()) as u64;
-            if block > self.head {
-                self.above_head += 1;
-            } else if self.versions.len() < cap {
-                self.versions.push(Rec {
-                    key,
-                    block,
-                    val: version_value(self.storage, value)?,
-                });
+            match block {
+                None => self.sentinels += 1,
+                Some(block) if block > self.head => self.above_head += 1,
+                Some(block) => {
+                    // The newest come last in a source sorted oldest first.
+                    if oldest_first && self.versions.len() >= cap.max(1).saturating_mul(2) {
+                        let excess = self.versions.len() - cap;
+                        self.versions.drain(..excess);
+                    }
+                    if oldest_first || self.versions.len() < cap {
+                        self.versions.push(Rec {
+                            key,
+                            block,
+                            val: version_value(self.storage, value)?,
+                        });
+                    }
+                }
             }
             self.iter.next();
         }
         self.iter.status()?;
-        // Newest first in the source.
-        self.versions.reverse();
+        if oldest_first {
+            let excess = self.versions.len().saturating_sub(cap);
+            self.versions.drain(..excess);
+        } else {
+            self.versions.reverse();
+        }
         Ok(have)
     }
 }
 
 /// Train one dictionary for a kind from keys spread over the key space.
-fn train_kind_dict(src: &DB, storage: bool, head: u64) -> Result<Vec<u8>, Error> {
+fn train_kind_dict(
+    src: &DB,
+    schema: ArchiveSchema,
+    storage: bool,
+    head: u64,
+) -> Result<Vec<u8>, Error> {
     let mut ro = ReadOptions::default();
     ro.set_total_order_seek(true);
     ro.set_verify_checksums(false);
     ro.fill_cache(false);
-    let mut keys = KeyVersions::new(src, storage, ro, head);
+    let mut keys = KeyVersions::new(src, schema, storage, ro, head);
     let mut samples: Vec<Vec<Rec>> = Vec::new();
     let k = key_len(storage);
     for i in 0..DICT_SAMPLES {
@@ -387,16 +582,16 @@ impl ShardWriter<'_> {
 }
 
 impl DataBaseRef {
-    /// Offline rewrite of a schema v3 archive into schema v4 at `dst_path`,
-    /// which must not exist or be empty. The source is opened read-only.
+    /// Offline rewrite of a RocksDB archive (schema v1, v2 or v3, told by
+    /// its schema file and its keys) into schema v4 at `dst_path`, which
+    /// must not exist or be empty. The source is opened read-only.
     ///
     /// The versioned column families are read shard by shard and written as
     /// v4 base files holding every version up to the source's head; the
-    /// result has no delta. The other column families are copied; block
-    /// infos move to `BlockNumToBlockInfo` if `ARCHIVE_BLOCK_INDEX=1` asks
-    /// for it and the source still has them by hash. The schema file is
-    /// written last: an interrupted conversion cannot be opened as v4.
-    pub fn convert_udt_to_v4(
+    /// result has no delta. Block infos and code go to the files of the
+    /// store. The schema file is written last: an interrupted conversion
+    /// cannot be opened as v4.
+    pub fn convert_to_v4(
         src_path: &Path,
         dst_path: &Path,
         jobs: usize,
@@ -407,28 +602,15 @@ impl DataBaseRef {
                 dst_path.display()
             )));
         }
-        if !udt::is_udt_archive(src_path)? {
-            return Err(Error::UnSupported(
-                "source must be a schema v3 archive".into(),
-            ));
-        }
         let jobs = jobs.clamp(1, 64);
-        let src = open_read_only(src_path, true)?;
-        let head = {
-            let meta = src
-                .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
-                .unwrap();
-            let hash = src
-                .get_cf(meta, [1u8])?
-                .ok_or_else(|| Error::UnSupported("source archive is empty".into()))?;
-            source_block_number(&src, &hash)?
-        };
+        let (src, schema) = open_source(src_path)?;
+        let head = source_head(&src)?;
         if head > u32::MAX as u64 {
             return Err(Error::UnSupported(format!(
                 "archive schema v4 holds block numbers up to 2^32, not {head}"
             )));
         }
-        info!(target: "migrate", "v4 convert: source head is block {head}");
+        info!(target: "migrate", "v4 convert: source is schema {schema}, its head is block {head}");
 
         let store_dir = dst_path.join(STORE_DIR);
         std::fs::create_dir_all(&store_dir)?;
@@ -438,7 +620,7 @@ impl DataBaseRef {
         let options = Options::maintenance(0);
         let mut dicts = Vec::new();
         for storage in [false, true] {
-            let raw = train_kind_dict(&src, storage, head)?;
+            let raw = train_kind_dict(&src, schema, storage, head)?;
             info!(
                 target: "migrate",
                 "v4 convert: {} dictionary of {} bytes",
@@ -462,8 +644,9 @@ impl DataBaseRef {
         let n_tasks = tasks.len();
         let queue = Mutex::new(tasks.into_iter());
         let done_tasks = AtomicU64::new(0);
-        // Storage versions, account versions, other records, above the head.
-        let records = [const { AtomicU64::new(0) }; 4];
+        // Storage versions, account versions, other records, above the head,
+        // pointers to the latest version.
+        let records = [const { AtomicU64::new(0) }; 5];
         let bytes_read = AtomicU64::new(0);
         let bytes_written = AtomicU64::new(0);
         let next_fid = AtomicU32::new(1);
@@ -550,6 +733,7 @@ impl DataBaseRef {
                                 Task::Versioned { storage, lo, hi } => {
                                     let mut keys = KeyVersions::new(
                                         &src,
+                                        schema,
                                         storage,
                                         scan_options(Some(lo), hi),
                                         head,
@@ -591,6 +775,7 @@ impl DataBaseRef {
                                     bytes_read.fetch_add(keys.bytes - seen, Ordering::Relaxed);
                                     bytes_written.fetch_add(out.bytes - written, Ordering::Relaxed);
                                     records[3].fetch_add(keys.above_head, Ordering::Relaxed);
+                                    records[4].fetch_add(keys.sentinels, Ordering::Relaxed);
                                     bases.lock().unwrap().append(&mut out.done);
                                 }
                             }
@@ -619,6 +804,7 @@ impl DataBaseRef {
             accounts: records[1].load(Ordering::Relaxed),
             storage: records[0].load(Ordering::Relaxed),
             above_head: records[3].load(Ordering::Relaxed),
+            sentinels: records[4].load(Ordering::Relaxed),
             other: records[2].load(Ordering::Relaxed),
             files: 0,
             bytes: bytes_written.load(Ordering::Relaxed),
@@ -849,8 +1035,48 @@ fn read_codes(
     Ok(total)
 }
 
+/// Block `number` of a RocksDB archive as [`read_blocks`] hands it over, if
+/// the archive has it.
+fn source_block(src: &DB, number: u64) -> Result<Option<BlockRec>, Error> {
+    if let Some(cf) = src.cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str()) {
+        let Some(value) = src.get_cf(cf, block_index::key(number))? else {
+            return Ok(None);
+        };
+        if value.len() < 32 {
+            return Err(Error::UnSupported("malformed block info by number".into()));
+        }
+        let hash: [u8; 32] = value[..32].try_into().unwrap();
+        return Ok(Some((hash, Arc::from(&value[32..]))));
+    }
+    let numbers = src
+        .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
+        .ok_or_else(|| Error::UnSupported("source archive has no block numbers".into()))?;
+    let infos = src
+        .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+        .ok_or_else(|| Error::UnSupported("source archive has no block infos".into()))?;
+    let Some(hash) = src.get_cf(numbers, encode_block_num(number))? else {
+        return Ok(None);
+    };
+    let hash: [u8; 32] = hash[..]
+        .try_into()
+        .map_err(|_| Error::UnSupported("malformed block number record".into()))?;
+    let info = src.get_cf(infos, hash)?.unwrap_or_default();
+    Ok(Some((hash, Arc::from(info))))
+}
+
 /// How far below its last block info the head of a source is looked for.
 const HEAD_SEARCH_BLOCKS: usize = 1 << 20;
+
+/// The number of the latest block of an archive opened read-only.
+fn source_head(src: &DB) -> Result<u64, Error> {
+    let meta = src
+        .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
+        .ok_or_else(|| Error::UnSupported("source archive has no head".into()))?;
+    let hash = src
+        .get_cf(meta, [1u8])?
+        .ok_or_else(|| Error::UnSupported("source archive is empty".into()))?;
+    source_block_number(src, &hash)
+}
 
 /// The number of the block with hash `hash` in an archive opened read-only.
 fn source_block_number(db: &DB, hash: &[u8]) -> Result<u64, Error> {
@@ -886,10 +1112,10 @@ fn source_block_number(db: &DB, hash: &[u8]) -> Result<u64, Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Verification against the v3 source
+// Verification against the source
 // ---------------------------------------------------------------------------
 
-/// Result of [`verify_v4_against_v3`].
+/// Result of [`verify_v4_against_source`].
 #[derive(Debug, Default, Clone)]
 pub struct V4VerifyReport {
     pub keys: u64,
@@ -898,6 +1124,9 @@ pub struct V4VerifyReport {
     pub inner_slots: u64,
     pub reads: u64,
     pub absent_keys: u64,
+    /// Block numbers and codes compared.
+    pub blocks: u64,
+    pub codes: u64,
     pub mismatches: u64,
 }
 
@@ -905,23 +1134,29 @@ pub struct V4VerifyReport {
 /// newest versions only.
 const VERIFY_MAX_VERSIONS: usize = 4096;
 
-/// Compare a v4 archive with the v3 archive it was converted from: for
-/// `samples` random keys of each kind, read v4 at heights on, just below
-/// and between the key's versions and above the newest, and compare value
-/// and block with v3's; also a key next to each that v3 does not hold.
-/// Heights go up to the last block the v4 archive's files hold.
-pub fn verify_v4_against_v3(
-    v3_path: &Path,
+/// Compare a v4 archive with the RocksDB archive (v1, v2 or v3) it was
+/// converted from: for `samples` random keys of each kind, read v4 at
+/// heights on, just below and between the key's versions and above the
+/// newest, and compare value and block with the source's; also a key next
+/// to each that the source does not hold. Heights go up to the last block
+/// the v4 archive's files hold. Then `samples` block numbers up to that
+/// block (hash and info, or that neither has the block) and `samples`
+/// codes of the source, and that v4 has no code under a hash the source
+/// has none under. A code that v4 lacks is a mismatch unless the source is
+/// ahead of it, when the code may be of a later block.
+pub fn verify_v4_against_source(
+    src_path: &Path,
     v4_path: &Path,
     samples: u64,
     seed: u64,
 ) -> Result<V4VerifyReport, Error> {
-    if !udt::is_udt_archive(v3_path)? || !udt::is_v4_archive(v4_path)? {
+    if !udt::is_v4_archive(v4_path)? {
         return Err(Error::UnSupported(format!(
-            "expected a schema v3 and a schema v4 archive ({SCHEMA_FILE})"
+            "{} is not a schema v4 archive ({SCHEMA_FILE})",
+            v4_path.display()
         )));
     }
-    let v3 = open_read_only(v3_path, true)?;
+    let (src, schema) = open_source(src_path)?;
     let store = Store::open(&v4_path.join(STORE_DIR), Options::maintenance(1 << 30))?;
     let head = store.head().unwrap_or(0);
     let mut rng = seed | 1;
@@ -937,7 +1172,7 @@ pub fn verify_v4_against_v3(
         let mut ro = ReadOptions::default();
         ro.set_total_order_seek(true);
         // The source may be ahead of the converted archive.
-        let mut keys = KeyVersions::new(&v3, storage, ro, head);
+        let mut keys = KeyVersions::new(&src, schema, storage, ro, head);
         for i in 0..samples {
             if i > 0 && i % 5000 == 0 {
                 info!(target: "migrate", "v4 verify: {} {i}/{samples} keys, {report:?}",
@@ -952,13 +1187,17 @@ pub fn verify_v4_against_v3(
                 // random in that address (or, past its last one, the first
                 // slot of the address after it).
                 if let Some(raw) = keys.iter.key() {
-                    let first = version_key(raw, k)?.0.to_vec();
+                    let first = version_key(schema, raw, k)?.0.to_vec();
                     let mut inner = first.clone();
                     for b in &mut inner[32..] {
                         *b = next() as u8;
                     }
                     keys.iter.seek(&inner);
-                    let landed = keys.iter.key().map(|raw| version_key(raw, k)).transpose()?;
+                    let landed = keys
+                        .iter
+                        .key()
+                        .map(|raw| version_key(schema, raw, k))
+                        .transpose()?;
                     if landed.is_some_and(|(key, _)| key[..32] == first[..32] && key != &first[..])
                     {
                         report.inner_slots += 1;
@@ -998,17 +1237,17 @@ pub fn verify_v4_against_v3(
                     report.mismatches += 1;
                     if report.mismatches <= 20 {
                         warn!(target: "migrate",
-                            "v4 verify mismatch: key {} at {h}: v3 {want:?} (next version {next_version}), v4 {read:?}",
+                            "v4 verify mismatch: key {} at {h}: source {want:?} (next version {next_version}), v4 {read:?}",
                             hex(&key[..k]));
                     }
                 }
             }
-            // A key next to it that v3 does not hold.
+            // A key next to it that the source does not hold.
             let mut absent = key;
             absent[k - 1] ^= 0x5a;
             keys.iter.seek(&absent[..k]);
             let held = match keys.iter.key() {
-                Some(raw) => version_key(raw, k)?.0 == &absent[..k],
+                Some(raw) => version_key(schema, raw, k)?.0 == &absent[..k],
                 None => {
                     keys.iter.status()?;
                     false
@@ -1023,9 +1262,69 @@ pub fn verify_v4_against_v3(
                     .is_some()
                 {
                     report.mismatches += 1;
-                    warn!(target: "migrate", "v4 verify: key {} absent in v3 but found", hex(&absent[..k]));
+                    warn!(target: "migrate", "v4 verify: key {} absent in the source but found", hex(&absent[..k]));
                 }
             }
+        }
+    }
+    let Some(head) = store.head() else {
+        return Ok(report);
+    };
+    let mismatch = |report: &mut V4VerifyReport, what: String| {
+        report.mismatches += 1;
+        if report.mismatches <= 20 {
+            warn!(target: "migrate", "v4 verify mismatch: {what}");
+        }
+    };
+    for i in 0..samples {
+        if i > 0 && i % 5000 == 0 {
+            info!(target: "migrate", "v4 verify: block {i}/{samples}, {report:?}");
+        }
+        let number = next() % (head + 1);
+        let want = source_block(&src, number)?;
+        report.blocks += 1;
+        if store.block(number)? != want || store.block_hash(number)? != want.map(|rec| rec.0) {
+            mismatch(&mut report, format!("block {number}"));
+        }
+    }
+    if let Some(cf) = src.cf_handle(StorageTypeColumn::HashToCode.to_str()) {
+        let ahead = source_head(&src)?.saturating_sub(head);
+        let mut later = 0u64;
+        let mut ro = ReadOptions::default();
+        ro.set_total_order_seek(true);
+        let mut iter = src.raw_iterator_cf_opt(cf, ro);
+        for i in 0..samples {
+            if i > 0 && i % 5000 == 0 {
+                info!(target: "migrate", "v4 verify: code {i}/{samples}, {report:?}");
+            }
+            let probe: [u8; 32] = std::array::from_fn(|_| next() as u8);
+            iter.seek(probe);
+            let (Some(hash), Some(code)) = (iter.key(), iter.value()) else {
+                iter.status()?;
+                continue;
+            };
+            let hash: [u8; 32] = hash
+                .try_into()
+                .map_err(|_| Error::UnSupported("malformed code hash".into()))?;
+            match store.code(&hash)? {
+                None if ahead > 0 => later += 1,
+                read => {
+                    report.codes += 1;
+                    if read.as_deref() != Some(code) {
+                        mismatch(&mut report, format!("code {}", hex(&hash)));
+                    }
+                }
+            }
+            if hash != probe && store.code(&probe)?.is_some() {
+                mismatch(
+                    &mut report,
+                    format!("code {} absent in the source but found", hex(&probe)),
+                );
+            }
+        }
+        if later > 0 {
+            info!(target: "migrate",
+                "v4 verify: {later} codes of the source are not in v4; the source is {ahead} blocks ahead");
         }
     }
     Ok(report)
@@ -1255,6 +1554,252 @@ mod tests {
         d
     }
 
+    /// What a node on the archive answers at heights up to `head`.
+    fn read_all(db: &Arc<DataBaseRef>, head: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for h in (1..=head).step_by(3).chain([head]) {
+            let state = db
+                .db_at(BlockId::Number(BlockNumberOrTag::Number(h)))
+                .unwrap()
+                .unwrap();
+            for a in 0..42u64 {
+                out.push(format!("{:?}", state.read_account(word(a)).unwrap()));
+                for s in (0..if a == 1 { 302 } else { 4 }).step_by(if a == 1 { 17 } else { 1 }) {
+                    out.push(format!(
+                        "{:?}",
+                        state
+                            .read_storage_and_height(word(a), word(10_000 + a * 1000 + s))
+                            .unwrap()
+                    ));
+                }
+            }
+            out.push(format!("{:?}", state.read_storage_slots(word(1)).unwrap()));
+        }
+        out
+    }
+
+    fn append(db: &Arc<DataBaseRef>, blocks: std::ops::RangeInclusive<u64>) {
+        for n in blocks {
+            let state = StateDBWrapper(
+                db.db_at(BlockId::Number(BlockNumberOrTag::Latest))
+                    .unwrap()
+                    .unwrap(),
+            );
+            state.update_block(block_info(n), diff(n)).unwrap();
+        }
+    }
+
+    /// The base files of the v4 archive at `dir`, by name.
+    fn base_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir.join(STORE_DIR))
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                name.starts_with("base-")
+                    .then(|| (name, std::fs::read(entry.path()).unwrap()))
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Every key of a kind in the source at `dir` with its versions, at
+    /// most `cap` of each.
+    fn source_versions(dir: &Path, storage: bool, cap: usize) -> Vec<Vec<(u64, String)>> {
+        let (src, schema) = open_source(dir).unwrap();
+        let mut keys = KeyVersions::new(&src, schema, storage, scan_options(None, None), 60);
+        keys.iter.seek_to_first();
+        let mut out = Vec::new();
+        while keys.next_key(cap).unwrap() {
+            if let Some(first) = keys.versions.first() {
+                let key = hex(&first.key[..key_len(storage)]);
+                out.push(
+                    keys.versions
+                        .iter()
+                        .map(|r| (r.block, format!("{key} {:?}", r.val)))
+                        .collect(),
+                );
+            }
+        }
+        out
+    }
+
+    /// The same blocks in a v1, a v2 and a v3 archive convert to the same
+    /// v4 archive, which answers as each of them.
+    #[test]
+    fn a_source_of_any_rocksdb_schema_converts_alike() {
+        use crate::db_impl::archive_encoding::{encode_account_key, encode_storage_key};
+        let _g = ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("leafage-v4-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut converted = Vec::new();
+        for schema in [ArchiveSchema::V1, ArchiveSchema::V2, ArchiveSchema::V3] {
+            let (src, dst) = (
+                base.join(schema.to_string()),
+                base.join(format!("{schema}-v4")),
+            );
+            set_inverted_block_encoding(schema.inverted());
+            init_archive_schema(&src, schema).unwrap();
+            let (want, sentinels) = {
+                let db = Arc::new(DataBaseRef::open(&src, 64, false, false));
+                // A v1 archive from before the marker has none.
+                if schema.inverted() {
+                    db.write_encoding_marker(true).unwrap();
+                }
+                append(&db, 1..=60);
+                let mut batch = db.prepare_write_batch().unwrap();
+                db.write_code(&mut batch, word(901), Bytes::from(vec![1, 2, 3]))
+                    .unwrap();
+                db.commit(batch).unwrap();
+                let want = read_all(&db, 60);
+                // The pointers to the latest version that an early v1
+                // archive holds: no versions, and here no values either.
+                let mut sentinels = 0;
+                if schema == ArchiveSchema::V1 {
+                    let [accounts, slots] = [
+                        StorageTypeColumn::AddressToAccount,
+                        StorageTypeColumn::AddressToStorage,
+                    ]
+                    .map(|col| db.db.cf_handle(col.to_str()).unwrap());
+                    for a in 0..40u64 {
+                        let slot = word(10_000 + a * 1000);
+                        db.db
+                            .put_cf(accounts, encode_account_key(word(a), u64::MAX), [0xff; 5])
+                            .unwrap();
+                        db.db
+                            .put_cf(
+                                slots,
+                                encode_storage_key(word(a), slot, u64::MAX),
+                                [0xff; 40],
+                            )
+                            .unwrap();
+                        sentinels += 2;
+                    }
+                }
+                (want, sentinels)
+            };
+
+            let passes = || [0, 1].map(|i| KEY_PASSES[i].load(Ordering::Relaxed));
+            let before = passes();
+            // One worker: the files are numbered in the order of the keys.
+            let report = DataBaseRef::convert_to_v4(&src, &dst, 1).unwrap();
+            let [whole, windows] = [0, 1].map(|i| passes()[i] - before[i]);
+            assert_eq!(
+                (report.head, report.above_head, report.sentinels),
+                (60, 0, sentinels),
+                "{schema}"
+            );
+            // Keys with few versions and keys passed on in several windows.
+            assert!(whole > 20 && windows > 100, "{schema}: {whole} {windows}");
+            let files = base_files(&dst);
+
+            let verify = verify_v4_against_source(&src, &dst, 300, 7).unwrap();
+            assert_eq!(verify.mismatches, 0, "{schema}: {verify:?}");
+            assert!(
+                verify.keys > 100 && verify.absent_keys > 100 && verify.inner_slots > 0,
+                "{schema}: {verify:?}"
+            );
+            // The newest versions of a key, when not all are wanted.
+            let mut versions = Vec::new();
+            for storage in [false, true] {
+                let all = source_versions(&src, storage, usize::MAX);
+                let newest = source_versions(&src, storage, 5);
+                assert_eq!(all.len(), newest.len(), "{schema}");
+                assert!(all.iter().any(|key| key.len() > 10), "{schema}");
+                for (all, newest) in all.iter().zip(&newest) {
+                    assert!(all.windows(2).all(|w| w[0].0 < w[1].0), "{schema}");
+                    assert_eq!(&all[all.len().saturating_sub(5)..], &newest[..], "{schema}");
+                }
+                versions.push(all);
+            }
+
+            set_inverted_block_encoding(true);
+            let db = Arc::new(DataBaseRef::open(&dst, 64, false, false));
+            assert!(db.is_schema_v4());
+            assert!(
+                read_all(&db, 60) == want,
+                "{schema}: reads of the converted archive"
+            );
+            for n in [1u64, 17, 60] {
+                let info = db.read_block_info(block_info(n).header.hash).unwrap();
+                assert_eq!(info.map(|info| info.header.number), Some(n));
+            }
+            assert_eq!(
+                db.read_code(word(901)).unwrap(),
+                Some(Bytes::from(vec![1, 2, 3]))
+            );
+            drop(db);
+            converted.push((
+                schema,
+                (report.accounts, report.storage),
+                want,
+                versions,
+                files,
+            ));
+        }
+        let (_, records, reads, versions, files) = &converted[2];
+        assert!(records.0 > 300 && records.1 > 3000 && files.len() >= 2);
+        for (schema, r, w, v, f) in &converted[..2] {
+            assert_eq!(r, records, "{schema}");
+            assert!(w == reads, "{schema}: reads of the source");
+            assert!(v == versions, "{schema}: versions of the source");
+            assert_eq!(
+                f.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                files.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                "{schema}"
+            );
+            assert!(f == files, "{schema}: base files");
+        }
+        set_inverted_block_encoding(false);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A source without a schema file is v1 or v2 as its keys say, and is
+    /// refused if its encoding marker says otherwise. A v4 archive is no
+    /// source.
+    #[test]
+    fn a_source_is_told_v1_from_v2_by_its_keys() {
+        let _g = ARCHIVE_DB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("leafage-v4-schema-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for (i, (inverted, marker, want)) in [
+            (false, None, Some(ArchiveSchema::V1)),
+            (false, Some(false), Some(ArchiveSchema::V1)),
+            (true, None, Some(ArchiveSchema::V2)),
+            (true, Some(true), Some(ArchiveSchema::V2)),
+            (false, Some(true), None),
+            (true, Some(false), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = base.join(i.to_string());
+            set_inverted_block_encoding(inverted);
+            {
+                let db = Arc::new(DataBaseRef::open(&dir, 64, false, false));
+                append(&db, 1..=5);
+                if let Some(marker) = marker {
+                    db.write_encoding_marker(marker).unwrap();
+                }
+            }
+            let found = open_source(&dir).map(|(_, schema)| schema).ok();
+            assert_eq!(found, want, "inverted {inverted}, marker {marker:?}");
+            if want.is_none() {
+                assert!(DataBaseRef::convert_to_v4(&dir, &base.join("refused"), 1).is_err());
+            }
+        }
+        let v4 = base.join("v4");
+        init_archive_schema(&v4, ArchiveSchema::V4).unwrap();
+        assert!(open_source(&v4).is_err());
+        set_inverted_block_encoding(false);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The head of a source that keeps its block infos by number is found
     /// below the infos a head-only rewind left above it.
     #[test]
@@ -1290,29 +1835,6 @@ mod tests {
         let (src, dst) = (base.join("v3"), base.join("v4"));
         set_inverted_block_encoding(true);
         init_archive_schema(&src, ArchiveSchema::V3).unwrap();
-        let read_all = |db: &Arc<DataBaseRef>, head: u64| {
-            let mut out = Vec::new();
-            for h in (1..=head).step_by(3).chain([head]) {
-                let state = db
-                    .db_at(BlockId::Number(BlockNumberOrTag::Number(h)))
-                    .unwrap()
-                    .unwrap();
-                for a in 0..42u64 {
-                    out.push(format!("{:?}", state.read_account(word(a)).unwrap()));
-                    for s in (0..if a == 1 { 302 } else { 4 }).step_by(if a == 1 { 17 } else { 1 })
-                    {
-                        out.push(format!(
-                            "{:?}",
-                            state
-                                .read_storage_and_height(word(a), word(10_000 + a * 1000 + s))
-                                .unwrap()
-                        ));
-                    }
-                }
-                out.push(format!("{:?}", state.read_storage_slots(word(1)).unwrap()));
-            }
-            out
-        };
         let want = {
             let db = Arc::new(DataBaseRef::open(&src, 64, false, false));
             db.write_encoding_marker(true).unwrap();
@@ -1349,7 +1871,7 @@ mod tests {
             read_all(&db, 60)
         };
 
-        let report = DataBaseRef::convert_udt_to_v4(&src, &dst, 3).unwrap();
+        let report = DataBaseRef::convert_to_v4(&src, &dst, 3).unwrap();
         assert_eq!(report.head, 60);
         assert!(report.accounts > 300 && report.storage > 3000, "{report:?}");
         assert_eq!(report.above_head, 0);
@@ -1358,13 +1880,14 @@ mod tests {
         let [whole, windows] = [0, 1].map(|i| KEY_PASSES[i].load(Ordering::Relaxed));
         assert!(whole > 20 && windows > 100, "{whole} {windows}");
         // Converting into it again is refused.
-        assert!(DataBaseRef::convert_udt_to_v4(&src, &dst, 3).is_err());
+        assert!(DataBaseRef::convert_to_v4(&src, &dst, 3).is_err());
 
-        let verify = verify_v4_against_v3(&src, &dst, 300, 7).unwrap();
+        let verify = verify_v4_against_source(&src, &dst, 300, 7).unwrap();
         assert_eq!(verify.mismatches, 0, "{verify:?}");
         assert!(verify.keys > 100 && verify.absent_keys > 100, "{verify:?}");
         // Slots inside the contract with many are among those compared.
         assert!(verify.inner_slots > 0, "{verify:?}");
+        assert!(verify.blocks == 300 && verify.codes > 0, "{verify:?}");
 
         let [warm, run] = replay_get_trace(&dst, &base.join("trace"), 3, 64, 100).unwrap();
         assert_eq!((warm.gets, run.gets), (100, 700));
@@ -1407,7 +1930,27 @@ mod tests {
             );
             state.update_block(block_info(61), diff(61)).unwrap();
         }
-        let verify = verify_v4_against_v3(&src, &dst, 300, 9).unwrap();
+        let verify = verify_v4_against_source(&src, &dst, 300, 9).unwrap();
+        assert_eq!(verify.mismatches, 0, "{verify:?}");
+        // A code and a block that only the source has are told.
+        let other_code = |db: &Arc<DataBaseRef>| {
+            let mut batch = db.prepare_write_batch().unwrap();
+            db.write_code(&mut batch, H256::from([0xff; 32]), Bytes::from(vec![4, 5]))
+                .unwrap();
+            db.commit(batch).unwrap();
+        };
+        {
+            let db = Arc::new(DataBaseRef::open(&src, 64, false, false));
+            other_code(&db);
+        }
+        let verify = verify_v4_against_source(&src, &dst, 300, 9).unwrap();
+        assert!(verify.mismatches > 0, "{verify:?}");
+        // Unless the source went on: the code may be of a later block.
+        {
+            let db = Arc::new(DataBaseRef::open(&src, 64, false, false));
+            append(&db, 62..=62);
+        }
+        let verify = verify_v4_against_source(&src, &dst, 300, 9).unwrap();
         assert_eq!(verify.mismatches, 0, "{verify:?}");
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -1,8 +1,8 @@
 # Archive schema v4: an archive in files of its own, without RocksDB
 
 Status: **implemented, not yet in production**. Reads, writes, new v4
-archives, an offline v3 → v4 conversion with a verifier, and offline rewind
-are implemented and tested against v3 (see "Results").
+archives, an offline conversion from v1, v2 or v3 with a verifier, and
+offline rewind are implemented and tested against v3 (see "Results").
 
 A v4 archive has no RocksDB and no log. What it has written to files is
 all it keeps: a node that stops loses the last blocks it took (36 minutes
@@ -466,21 +466,37 @@ below it.
 
 `--head-only` is refused: v4 cannot keep versions above its head.
 
-## Conversion from v3
+## Conversion from v1, v2 or v3
 
-`leafage-evm archive-v4 convert --src <v3> --dst <new dir>` rewrites a v3
-archive offline; the source is opened read-only.
+`leafage-evm archive-v4 convert --src <archive> --dst <new dir>` rewrites a
+RocksDB archive of any earlier schema offline; the source is opened
+read-only. The schema file names a v3 source. One without it is v1 or v2,
+told by its keys: the tail of a version is its block on v1 and `u64::MAX`
+less its block on v2, so it is below 2^63 on one and above on the other.
+The encoding marker must agree if the archive has one (an archive from
+before the marker has none); a source whose sampled keys are in both
+encodings is refused.
 
 - One zstd dictionary per kind is trained on keys sampled over the key
   space.
-- Each worker reads a key range of a versioned CF with every version
-  (`iter_start_ts`), newest first, turns a key's versions round and writes
-  base files. Versions above the source's head are left behind and counted.
-  A key with more than 262,144 versions (an account that changes in every
-  block has one per block of the chain) is not held whole: the first pass
-  notes the block of every 262,144th version, and the key is read again in
-  those block windows (`timestamp` / `iter_start_ts`), oldest window first.
-  A worker so holds two windows at most, about 80 MB.
+- Each worker reads a key range of a versioned CF with every version and
+  writes base files, a key's versions oldest first. Versions above the
+  source's head are left behind and counted.
+  - v2 and v3 sort a key's versions newest first (v3 gives them with
+    `iter_start_ts`), so a key's versions are turned round. A key with more
+    than 262,144 versions (an account that changes in every block has one
+    per block of the chain) is not held whole: the first pass notes the
+    block of every 262,144th version, and the key is read again in those
+    block windows, oldest window first (on v3 with `timestamp` /
+    `iter_start_ts`, on v2 with a seek to the newest block of the window).
+    A worker so holds two windows at most, about 80 MB.
+  - v1 sorts them oldest first: they go to the files as they are read, a
+    window at a time. The pointers to the latest version that the first v1
+    archives wrote beside each version (block `u64::MAX`, stale since) are
+    left behind and counted, as `db-migrate --reencode-inverted` does.
+- Values are the same in the three schemas but for the leading zeros of a
+  slot's value, which v3 drops: the same blocks give the same base files
+  from any of them.
 - Block infos (from CF `7`, or CFs `3` and `2`) and code (CF `6`) are read
   in order and written to the block and code files; a block number the
   source does not have becomes an absent block. The saved block index is
@@ -489,13 +505,18 @@ archive offline; the source is opened read-only.
 - The result has no delta. The schema file is written last: an interrupted
   conversion cannot be opened.
 
-`leafage-evm archive-v4 verify --v3 <v3> --v4 <v4>` reads random keys of
-both kinds at heights around each version, and absent keys, and compares
+`leafage-evm archive-v4 verify --src <archive> --v4 <v4>` (`--v3` is the
+earlier name of `--src`) reads random keys of both kinds of the source,
+whatever its schema, at heights around each version, and absent keys, and compares
 value, block, and that the span v4 reports skips no version. A storage key
 is picked in two steps, an address and then a slot of it, so that the slots
 inside large contracts are among them (`inner_slots` in the report; the
 verification under Results was run before this, and took the first slot of
-each address it picked). It opens the v4 store itself: stop the node first.
+each address it picked). It then compares as many block numbers (hash and
+info, or that neither has the block) and as many codes of the source, and
+checks that v4 has no code under a hash the source has none under
+(`blocks` and `codes` in the report). It opens the v4 store itself: stop
+the node first.
 
 To move a fleet: convert on the seed, verify, snapshot, and create the
 replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
@@ -540,7 +561,8 @@ archive.
 - Block numbers of 2^32 and above.
 - An exact restart: see "Writes".
 - Archives of development builds that kept block infos and code in a
-  RocksDB next to the store: convert the v3 source again.
+  RocksDB next to the store: convert the source again.
+- Converting an MDBX archive: `archive-v4 convert` reads RocksDB archives.
 
 ## Results (bsc)
 
@@ -816,6 +838,12 @@ the second is the node as the others were. Each archive's node answered
 200,000 of the captured requests (1,036,115 calls) as the v3 node beside it
 did.
 
+These ran with 512 MiB reserved for segment filters. With the 1024 MiB of
+the default since (a page cache of 4.58 GiB instead of 5.08) the 2 GiB
+archive gave 0.269 ms of CPU per request, p50 / p99 of 0.30 / 2.45 ms,
+0.123 device reads and 0.354 pages per request, and 15,200 requests/s from
+a cold start: no difference.
+
 **The p99 of the runs before these is not the nodes' alone.** The bench
 host runs another workload that takes two cores or more for 75 – 100 s
 about every 12.5 minutes. In those windows requests wait three to ten times
@@ -851,3 +879,43 @@ took 8 s and rewrote 4 files of 0.13 GiB together.
 Not measured here: a rewrite pass to its end on a serving node (no node has
 run long enough to start one by itself; covered by tests and by the
 store-level runs of the study), and more than ten minutes of traffic.
+
+## Results (base, from a v2 archive)
+
+The same bench host, source and result on gp3 volumes (8000 IOPS,
+1000 MB/s). The source is a v2 archive of base through block 53,490,927,
+1304 GiB, from before the block index: its block infos are read by hash.
+
+`archive-v4 convert` with 10 workers took 6 h 01 min and at most 29.6 GiB
+of memory (container limit 64 GiB). It told the schema by the keys and
+passed 14,492,965,279 account and 37,939,475,762 storage versions, the
+counts the v2 → v3 conversion of the same archive gave, with 53,490,928
+blocks and 9,651,153 codes; none above the head, no pointer of v1.
+
+| | v2 | v3 (converted from the same archive earlier) | v4 |
+|---|---|---|---|
+| Whole archive | 1304 GiB | 953 GiB | 726 GiB (−44 % / −24 %) |
+| Account and storage history | | | 695.6 GiB in 390 base files, 14.2 bytes per version |
+| Block infos | | | `blocks.dat` 19.5 GiB, `blocks.pfx` 0.40 GiB |
+| Code | | | `code.dat` 8.45 GiB, `code.idx` 0.40 GiB |
+| Index in memory | | | 1.26 GiB, loaded in 2.7 s at open |
+
+The history was written after about 5 h. The last hour was the block infos
+alone: read by hash they are point reads on one thread, about 2,750 blocks
+a second over the whole run (a source with CF `7` is read in order).
+
+`archive-v4 verify` against the v2 source, 20,000 samples, twice with
+different seeds (6 minutes each): 40,000 keys (14,077 of the storage keys
+inside a contract), 1,080,000 reads, and in the second run 20,000 block
+numbers and 20,000 codes; no mismatch.
+
+A node of the released v1.2.85 image then opened the result (2.7 s) and
+brought it from block 53,490,927 to the chain head, 5.8 M blocks from S3 in
+68 minutes on 8 CPUs (about 1,400 blocks a second, 5 GiB of memory, the
+device not throttled), and follows the chain since. The archive grew by
+15 GiB to 741 GiB. Balances, storage slots, nonces and calls at seven
+heights from block 1,000,000 to the new head, on both sides of the
+conversion's head, are those a public base endpoint gives (42 of 42).
+
+Not measured: a v1 source of real size (v1 is covered by the tests, where
+the same blocks written as v1, v2 and v3 convert to the same base files).

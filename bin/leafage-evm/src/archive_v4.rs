@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Result};
 use leafage_evm_storage::{
-    replay_get_trace, set_inverted_block_encoding, verify_v4_against_v3, ArchiveRocksDBStorage,
+    replay_get_trace, set_inverted_block_encoding, verify_v4_against_source, ArchiveRocksDBStorage,
 };
 use std::path::PathBuf;
 use tracing::info;
@@ -17,11 +17,12 @@ pub struct Command {
 
 #[derive(Debug, clap::Subcommand)]
 enum Action {
-    /// Rewrite a v3 archive as schema v4 into a new directory. The source
-    /// is opened read-only. `ARCHIVE_V4_BASE_ZSTD_LEVEL` (default 3) and
+    /// Rewrite a RocksDB archive (schema v1, v2 or v3; which one is read
+    /// from the archive) as schema v4 into a new directory. The source is
+    /// opened read-only. `ARCHIVE_V4_BASE_ZSTD_LEVEL` (default 3) and
     /// `ARCHIVE_V4_BASE_FILE_MB` (default 2048) shape the files written.
     Convert {
-        /// The v3 archive database.
+        /// The v1, v2 or v3 archive database.
         #[arg(long, value_name = "PATH")]
         src: PathBuf,
         /// The v4 archive to create; must not exist or be empty.
@@ -31,10 +32,12 @@ enum Action {
         #[arg(long, default_value = "8")]
         jobs: usize,
     },
-    /// Compare a v4 archive with the v3 archive it was converted from.
+    /// Compare a v4 archive with the v1, v2 or v3 archive it was converted
+    /// from.
     Verify {
-        #[arg(long, value_name = "PATH")]
-        v3: PathBuf,
+        /// The source archive (`--v3` is the earlier name of this option).
+        #[arg(long, value_name = "PATH", alias = "v3")]
+        src: PathBuf,
         #[arg(long, value_name = "PATH")]
         v4: PathBuf,
         /// Random keys per kind (accounts, storage).
@@ -77,16 +80,16 @@ impl Command {
     pub async fn run(&mut self) -> Result<()> {
         match &self.action {
             Action::Convert { src, dst, jobs } => {
-                let report = ArchiveRocksDBStorage::convert_udt_to_v4(src, dst, *jobs)?;
+                let report = ArchiveRocksDBStorage::convert_to_v4(src, dst, *jobs)?;
                 info!(target: "migrate", "archive-v4 convert: {report:?}");
             }
             Action::Verify {
-                v3,
+                src,
                 v4,
                 samples,
                 seed,
             } => {
-                let report = verify_v4_against_v3(v3, v4, *samples, *seed)?;
+                let report = verify_v4_against_source(src, v4, *samples, *seed)?;
                 info!(target: "migrate", "archive-v4 verify: {report:?}");
                 if report.mismatches > 0 {
                     bail!("{} mismatches", report.mismatches);

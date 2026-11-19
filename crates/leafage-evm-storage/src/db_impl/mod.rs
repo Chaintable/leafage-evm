@@ -22,7 +22,7 @@ pub use rocksdb;
 pub(crate) use rocksdb_impl::ARCHIVE_DB_TEST_LOCK;
 pub use rocksdb_impl::{
     init_archive_schema, is_archive_schema_v4, replay_get_trace, verify_udt_against_v2,
-    verify_v4_against_v3, ArchiveRocksDBStorage, ArchiveSchema, ArchiveStateDB, BulkColumn,
+    verify_v4_against_source, ArchiveRocksDBStorage, ArchiveSchema, ArchiveStateDB, BulkColumn,
     RocksDBStorage, UdtConvertReport, UdtVerifyReport, V4ConvertReport, V4ReplayReport,
     V4VerifyReport,
 };
