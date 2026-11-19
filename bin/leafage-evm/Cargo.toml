@@ -42,3 +42,6 @@ futures.workspace = true
 lru.workspace = true
 axum.workspace = true
 pprof = { workspace = true, features = ["cpp", "prost-codec"] }
+base64.workspace = true
+prost.workspace = true
+bech32.workspace = true

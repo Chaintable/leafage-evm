@@ -61,6 +61,8 @@ pub(crate) enum Commands {
     /// Replay a chain's blocks on its archive DB into pipeline-compactor bundles
     #[command(name = "pipeline-export")]
     PipelineExport(pipeline_export::Command),
+    /// Replay Cronos archive blocks to local files.
+    PipelineReplay(crate::pipeline_replay::Command),
 }
 
 impl Commands {
@@ -78,6 +80,7 @@ impl Commands {
             Commands::ArchiveV4(mut cmd) => cmd.run().await,
             Commands::PutCode(mut cmd) => cmd.run().await,
             Commands::PipelineExport(mut cmd) => cmd.run().await,
+            Commands::PipelineReplay(cmd) => cmd.run().await,
         }
     }
 }

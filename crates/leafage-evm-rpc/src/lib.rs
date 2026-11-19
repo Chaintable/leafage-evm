@@ -15,5 +15,6 @@ mod metrics;
 
 mod pipeline;
 pub use pipeline::{
-    bundle_range, export_bundles, Chain, ExportConfig, Resource, S3Target, BUNDLE_SIZE,
+    bundle_range, export_bundles, native_block_file, replay_cronos_ethermint, Chain, ExportConfig,
+    Resource, S3Target, BUNDLE_SIZE,
 };
