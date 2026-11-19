@@ -816,6 +816,12 @@ the second is the node as the others were. Each archive's node answered
 200,000 of the captured requests (1,036,115 calls) as the v3 node beside it
 did.
 
+These ran with 512 MiB reserved for segment filters. With the 1024 MiB of
+the default since (a page cache of 4.58 GiB instead of 5.08) the 2 GiB
+archive gave 0.269 ms of CPU per request, p50 / p99 of 0.30 / 2.45 ms,
+0.123 device reads and 0.354 pages per request, and 15,200 requests/s from
+a cold start: no difference.
+
 **The p99 of the runs before these is not the nodes' alone.** The bench
 host runs another workload that takes two cores or more for 75 – 100 s
 about every 12.5 minutes. In those windows requests wait three to ten times
