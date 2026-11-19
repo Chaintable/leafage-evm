@@ -266,6 +266,13 @@ pub(crate) struct Api<C> {
     pub(super) rpc_block_zero: Option<DebankBlock>,
 }
 
+impl<C> Api<C> {
+    pub(super) fn with_rpc_block_zero(mut self, block: Option<DebankBlock>) -> Self {
+        self.rpc_block_zero = block;
+        self
+    }
+}
+
 impl<C> Clone for Api<C> {
     fn clone(&self) -> Self {
         Self {

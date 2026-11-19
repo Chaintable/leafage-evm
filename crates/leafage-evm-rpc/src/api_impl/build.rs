@@ -324,7 +324,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                let api = Api::new(api_impl);
+                let api = Api::new(api_impl).with_rpc_block_zero(self.rpc_block_zero);
                 warmup_api(
                     &api,
                     self.replay_blocks.take(),
@@ -333,7 +333,7 @@ where
                 .await;
                 let $api = api.clone();
                 $extra
-                register_api(&mut rpc_module, api, self.rpc_block_zero.as_ref())?;
+                register_api(&mut rpc_module, api)?;
             }};
         }
 
@@ -422,14 +422,14 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                let api = Api::new(api_impl);
+                let api = Api::new(api_impl).with_rpc_block_zero(self.rpc_block_zero);
                 warmup_api(
                     &api,
                     self.replay_blocks.take(),
                     self.warmup_erc20_addresses.take(),
                 )
                 .await;
-                register_api(&mut rpc_module, api.clone(), self.rpc_block_zero.as_ref())?;
+                register_api(&mut rpc_module, api.clone())?;
                 super::celo::l1::rpc::register(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Base(env) => {
@@ -487,14 +487,14 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                let api = Api::new(api_impl);
+                let api = Api::new(api_impl).with_rpc_block_zero(self.rpc_block_zero);
                 warmup_api(
                     &api,
                     self.replay_blocks.take(),
                     self.warmup_erc20_addresses.take(),
                 )
                 .await;
-                register_api(&mut rpc_module, api, self.rpc_block_zero.as_ref())?;
+                register_api(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Citrea(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
@@ -561,11 +561,7 @@ where
         })
 }
 
-fn register_api<A>(
-    rpc_module: &mut RpcModule<()>,
-    api: Api<A>,
-    rpc_block_zero: Option<&DebankBlock>,
-) -> std::io::Result<()>
+fn register_api<A>(rpc_module: &mut RpcModule<()>, api: Api<A>) -> std::io::Result<()>
 where
     A: ApiCore,
     <A as ApiBase>::DB: BlockIndex + EvmStorageRead,
@@ -573,10 +569,8 @@ where
     DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
     PreErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
 {
-    let mut debank_api = api.clone();
-    debank_api.rpc_block_zero = rpc_block_zero.cloned();
     rpc_module
-        .merge(DebankApiServer::into_rpc(debank_api))
+        .merge(DebankApiServer::into_rpc(api.clone()))
         .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
