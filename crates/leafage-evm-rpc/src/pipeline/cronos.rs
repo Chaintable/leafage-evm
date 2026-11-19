@@ -105,6 +105,54 @@ fn ethermint_sstore<D: Database>(
     })
 }
 
+/// Cronos mainnet genesis sets london_block to 2^63. The v0.7.0
+/// upgrade handler sets it to zero and enables the fee market at Huygen.
+/// v1 and later require independently verified execution rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CronosEra {
+    BeforeHuygen,
+    Huygen,
+}
+
+impl CronosEra {
+    pub fn at_height(height: u64) -> Option<Self> {
+        match height {
+            1..2_693_800 => Some(Self::BeforeHuygen),
+            2_693_800..6_542_800 => Some(Self::Huygen),
+            _ => None,
+        }
+    }
+
+    pub fn version(self) -> &'static str {
+        match self {
+            Self::BeforeHuygen => "ethermint-transient-v2",
+            Self::Huygen => "ethermint-statedb-v2",
+        }
+    }
+
+    pub fn spec(self, base_fee: Option<u64>) -> Result<SpecId> {
+        let spec = match self {
+            Self::BeforeHuygen => SpecId::BERLIN,
+            Self::Huygen => SpecId::LONDON,
+        };
+        ensure!(
+            base_fee.is_some() == (spec == SpecId::LONDON),
+            "baseFeePerGas inconsistent with Cronos mainnet {self:?}"
+        );
+        Ok(spec)
+    }
+}
+
+/// Identifies storage failures even when they occur inside an EVM instruction.
+#[derive(Debug)]
+pub struct CronosArchiveRead;
+
+impl std::fmt::Display for CronosArchiveRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reading Cronos archive state")
+    }
+}
+
 pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
     parent: D,
     block: &Block,
@@ -121,13 +169,12 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
         "receipt count mismatch"
     );
     let header = &block.header;
-    let transient = header.number < 2_693_800;
-    let spec = if header.base_fee_per_gas.is_some() {
-        SpecId::LONDON
-    } else {
-        SpecId::BERLIN
-    };
+    let era = CronosEra::at_height(header.number).context("unsupported Cronos execution era")?;
+    let transient = era == CronosEra::BeforeHuygen;
+    let spec = era.spec(header.base_fee_per_gas)?;
     let mut cfg = CfgEnv::new_with_spec(spec).with_chain_id(25);
+    // Ethermint exposes zero to GASLIMIT for an unbounded block meter.
+    cfg.disable_block_gas_limit = gas_limit == 0;
     cfg.gas_params.override_gas([
         (GasId::sstore_static(), 800),
         (GasId::sstore_set_without_load_cost(), 19_200),
@@ -152,7 +199,11 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
     );
     let mut db = CacheDB::new(parent);
     for &(address, credit, amount) in begin_transfers {
-        let balance = &mut db.load_account(address)?.info.balance;
+        let balance = &mut db
+            .load_account(address)
+            .context(CronosArchiveRead)?
+            .info
+            .balance;
         *balance = if credit {
             balance.checked_add(amount)
         } else {
@@ -189,7 +240,10 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
         let collector = alloy::primitives::address!("f1829676db577682e944fc3493d451b67ff3e29f");
         let escrow = U256::from(envelope.gas_limit())
             * U256::from(envelope.effective_gas_price(header.base_fee_per_gas));
-        db.load_account(collector)?.info.balance += escrow;
+        db.load_account(collector)
+            .context(CronosArchiveRead)?
+            .info
+            .balance += escrow;
         let mut evm = EthEvmFactory::default()
             .create_evm_with_inspector(&mut db, env.clone(), PipelineInspector::new())
             .into_inner();
@@ -207,9 +261,10 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             warm,
             marker: PhantomData,
         };
-        let result = handler
-            .inspect_run(&mut evm)
-            .map_err(|e| anyhow!("tx {index} {hash}: {e:?}"))?;
+        let result = handler.inspect_run(&mut evm).map_err(|e| match e {
+            EVMError::Database(source) => anyhow::Error::new(source).context(CronosArchiveRead),
+            other => anyhow!("tx {index} {hash}: {other:?}"),
+        })?;
         warm = handler.warm;
         let state = evm.ctx.journaled_state.finalize();
         ensure!(
@@ -224,8 +279,8 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             result.tx_gas_used(),
             message_gas[index]
         );
-        // The historical RPC projects the full gas limit on reverted
-        // transactions before the refund fix; DeliverTx records execution gas.
+        // Before Huygen a revert also discarded the unused-gas refund.
+        // At H124760 tx 4 the sender paid 822893 gas; DeliverTx recorded 810418.
         let charged = if transient && !result.is_success() {
             envelope.gas_limit()
         } else {
@@ -275,13 +330,21 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
         let refund = U256::from(envelope.gas_limit() - result.tx_gas_used())
             * U256::from(envelope.effective_gas_price(header.base_fee_per_gas));
         if charged != result.tx_gas_used() {
-            let balance = &mut db.load_account(tx.inner.signer())?.info.balance;
+            let balance = &mut db
+                .load_account(tx.inner.signer())
+                .context(CronosArchiveRead)?
+                .info
+                .balance;
             *balance = balance
                 .checked_sub(refund)
                 .ok_or_else(|| anyhow!("sender cannot settle failed tx {hash}"))?;
             continue;
         }
-        let balance = &mut db.load_account(collector)?.info.balance;
+        let balance = &mut db
+            .load_account(collector)
+            .context(CronosArchiveRead)?
+            .info
+            .balance;
         *balance = balance
             .checked_sub(refund)
             .ok_or_else(|| anyhow!("fee collector cannot refund {hash}"))?;
@@ -399,4 +462,27 @@ fn check_block_file(file: &BlockFile, receipts: &[TransactionReceipt]) -> Result
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod era_tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_upgrade_boundaries_and_header_consistency() {
+        for (height, era) in [
+            (0, None),
+            (1, Some(CronosEra::BeforeHuygen)),
+            (2_693_799, Some(CronosEra::BeforeHuygen)),
+            (2_693_800, Some(CronosEra::Huygen)),
+            (6_542_799, Some(CronosEra::Huygen)),
+            (6_542_800, None),
+        ] {
+            assert_eq!(CronosEra::at_height(height), era);
+        }
+        assert_eq!(CronosEra::BeforeHuygen.spec(None).unwrap(), SpecId::BERLIN);
+        assert!(CronosEra::BeforeHuygen.spec(Some(0)).is_err());
+        assert_eq!(CronosEra::Huygen.spec(Some(0)).unwrap(), SpecId::LONDON);
+        assert!(CronosEra::Huygen.spec(None).is_err());
+    }
 }
