@@ -53,7 +53,6 @@ impl<C> Api<C> {
     pub fn new(core: C) -> Self {
         Self {
             inner: Arc::new(core),
-            rpc_block_zero: None,
         }
     }
 
@@ -190,7 +189,7 @@ where
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
         if block.is_none() {
-            if let Some(block) = self.rpc_block_zero.as_ref().filter(|_| number == 0) {
+            if let Some(block) = self.inner.evm_cfg().rpc.block_zero_at(number) {
                 return Ok(block.clone());
             }
             if self.inner.evm_cfg().is_archive {
@@ -2000,8 +1999,7 @@ where
                     .get_block_by_height(height)
                     .await
                     .or_else(|error| {
-                        let placeholder =
-                            self.rpc_block_zero.as_ref().filter(|_| block_number == 0);
+                        let placeholder = self.inner.evm_cfg().rpc.block_zero_at(block_number);
                         match (&error, placeholder) {
                             (jsonrpsee::core::ClientError::Call(err), Some(block))
                                 if err.code() == DebankErrorCode::BlockNotFound as i32

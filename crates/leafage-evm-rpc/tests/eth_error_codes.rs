@@ -8,7 +8,7 @@ use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::server::ServerHandle;
-use leafage_evm_rpc::{ApiBuilder, DebankApiClient, EthApiClient, MultiChainCfgEnv};
+use leafage_evm_rpc::{ApiBuilder, DebankApiClient, EthApiClient, MultiChainCfgEnv, RpcConfig};
 use leafage_evm_storage::{
     EvmStorageWrite, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
     StorageKind,
@@ -106,7 +106,7 @@ async fn serve(
     cfg.disable_base_fee = true;
     cfg.chain_id = 1;
     let handle = ApiBuilder::new(tree, MultiChainCfgEnv::Mainnet(cfg))
-        .with_rpc_block_zero(block_zero)
+        .with_rpc_config(RpcConfig { block_zero })
         .with_historical_config(historical_rpc, Some(1))
         .build_and_run(
             &addr.to_string(),

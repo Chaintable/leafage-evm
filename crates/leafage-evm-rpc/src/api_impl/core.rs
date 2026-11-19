@@ -29,6 +29,29 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RpcConfig {
+    pub block_zero: Option<DebankBlock>,
+}
+
+impl RpcConfig {
+    pub(super) fn block_zero_at(&self, height: u64) -> Option<&DebankBlock> {
+        self.block_zero.as_ref().filter(|_| height == 0)
+    }
+
+    pub fn validate(&self, genesis_number: u64) -> anyhow::Result<()> {
+        if let Some(block) = &self.block_zero {
+            anyhow::ensure!(block.height == 0, "rpc.block_zero requires block height 0");
+            anyhow::ensure!(
+                genesis_number > 0,
+                "rpc.block_zero requires --genesis-number greater than 0"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EvmCfg<SpecId, CustomCfg> {
     pub is_archive: bool,
@@ -39,6 +62,7 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
+    pub rpc: RpcConfig,
     /// Per-server limiter for CPU-bound EVM execution (call / multicall /
     /// estimateGas / simulate / trace). `None` keeps execution unbounded.
     pub exec_limiter: Option<Arc<tokio::sync::Semaphore>>,
@@ -263,21 +287,12 @@ pub(crate) trait GetHaltReason {
 
 pub(crate) struct Api<C> {
     pub inner: Arc<C>,
-    pub(super) rpc_block_zero: Option<DebankBlock>,
-}
-
-impl<C> Api<C> {
-    pub(super) fn with_rpc_block_zero(mut self, block: Option<DebankBlock>) -> Self {
-        self.rpc_block_zero = block;
-        self
-    }
 }
 
 impl<C> Clone for Api<C> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            rpc_block_zero: self.rpc_block_zero.clone(),
         }
     }
 }

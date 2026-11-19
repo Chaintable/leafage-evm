@@ -48,6 +48,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 version,
                 estimate_gas_buffer,
                 custom_cfg,
+                rpc: Default::default(),
                 exec_limiter,
                 state_read_limiter,
                 multicall_parallelism: 0,

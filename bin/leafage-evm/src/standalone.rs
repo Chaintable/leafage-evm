@@ -20,12 +20,12 @@ use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
+use leafage_evm_rpc::RpcConfig;
 use leafage_evm_rpc::{build_op_custom_config, ApiBuilder, MultiChainCfgEnv, TokenCollector};
 use leafage_evm_storage::{
     ArchiveSchema, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
     StorageKind,
 };
-use leafage_evm_types::DebankBlock;
 use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use metrics::gauge;
 use std::path::PathBuf;
@@ -75,7 +75,9 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode
+    /// Optional RPC and chain-specific EVM parameters as JSON. Set
+    /// rpc.block_zero to configure a height-zero block for a nonzero genesis.
+    /// Chain-specific options include Arbitrum execution_mode
     /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
     /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules);
     /// chains with a built-in fork schedule, OP Mainnet 10, Soneium 1868, Unichain 130,
@@ -87,8 +89,8 @@ pub struct Command {
     /// # Example
     /// --evm-type=cosmos
     /// --evm-custom-config={"native_token":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
-    #[arg(long)]
-    evm_custom_config: Option<String>,
+    #[arg(long, value_parser = parse_evm_custom_config)]
+    evm_custom_config: Option<EvmCustomConfig>,
 
     /// Execution specification ID, using the selected EVM type's numbering.
     /// For OP, use op_spec_id in --evm-custom-config instead.
@@ -298,11 +300,6 @@ pub struct Command {
     /// For some forked chains , the genesis block number is not 0, e.g. op-bedrock.
     #[arg(long, default_value = "0")]
     genesis_number: u64,
-
-    /// JSON block metadata to return when getBlockByHeight(0) cannot find a block.
-    /// Requires a nonzero genesis number.
-    #[arg(long, value_parser = parse_rpc_block_zero, value_name = "JSON")]
-    rpc_block_zero: Option<DebankBlock>,
 
     /// The size of the task queue for the s3 updater.
     /// Default: 256
@@ -555,12 +552,26 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
     Ok(interceptor_config)
 }
 
-fn parse_rpc_block_zero(arg: &str) -> Result<DebankBlock> {
-    let block: DebankBlock = serde_json::from_str(arg)?;
-    if block.height != 0 {
-        bail!("--rpc-block-zero requires block height 0");
+#[derive(Clone, Debug)]
+struct EvmCustomConfig {
+    rpc: RpcConfig,
+    chain: Option<String>,
+}
+
+fn parse_evm_custom_config(arg: &str) -> Result<EvmCustomConfig> {
+    let mut value: serde_json::Value = serde_json::from_str(arg)?;
+    if let Some(chain) = value.as_object_mut() {
+        if let Some(rpc) = chain.remove("rpc") {
+            return Ok(EvmCustomConfig {
+                rpc: serde_json::from_value(rpc)?,
+                chain: (!chain.is_empty()).then(|| value.to_string()),
+            });
+        }
     }
-    Ok(block)
+    Ok(EvmCustomConfig {
+        rpc: RpcConfig::default(),
+        chain: Some(arg.to_owned()),
+    })
 }
 
 fn parse_ovm_address(arg: &str) -> Result<Address> {
@@ -640,7 +651,10 @@ impl Command {
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
         let evm_type = self.evm_type.clone();
-        let custom_evm_cfg = self.evm_custom_config.clone();
+        let custom_evm_cfg = self
+            .evm_custom_config
+            .as_ref()
+            .and_then(|config| config.chain.as_deref());
         let gas_cap = self.rpc_gas_cap;
         if self.forward_read_precompiles && evm_type != "hyper" {
             bail!("--forward-read-precompiles is only supported with --evm-type=hyper");
@@ -716,7 +730,7 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 let mut custom_evm_cfg: Option<ArbitrumEvmConfig> = custom_evm_cfg
                     .map(|str| {
-                        serde_json::from_str(&str).map_err(|err| {
+                        serde_json::from_str(str).map_err(|err| {
                             anyhow!("cannot parse arbitrum custom evm config: {}", err)
                         })
                     })
@@ -741,8 +755,7 @@ impl Command {
                 if self.spec_id != u8::MAX {
                     bail!("celo evm-type follows its mainnet fork schedule; --spec-id is not supported");
                 }
-                let custom: CeloEvmConfig =
-                    serde_json::from_str(custom_evm_cfg.as_deref().unwrap_or("{}"))?;
+                let custom: CeloEvmConfig = serde_json::from_str(custom_evm_cfg.unwrap_or("{}"))?;
                 let mut cfg = CfgEnv::new_with_spec(OpSpecId::JOVIAN);
                 cfg.chain_id = chain_id;
                 cfg.disable_balance_check = true;
@@ -764,7 +777,7 @@ impl Command {
                         "--spec-id is not supported for op; use op_spec_id in --evm-custom-config"
                     );
                 }
-                let mut chain_cfg = build_op_custom_config(custom_evm_cfg.as_deref())?;
+                let mut chain_cfg = build_op_custom_config(custom_evm_cfg)?;
                 chain_cfg.disable_balance_check = true;
                 chain_cfg.disable_eip3607 = true;
                 chain_cfg.disable_block_gas_limit = true;
@@ -805,7 +818,7 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 let custom_evm_cfg = custom_evm_cfg
                     .map(|str| {
-                        serde_json::from_str(&str).map_err(|err| {
+                        serde_json::from_str(str).map_err(|err| {
                             anyhow!("cannot parse cosmos custom evm config: {}", err)
                         })
                     })
@@ -1139,7 +1152,12 @@ impl Command {
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
-            .with_rpc_block_zero(self.rpc_block_zero.clone())
+            .with_rpc_config(
+                self.evm_custom_config
+                    .as_ref()
+                    .map(|config| config.rpc.clone())
+                    .unwrap_or_default(),
+            )
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_upstream_config(
                 self.upstream_url.clone(),
@@ -1266,8 +1284,8 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        if self.rpc_block_zero.is_some() && self.genesis_number == 0 {
-            bail!("--rpc-block-zero requires --genesis-number greater than 0");
+        if let Some(config) = &self.evm_custom_config {
+            config.rpc.validate(self.genesis_number)?;
         }
 
         // Fix the versioned-key encoding mode before any archive DB access.
@@ -1337,6 +1355,25 @@ mod chain_config_tests {
     }
 
     #[test]
+    fn op_accepts_rpc_options_alongside_chain_options() {
+        let json = serde_json::json!({
+            "op_spec_id": "Jovian",
+            "rpc": {"block_zero": leafage_evm_types::DebankBlock::default()}
+        });
+        let command = command(&[
+            "--genesis-number",
+            "1",
+            "--evm-custom-config",
+            &json.to_string(),
+        ]);
+        let MultiChainCfgEnv::Op(cfg) = command.build_chain_cfg_env().unwrap() else {
+            panic!("expected OP configuration");
+        };
+        assert_eq!(cfg.spec, OpSpecId::JOVIAN);
+        assert!(command.evm_custom_config.unwrap().rpc.block_zero.is_some());
+    }
+
+    #[test]
     fn op_uses_custom_config_and_rejects_global_spec_id() {
         assert_eq!(config(&[]).spec, OpSpecId::KARST);
         let rise = config(&[
@@ -1377,18 +1414,25 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_block_zero_requires_nonzero_genesis_and_zero_height() {
-        let mut block = serde_json::to_value(DebankBlock {
+        let mut block = serde_json::to_value(leafage_evm_types::DebankBlock {
             timestamp: 1_636_333_200,
             ..Default::default()
         })
         .unwrap();
         block["process_start_timestamp"] = 0.into();
-        let json = block.to_string();
+        let json = serde_json::json!({"rpc": {"block_zero": block}});
 
-        let command = parse_command(&["--genesis-number", "1", "--rpc-block-zero", &json]);
-        assert_eq!(command.rpc_block_zero.unwrap().timestamp, 1_636_333_200);
+        let command = parse_command(&[
+            "--genesis-number",
+            "1",
+            "--evm-custom-config",
+            &json.to_string(),
+        ]);
+        let config = command.evm_custom_config.unwrap();
+        assert!(config.chain.is_none());
+        assert_eq!(config.rpc.block_zero.unwrap().timestamp, 1_636_333_200);
 
-        let error = parse_command(&["--rpc-block-zero", &json])
+        let error = parse_command(&["--evm-custom-config", &json.to_string()])
             .run()
             .await
             .unwrap_err();
@@ -1396,9 +1440,19 @@ mod tests {
             .to_string()
             .contains("--genesis-number greater than 0"));
 
-        block["height"] = 1.into();
-        assert!(parse_rpc_block_zero(&block.to_string()).is_err());
-        assert!(parse_rpc_block_zero("{}").is_err());
+        let mut invalid = json;
+        invalid["rpc"]["block_zero"]["height"] = 1.into();
+        let error = parse_command(&[
+            "--genesis-number",
+            "1",
+            "--evm-custom-config",
+            &invalid.to_string(),
+        ])
+        .run()
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("requires block height 0"));
+        assert!(parse_evm_custom_config(r#"{"rpc":{"block_zero":{}}}"#).is_err());
     }
 
     #[test]
