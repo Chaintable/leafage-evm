@@ -66,7 +66,7 @@ pub(crate) enum Commands {
 impl Commands {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
-            Commands::Standalone(cmd) => cmd.run().await,
+            Commands::Standalone(mut cmd) => cmd.run().await,
             Commands::DBMigrate(mut cmd) => cmd.run().await,
             Commands::ArchiveInit(mut cmd) => cmd.run().await,
             Commands::Compact(mut cmd) => cmd.run().await,

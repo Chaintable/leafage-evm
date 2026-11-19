@@ -1286,14 +1286,16 @@ impl Command {
         Ok((updater_handle, rpc_handle, registry_handle))
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
+        let original_config = self.evm_custom_config.clone();
         let rpc_block_zero = self.take_rpc_block_zero()?;
+        let chain_cfg = self.build_chain_cfg_env();
+        self.evm_custom_config = original_config;
 
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
-        let (updater_handle, rpc_handle, resgitry_handle) = self
-            .start(self.build_chain_cfg_env()?, rpc_block_zero)
-            .await?;
+        let (updater_handle, rpc_handle, resgitry_handle) =
+            self.start(chain_cfg?, rpc_block_zero).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
@@ -1500,7 +1502,7 @@ mod tests {
     async fn arc_startup_reaches_runtime_initialization() {
         // Startup sets the archive block encoding.
         let _guard = crate::ARCHIVE_TEST_LOCK.lock().await;
-        let command = parse_command(&[
+        let mut command = parse_command(&[
             "--evm-type",
             "arc",
             "--chain-cfg",
