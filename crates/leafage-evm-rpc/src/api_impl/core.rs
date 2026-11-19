@@ -18,7 +18,7 @@ use leafage_evm_chains::rsk::RskHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_storage::EvmStorageRead;
 use leafage_evm_types::{
-    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
+    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId, H256,
 };
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -263,12 +263,14 @@ pub(crate) trait GetHaltReason {
 
 pub(crate) struct Api<C> {
     pub inner: Arc<C>,
+    pub(super) rpc_block_zero: Option<DebankBlock>,
 }
 
 impl<C> Clone for Api<C> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            rpc_block_zero: self.rpc_block_zero.clone(),
         }
     }
 }

@@ -26,7 +26,7 @@ use leafage_evm_chains::arc::ARC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{ApeYieldStorage, BlockIndex, EvmStorageRead};
-use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
+use leafage_evm_types::{Address, DebankBlock, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -38,6 +38,7 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
+    rpc_block_zero: Option<DebankBlock>,
     upstream_client: Option<HttpClient>,
     /// URL the upstream client was built for, kept so the HyperCore read-precompile
     /// forwarder can be built when the server starts.
@@ -68,6 +69,7 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
+            rpc_block_zero: None,
             upstream_client: None,
             upstream_url: None,
             forward_simulate: false,
@@ -92,6 +94,11 @@ where
     #[cfg(target_os = "linux")]
     pub fn with_interceptor_cfg(mut self, interceptor_cfg: Option<InterceptorConfig>) -> Self {
         self.interceptor_cfg = interceptor_cfg;
+        self
+    }
+
+    pub fn with_rpc_block_zero(mut self, block: Option<DebankBlock>) -> Self {
+        self.rpc_block_zero = block;
         self
     }
 
@@ -326,7 +333,7 @@ where
                 .await;
                 let $api = api.clone();
                 $extra
-                register_api(&mut rpc_module, api)?;
+                register_api(&mut rpc_module, api, self.rpc_block_zero.as_ref())?;
             }};
         }
 
@@ -422,7 +429,7 @@ where
                     self.warmup_erc20_addresses.take(),
                 )
                 .await;
-                register_api(&mut rpc_module, api.clone())?;
+                register_api(&mut rpc_module, api.clone(), self.rpc_block_zero.as_ref())?;
                 super::celo::l1::rpc::register(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Base(env) => {
@@ -487,7 +494,7 @@ where
                     self.warmup_erc20_addresses.take(),
                 )
                 .await;
-                register_api(&mut rpc_module, api)?;
+                register_api(&mut rpc_module, api, self.rpc_block_zero.as_ref())?;
             }
             MultiChainCfgEnv::Citrea(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
@@ -554,7 +561,11 @@ where
         })
 }
 
-fn register_api<A>(rpc_module: &mut RpcModule<()>, api: Api<A>) -> std::io::Result<()>
+fn register_api<A>(
+    rpc_module: &mut RpcModule<()>,
+    api: Api<A>,
+    rpc_block_zero: Option<&DebankBlock>,
+) -> std::io::Result<()>
 where
     A: ApiCore,
     <A as ApiBase>::DB: BlockIndex + EvmStorageRead,
@@ -562,8 +573,10 @@ where
     DebankErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
     PreErrorCode: From<<A as EvmExecutor>::EvmHaltReason>,
 {
+    let mut debank_api = api.clone();
+    debank_api.rpc_block_zero = rpc_block_zero.cloned();
     rpc_module
-        .merge(DebankApiServer::into_rpc(api.clone()))
+        .merge(DebankApiServer::into_rpc(debank_api))
         .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
