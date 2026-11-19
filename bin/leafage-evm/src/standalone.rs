@@ -25,9 +25,8 @@ use leafage_evm_storage::{
     ArchiveSchema, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
     StorageKind,
 };
-use leafage_evm_types::{
-    Address, BlockId, BlockNumberOrTag, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId,
-};
+use leafage_evm_types::DebankBlock;
+use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;

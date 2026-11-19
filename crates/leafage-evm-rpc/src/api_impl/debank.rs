@@ -175,57 +175,48 @@ where
             .map_err(|_| internal_rpc_err("get latest block failed"))?
     }
 
-    async fn lookup_block_by_height(&self, height: u64) -> RpcResult<DebankBlock> {
-        let placeholder = self.rpc_block_zero.as_ref().filter(|_| height == 0);
-
-        if let Some(client) = self.inner.historical_client().filter(|_| {
-            self.inner
-                .historical_height()
-                .is_some_and(|threshold| height < threshold)
-        }) {
-            let result = client.get_block_by_height(U256::from(height)).await;
-            return match (result, placeholder) {
-                (Ok(block), _) => Ok(block),
-                (Err(jsonrpsee::core::ClientError::Call(err)), Some(block))
-                    if err.code() == DebankErrorCode::BlockNotFound as i32
-                        || err.code() == DebankErrorCode::InvalidBlockID as i32 =>
-                {
-                    Ok(block.clone())
-                }
-                (Err(err), _) => Err(map_historical_error(None, err)),
-            };
+    fn debank_get_block_by_height_inner(&self, height: U256) -> RpcResult<DebankBlock> {
+        let number: u64 = height.try_into().map_err(|_| {
+            rpc_error_with_code(
+                DebankErrorCode::InvalidParams as i32,
+                "block height out of range".to_string(),
+            )
+        })?;
+        let block = self
+            .inner
+            .db()
+            .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Number(number)))
+            .map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
+            })?;
+        if block.is_none() {
+            if let Some(block) = self.rpc_block_zero.as_ref().filter(|_| number == 0) {
+                return Ok(block.clone());
+            }
+            if self.inner.evm_cfg().is_archive {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::InvalidBlockID as i32,
+                    format!("block height {:?} is invalid", height),
+                ));
+            } else {
+                return Err(rpc_error_with_code(
+                    DebankErrorCode::BlockNotFound as i32,
+                    format!("block height {:?} not found for state node", height),
+                ));
+            }
         }
 
+        let block = block.unwrap();
+        Ok(block.into())
+    }
+
+    async fn debank_get_block_by_height_impl(&self, height: U256) -> RpcResult<DebankBlock> {
         let this = self.clone();
-        let block = utils::spawn_blocking_with_cancel(move |_token| {
-            this.inner
-                .db()
-                .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Number(height)))
-                .map_err(|e| {
-                    rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
-                })
+        utils::spawn_blocking_with_cancel(move |_token| {
+            this.debank_get_block_by_height_inner(height)
         })
         .await
-        .map_err(|_| internal_rpc_err("get block by height failed"))??;
-
-        if let Some(block) = block {
-            return Ok(block.into());
-        }
-        if let Some(block) = placeholder {
-            return Ok(block.clone());
-        }
-
-        if self.inner.evm_cfg().is_archive {
-            Err(rpc_error_with_code(
-                DebankErrorCode::InvalidBlockID as i32,
-                format!("block height {:?} is invalid", height),
-            ))
-        } else {
-            Err(rpc_error_with_code(
-                DebankErrorCode::BlockNotFound as i32,
-                format!("block height {:?} not found for state node", height),
-            ))
-        }
+        .map_err(|_| internal_rpc_err("get block by height failed"))?
     }
 
     fn debank_get_block_by_id_inner(&self, id: H256) -> RpcResult<DebankBlock> {
@@ -1998,7 +1989,33 @@ where
             )
         })?;
 
-        self.lookup_block_by_height(block_number).await
+        if self.inner.historical_client().is_some()
+            && self
+                .inner
+                .historical_height()
+                .map_or(false, |h| block_number < h)
+        {
+            if let Some(historical_client) = self.inner.historical_client() {
+                return historical_client
+                    .get_block_by_height(height)
+                    .await
+                    .or_else(|error| {
+                        let placeholder =
+                            self.rpc_block_zero.as_ref().filter(|_| block_number == 0);
+                        match (&error, placeholder) {
+                            (jsonrpsee::core::ClientError::Call(err), Some(block))
+                                if err.code() == DebankErrorCode::BlockNotFound as i32
+                                    || err.code() == DebankErrorCode::InvalidBlockID as i32 =>
+                            {
+                                Ok(block.clone())
+                            }
+                            _ => Err(map_historical_error(None, error)),
+                        }
+                    });
+            }
+        }
+
+        self.debank_get_block_by_height_impl(height).await
     }
 
     async fn get_block_by_id(&self, id: H256) -> RpcResult<DebankBlock> {
