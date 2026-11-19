@@ -25,9 +25,8 @@ use leafage_evm_storage::{
     ArchiveSchema, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
     StorageKind,
 };
-use leafage_evm_types::{
-    Address, BlockId, BlockNumberOrTag, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId,
-};
+use leafage_evm_types::DebankBlock;
+use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -76,9 +75,7 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Optional RPC and chain-specific EVM parameters as JSON. Set
-    /// rpc.block_zero to configure a height-zero block for a nonzero genesis.
-    /// Chain-specific options include Arbitrum execution_mode
+    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode
     /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
     /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules);
     /// chains with a built-in fork schedule, OP Mainnet 10, Soneium 1868, Unichain 130,
