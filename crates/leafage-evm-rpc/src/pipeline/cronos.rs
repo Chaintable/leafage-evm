@@ -160,6 +160,25 @@ impl CronosEra {
         }
     }
 
+    fn block_gas_limit(self, height: u64, consensus_limit: u64) -> u64 {
+        // The SDK rebuilds the meter after Titan's BeginBlock upgrade. Comet
+        // exposes the updated consensus parameter starting at the next height.
+        if self == Self::Titan && Self::at_height(height - 1) != Some(self) {
+            return 60_000_000;
+        }
+        // The SDK used by Galileo through v1.3 returns MaxUint64 from
+        // InfiniteGasMeter.Limit(). Pallene reads the consensus params directly.
+        if consensus_limit == 0
+            && matches!(
+                self,
+                Self::Galileo | Self::FeeMarket | Self::Titan | Self::V12 | Self::V13
+            )
+        {
+            return u64::MAX;
+        }
+        consensus_limit
+    }
+
     pub fn spec(self, base_fee: Option<u64>) -> Result<SpecId> {
         let spec = match self {
             Self::BeforeHuygen => SpecId::BERLIN,
@@ -266,18 +285,11 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
     );
     let header = &block.header;
     let era = CronosEra::at_height(header.number).context("unsupported Cronos execution era")?;
-    // Titan changes the SDK consensus store in BeginBlock. The SDK recreates
-    // the meter immediately, one block before Comet exposes the new limit.
-    let gas_limit =
-        if era == CronosEra::Titan && CronosEra::at_height(header.number - 1) != Some(era) {
-            60_000_000
-        } else {
-            gas_limit
-        };
+    let gas_limit = era.block_gas_limit(header.number, gas_limit);
     let transient = era == CronosEra::BeforeHuygen;
     let spec = era.spec(header.base_fee_per_gas)?;
     let mut cfg = CfgEnv::new_with_spec(spec).with_chain_id(25);
-    // Ethermint exposes zero to GASLIMIT for an unbounded block meter.
+    // A zero GASLIMIT can still represent an unbounded SDK meter.
     cfg.disable_block_gas_limit = gas_limit == 0;
     let genesis_eips = matches!(
         era,
@@ -374,11 +386,14 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
                 .info
                 .balance;
             ensure!(
-                balance
-                    .checked_sub(escrow)
-                    .is_some_and(|available| available >= envelope.value()),
-                "insufficient funds for effective escrow and value in tx {hash}"
+                balance >= escrow && balance >= envelope.value(),
+                "insufficient funds at ante for tx {hash}"
             );
+            if balance - escrow < envelope.value() {
+                return Err(anyhow!("tx {index} {hash}").context(CronosRuleGap(
+                    "value transfer underfunded after effective fee escrow",
+                )));
+            }
         }
         adjust_balance(&mut db, collector, escrow, true)?;
         let mut evm = EthEvmFactory::default()
@@ -683,6 +698,25 @@ fn check_block_file(file: &BlockFile, receipts: &[TransactionReceipt]) -> Result
 #[cfg(test)]
 mod era_tests {
     use super::*;
+
+    #[test]
+    fn sdk_block_meter_and_titan_upgrade() {
+        for (height, input, output) in [
+            (1, 0, 0),
+            (6_542_800, 0, u64::MAX),
+            (13_184_000, 40_000_000, 60_000_000),
+            (13_184_001, 0, u64::MAX),
+            (17_154_999, 0, u64::MAX),
+            (17_155_000, 0, 0),
+        ] {
+            assert_eq!(
+                CronosEra::at_height(height)
+                    .unwrap()
+                    .block_gas_limit(height, input),
+                output
+            );
+        }
+    }
 
     #[test]
     fn mainnet_upgrade_boundaries_and_header_consistency() {
