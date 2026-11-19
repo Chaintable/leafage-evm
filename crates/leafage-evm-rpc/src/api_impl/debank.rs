@@ -1421,8 +1421,10 @@ where
         let consensus_cap = self
             .inner
             .consensus_tx_gas_limit_cap(chain_spec, &block_env);
-        let max_gas_limit =
-            estimate_gas_limit_cap(cfg.tx_gas_limit_cap, consensus_cap, block_env_gas_limit);
+        let rpc_cap = self
+            .inner
+            .rpc_tx_gas_limit_cap(cfg.tx_gas_limit_cap, &block_env, &memory_db);
+        let max_gas_limit = estimate_gas_limit_cap(rpc_cap, consensus_cap, block_env_gas_limit);
         let mut highest_gas_limit = tx_request_gas_limit
             .map(|tx_gas_limit| tx_gas_limit.min(max_gas_limit))
             .unwrap_or(max_gas_limit);

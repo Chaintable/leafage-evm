@@ -7,5 +7,7 @@ pub(crate) mod evm;
 
 mod legacy;
 
+mod mantle;
+
 #[cfg(test)]
 mod tests;
