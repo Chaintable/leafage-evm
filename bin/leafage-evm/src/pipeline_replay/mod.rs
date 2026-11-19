@@ -1,4 +1,6 @@
+mod chain_config;
 mod messages;
+mod params;
 
 use alloy::{
     consensus::transaction::SignerRecoverable,
@@ -33,7 +35,7 @@ pub struct Command {
     db_path: PathBuf,
     #[arg(long)]
     evm_rpc: String,
-    /// Comet RPC serving block, block_results and consensus_params at the requested heights.
+    /// Comet archive RPC serving blocks, results, consensus parameters and historical ABCI queries.
     #[arg(long)]
     comet_rpc: String,
     /// First mainnet height in the inclusive range.
@@ -73,7 +75,7 @@ fn rule(height: u64, empty: bool) -> &'static str {
     if height == 1 {
         "genesis-native-token-v1"
     } else if empty {
-        "native-v1"
+        "native-v2"
     } else {
         CronosEra::at_height(height).map_or("uncovered", CronosEra::version)
     }
@@ -150,6 +152,12 @@ impl Command {
                 Ok(report) => report,
                 Err(err) if err.is::<CronosArchiveRead>() || err.is::<std::io::Error>() => {
                     return Err(err.context(format!("replaying block {height}")));
+                }
+                Err(err) if err.is::<chain_config::UnauditedParams>() => {
+                    json!({"height":height, "status":"rules_uncovered","detail":format!("{err:#}")})
+                }
+                Err(err) if err.is::<params::HistoricalParamsUnavailable>() => {
+                    json!({"height":height, "status":"input_gap","detail":format!("{err:#}")})
                 }
                 Err(err) => {
                     let status = match err.downcast_ref::<jsonrpsee::core::ClientError>() {
@@ -299,11 +307,6 @@ impl Command {
                 );
             }
         }
-        let mapping = messages::positions(
-            tx_array(tm.pointer("/block/data/txs"))?,
-            tx_array(results.get("txs_results"))?,
-            &hashes,
-        )?;
         let mut receipts = Vec::new();
         for (index, tx) in hashes.iter().enumerate() {
             let receipt: Option<alloy::rpc::types::TransactionReceipt> = evm
@@ -323,6 +326,11 @@ impl Command {
             );
             receipts.push(receipt);
         }
+        let mapping = messages::positions(
+            tx_array(tm.pointer("/block/data/txs"))?,
+            tx_array(results.get("txs_results"))?,
+            &hashes,
+        )?;
         let mut report = json!({"height":height,"hash":hash,"parent":parent,"max_gas":max_gas,"messages":mapping});
         let native_prefix = mapping
             .iter()
@@ -345,6 +353,10 @@ impl Command {
             report["cosmos_results"] = results["txs_results"].clone();
             return Ok(report);
         }
+        if version == "uncovered" {
+            report["status"] = json!("rules_uncovered");
+            return Ok(report);
+        }
         let Some(info) = tree
             .get_block_by_id_arc(BlockId::Number(BlockNumberOrTag::Number(height)))
             .context(CronosArchiveRead)?
@@ -357,7 +369,7 @@ impl Command {
             info.header.hash == hash && info.header.parent_hash == parent,
             "archive block identity mismatch"
         );
-        let file = if height == 1 {
+        let mut file = if height == 1 {
             ensure!(
                 hashes.is_empty() && parent == B256::ZERO,
                 "unexpected Cronos genesis block"
@@ -367,30 +379,6 @@ impl Command {
             leafage_evm_rpc::native_block_file(&block.header)
         } else {
             report["receipts"] = serde_json::to_value(&receipts)?;
-            if version == "uncovered" {
-                report["status"] = json!("rules_uncovered");
-                return Ok(report);
-            }
-            let hooks = [
-                "__CronosSendToAccount(address,uint256)",
-                "__CronosSendToEthereum(address,uint256,uint256)",
-                "__CronosSendToIbc(address,string,uint256)",
-                "__CronosSendCroToIbc(address,string,uint256)",
-            ]
-            .map(keccak256);
-            if let Some(index) = receipts.iter().position(|receipt| {
-                receipt.logs().iter().any(|log| {
-                    log.topics()
-                        .first()
-                        .is_some_and(|topic| hooks.contains(topic))
-                })
-            }) {
-                report["status"] = json!("native_state_gap");
-                report["detail"] = json!(format!(
-                    "native post-execution hook at EVM transaction {index}"
-                ));
-                return Ok(report);
-            }
             let mut message_gas = Vec::new();
             for m in mapping.iter().filter(|m| m.evm_tx.is_some()) {
                 let result = &results["txs_results"][m.cosmos_tx];
@@ -420,18 +408,25 @@ impl Command {
                 report["detail"] = json!("archive parent state missing");
                 return Ok(report);
             };
+            let era = CronosEra::at_height(height).context("missing replay rule")?;
+            let parameters = params::at_block(comet, height, era).await?;
             match leafage_evm_rpc::replay_cronos_ethermint(
                 leafage_evm_storage::EvmStorageWrapper::new(state),
                 &block,
                 &receipts,
                 max_gas.max(0) as u64,
                 &message_gas,
+                &parameters,
                 &messages::begin_transfers(&results)?,
             ) {
                 Ok(file) => file,
                 Err(err) if err.is::<CronosArchiveRead>() => return Err(err),
                 Err(err) => {
-                    report["status"] = if err.is::<leafage_evm_rpc::LegacySelfdestruct>() {
+                    report["status"] = if err.is::<leafage_evm_rpc::CronosNativeCall>() {
+                        json!("native_state_gap")
+                    } else if err.is::<leafage_evm_rpc::CronosRuleGap>()
+                        || err.is::<leafage_evm_rpc::LegacySelfdestruct>()
+                    {
                         json!("rules_uncovered")
                     } else {
                         json!("execution_mismatch")
@@ -445,6 +440,9 @@ impl Command {
                 }
             }
         };
+        if height > 1 {
+            messages::extend_storage_contracts(&mut file.storage_contracts, &block, &results)?;
+        }
         let name = format!("{height}-{hash}-{version}.json");
         let value = serde_json::to_value(&file)?;
         report["artifact_digest"] = json!(keccak256(serde_json::to_vec(&value)?));

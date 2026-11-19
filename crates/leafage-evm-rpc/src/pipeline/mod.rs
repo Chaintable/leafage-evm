@@ -15,7 +15,8 @@ pub(crate) mod changes;
 pub(crate) mod convert;
 mod cronos;
 pub use cronos::{
-    replay_cronos_ethermint, CronosArchiveRead, CronosEra, CronosRelease, LegacySelfdestruct,
+    replay_cronos_ethermint, CronosArchiveRead, CronosEra, CronosExecutionParams, CronosNativeCall,
+    CronosRelease, CronosRuleGap, LegacySelfdestruct,
 };
 pub use genesis::native_token_genesis_block;
 pub(crate) mod export;

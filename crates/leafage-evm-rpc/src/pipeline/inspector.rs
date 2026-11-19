@@ -21,7 +21,7 @@
 use alloy::primitives::{Address, Bytes, Log, U256};
 use revm::{
     bytecode::opcode,
-    context::{ContextTr, JournalTr},
+    context::{ContextTr, JournalEntry, JournalTr},
     inspector::JournalExt,
     interpreter::{
         interpreter_types::{Jumps, LoopControl},
@@ -42,8 +42,11 @@ struct PendingSelfdestruct {
 }
 
 #[derive(Debug)]
-pub(crate) struct PipelineInspector {
+pub(crate) struct PipelineInspector<const CRONOS: bool = false> {
     tracer: TracingInspector,
+    pub(super) cronos_native_call: Option<Address>,
+    pub(super) ran_blobbasefee: bool,
+    pub(super) ran_prevrandao: bool,
     /// Arena index of every open call frame, innermost last.
     frames: Vec<usize>,
     /// SELFDESTRUCT seen in the open frame with the same position.
@@ -51,6 +54,8 @@ pub(crate) struct PipelineInspector {
     /// Whether the frame with this arena index ran an SSTORE. Recording
     /// the tracer's steps for that costs a step entry per instruction.
     sstore: Vec<bool>,
+    /// Journal position before a Cronos SSTORE, used to detect an actual write.
+    sstore_start: Option<usize>,
     /// For the open frame with the same position: `Some` for a creation,
     /// holding the code its constructor returned once it returns.
     returned: Vec<Option<Bytes>>,
@@ -62,15 +67,25 @@ pub(crate) struct PipelineInspector {
 
 impl PipelineInspector {
     pub(crate) fn new() -> Self {
+        Self::configured()
+    }
+}
+
+impl<const CRONOS: bool> PipelineInspector<CRONOS> {
+    pub(super) fn configured() -> Self {
         let config = TracingInspectorConfig::default_parity()
             .set_steps(false)
             .set_record_logs(true)
             .set_exclude_precompile_calls(false);
         Self {
             tracer: TracingInspector::new(config),
+            cronos_native_call: None,
+            ran_blobbasefee: false,
+            ran_prevrandao: false,
             frames: Vec::new(),
             pending: Vec::new(),
             sstore: Vec::new(),
+            sstore_start: None,
             returned: Vec::new(),
             returning: false,
             code_deposit_failed: false,
@@ -118,7 +133,7 @@ impl PipelineInspector {
     }
 }
 
-impl PipelineInspector {
+impl<const CRONOS: bool> PipelineInspector<CRONOS> {
     fn mark_sstore(&mut self) {
         if let Some(&idx) = self.frames.last() {
             if self.sstore.len() <= idx {
@@ -198,7 +213,7 @@ fn fill_selfdestruct(node: &mut CallTraceNode, pending: PendingSelfdestruct) {
     trace.selfdestruct_transferred_value = Some(pending.balance);
 }
 
-impl<CTX> Inspector<CTX> for PipelineInspector
+impl<CTX, const CRONOS: bool> Inspector<CTX> for PipelineInspector<CRONOS>
 where
     CTX: ContextTr<Journal: JournalExt>,
 {
@@ -210,16 +225,38 @@ where
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         let op = interp.bytecode.opcode();
         if op == opcode::SSTORE {
-            self.mark_sstore();
+            if CRONOS {
+                self.sstore_start = Some(context.journal_ref().journal().len());
+            } else {
+                self.mark_sstore();
+            }
         } else if op == opcode::SELFDESTRUCT {
             self.record_selfdestruct(interp, context);
+        } else if CRONOS && op == opcode::DIFFICULTY {
+            self.ran_prevrandao = true;
+        } else if CRONOS && op == opcode::BLOBBASEFEE {
+            self.ran_blobbasefee = true;
         } else if op == opcode::RETURN {
             self.returning = true;
         }
     }
 
     #[inline(always)]
-    fn step_end(&mut self, interp: &mut Interpreter, _context: &mut CTX) {
+    fn step_end(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        // Ethermint HookedStateDB emits OnStorageChange only when SetState
+        // changes the current value. revm journals before charging dynamic
+        // SSTORE gas, so exclude an instruction that subsequently halted.
+        if CRONOS {
+            if let Some(start) = self.sstore_start.take() {
+                if !interp.bytecode.is_end()
+                    && context.journal_ref().journal()[start..]
+                        .iter()
+                        .any(|entry| matches!(entry, JournalEntry::StorageChanged { .. }))
+                {
+                    self.mark_sstore();
+                }
+            }
+        }
         if self.returning {
             self.record_return(interp);
         }
@@ -230,6 +267,14 @@ where
     }
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        let target = inputs.bytecode_address;
+        if CRONOS
+            && (target == alloy::primitives::address!("0000000000000000000000000000000000000065")
+                || target
+                    == alloy::primitives::address!("0000000000000000000000000000000000000066"))
+        {
+            self.cronos_native_call.get_or_insert(target);
+        }
         let nodes_before = self.tracer.traces().nodes().len();
         let outcome = self.tracer.call(context, inputs);
         if outcome.is_none() {
@@ -281,11 +326,15 @@ mod tests {
     const RETURN_100: &[u8] = &[0x60, 0x64, 0x60, 0x00, 0xf3];
 
     /// Deploy `initcode` with `gas_limit`.
-    fn deploy(spec: SpecId, initcode: &'static [u8], gas_limit: u64) -> (bool, PipelineInspector) {
+    fn deploy<const CRONOS: bool>(
+        spec: SpecId,
+        initcode: &'static [u8],
+        gas_limit: u64,
+    ) -> (bool, PipelineInspector<CRONOS>) {
         let mut evm = Context::mainnet()
             .with_db(CacheDB::new(EmptyDB::default()))
             .modify_cfg_chained(|cfg| cfg.set_spec_and_mainnet_gas_params(spec))
-            .build_mainnet_with_inspector(PipelineInspector::new());
+            .build_mainnet_with_inspector(PipelineInspector::<CRONOS>::configured());
         let tx = TxEnv::builder()
             .caller(Address::with_last_byte(1))
             .kind(TxKind::Create)
@@ -304,21 +353,38 @@ mod tests {
     }
 
     #[test]
+    fn cronos_flags_only_completed_storage_value_changes() {
+        const NOOP: &[u8] = &[0x60, 0, 0x60, 0, 0x55, 0x00];
+        const CHANGE: &[u8] = &[0x60, 1, 0x60, 0, 0x55, 0x00];
+        const REVERT: &[u8] = &[0x60, 1, 0x60, 0, 0x55, 0x60, 0, 0x60, 0, 0xfd];
+        for (code, limit, success, flag) in [
+            (NOOP, 100_000, true, false),
+            (CHANGE, 60_000, false, false), // OOG paying dynamic SSTORE cost
+            (CHANGE, 100_000, true, true),
+            (REVERT, 100_000, false, true), // writer already recorded the write
+        ] {
+            let (actual, inspector) = deploy::<true>(SpecId::LONDON, code, limit);
+            assert_eq!(actual, success);
+            assert_eq!(inspector.sstore.first().copied().unwrap_or(false), flag);
+        }
+    }
+
+    #[test]
     fn frontier_creation_without_gas_for_its_code_keeps_it_as_output() {
         // Enough to run the constructor (21000 + 276 calldata + 18), not
         // to deposit 100 bytes (20000).
-        let (success, inspector) = deploy(SpecId::FRONTIER, RETURN_100, 22_000);
+        let (success, inspector) = deploy::<false>(SpecId::FRONTIER, RETURN_100, 22_000);
         assert!(success, "revm keeps the contract, without code");
         assert!(inspector.code_deposit_failed());
         assert_eq!(output(inspector), Bytes::from(vec![0u8; 100]));
 
-        let (success, inspector) = deploy(SpecId::FRONTIER, RETURN_100, 100_000);
+        let (success, inspector) = deploy::<false>(SpecId::FRONTIER, RETURN_100, 100_000);
         assert!(success);
         assert!(!inspector.code_deposit_failed());
         assert_eq!(output(inspector), Bytes::from(vec![0u8; 100]));
 
         // Homestead fails the creation instead.
-        let (success, inspector) = deploy(SpecId::HOMESTEAD, RETURN_100, 60_000);
+        let (success, inspector) = deploy::<false>(SpecId::HOMESTEAD, RETURN_100, 60_000);
         assert!(!success);
         assert!(!inspector.code_deposit_failed());
     }
@@ -329,7 +395,7 @@ mod tests {
         // inspector must not read 2 GiB before that.
         let initcode = &[0x63, 0x80, 0x00, 0x00, 0x00, 0x60, 0x00, 0xf3];
         for spec in [SpecId::FRONTIER, SpecId::CANCUN] {
-            let (success, inspector) = deploy(spec, initcode, 100_000);
+            let (success, inspector) = deploy::<false>(spec, initcode, 100_000);
             assert!(!success);
             assert!(!inspector.code_deposit_failed());
             assert!(output(inspector).is_empty());

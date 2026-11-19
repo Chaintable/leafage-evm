@@ -1,4 +1,4 @@
-//! Historical Ethermint replay before the Cronos v1 upgrade.
+//! Historical Ethermint replay across Cronos mainnet binary upgrades.
 //! Receipt agreement alone does not certify the Cosmos hooks or internal frames.
 use super::{
     build::{pipeline_block, pipeline_transaction},
@@ -10,7 +10,7 @@ use alloy::{
     consensus::Transaction as _,
     primitives::{
         map::{AddressMap, HashSet},
-        U256,
+        Address, U256,
     },
     rpc::types::{Block, BlockTransactions, TransactionReceipt},
 };
@@ -59,6 +59,14 @@ where
         Ok(())
     }
 
+    fn first_frame_input(
+        &mut self,
+        evm: &mut E,
+        gas: &mut revm::interpreter::GasTracker,
+    ) -> Result<Option<revm::interpreter::interpreter_action::FrameInit>, Self::Error> {
+        modern::first_frame_input(evm, gas)
+    }
+
     fn reward_beneficiary(&self, _: &mut E, _: &mut FrameResult) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -105,17 +113,29 @@ fn ethermint_sstore<D: Database>(
     })
 }
 
+mod galileo;
+mod modern;
+mod pallene;
 mod releases;
 pub use releases::CronosRelease;
 
 /// Cronos mainnet genesis sets london_block to 2^63. The v0.7.0
 /// upgrade handler sets it to zero and enables the fee market at Huygen.
-/// v1 and later require independently verified execution rules.
+/// Subsequent revisions follow the mainnet EVM module migrations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CronosEra {
     BeforeHuygen,
     Huygen,
     HuygenHotfix,
+    Galileo,
+    FeeMarket,
+    Titan,
+    V12,
+    V13,
+    Pallene,
+    V15,
+    V16,
+    V17,
 }
 
 impl CronosEra {
@@ -125,19 +145,30 @@ impl CronosEra {
 
     pub fn version(self) -> &'static str {
         match self {
-            Self::BeforeHuygen => "ethermint-transient-v3",
-            Self::Huygen => "ethermint-huygen-v4",
-            Self::HuygenHotfix => "ethermint-huygen-hotfix-v4",
+            Self::Galileo => "ethermint-galileo-v1",
+            Self::FeeMarket => "ethermint-feemarket-v1",
+            Self::Titan => "ethermint-titan-v1",
+            Self::V12 => "ethermint-v12-v1",
+            Self::V13 => "ethermint-v13-v1",
+            Self::Pallene => "ethermint-pallene-v1",
+            Self::V15 => "ethermint-v15-v1",
+            Self::V16 => "ethermint-v16-v1",
+            Self::V17 => "ethermint-v17-v1",
+            Self::BeforeHuygen => "ethermint-transient-v4",
+            Self::Huygen => "ethermint-huygen-v5",
+            Self::HuygenHotfix => "ethermint-huygen-hotfix-v5",
         }
     }
 
     pub fn spec(self, base_fee: Option<u64>) -> Result<SpecId> {
         let spec = match self {
             Self::BeforeHuygen => SpecId::BERLIN,
-            Self::Huygen | Self::HuygenHotfix => SpecId::LONDON,
+            Self::Huygen | Self::HuygenHotfix | Self::Galileo | Self::FeeMarket => SpecId::LONDON,
+            Self::Titan | Self::V12 | Self::V13 | Self::Pallene => SpecId::SHANGHAI,
+            Self::V15 | Self::V16 | Self::V17 => SpecId::PRAGUE,
         };
         ensure!(
-            base_fee.is_some() == (spec == SpecId::LONDON),
+            base_fee.is_some() == (spec >= SpecId::LONDON),
             "baseFeePerGas inconsistent with Cronos mainnet {self:?}"
         );
         Ok(spec)
@@ -154,6 +185,28 @@ impl std::fmt::Display for LegacySelfdestruct {
     }
 }
 
+#[derive(Debug)]
+pub struct CronosRuleGap(pub &'static str);
+impl std::fmt::Display for CronosRuleGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+#[derive(Debug)]
+pub enum CronosNativeCall {
+    Precompile(alloy::primitives::Address),
+    Hook(alloy::primitives::B256),
+}
+impl std::fmt::Display for CronosNativeCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Precompile(addr) => write!(f, "Cosmos state required by precompile {addr}"),
+            Self::Hook(topic) => write!(f, "Cosmos state required by post-execution hook {topic}"),
+        }
+    }
+}
+
 /// Identifies storage failures even when they occur inside an EVM instruction.
 #[derive(Debug)]
 pub struct CronosArchiveRead;
@@ -164,12 +217,44 @@ impl std::fmt::Display for CronosArchiveRead {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct CronosExecutionParams {
+    pub min_gas_multiplier_atomics: u64,
+    pub history_serve_window: u64,
+}
+
+fn adjust_balance<D: DatabaseRef>(
+    db: &mut CacheDB<D>,
+    address: Address,
+    amount: U256,
+    credit: bool,
+) -> Result<()> {
+    if amount.is_zero() {
+        return Ok(());
+    }
+    let mut info = db
+        .load_account(address)
+        .context(CronosArchiveRead)?
+        .info
+        .clone();
+    info.balance = if credit {
+        info.balance.checked_add(amount)
+    } else {
+        info.balance.checked_sub(amount)
+    }
+    .with_context(|| format!("cannot settle {amount} basecro at {address}"))?;
+    // insert_account_info also makes a newly funded address visible to the EVM.
+    db.insert_account_info(address, info);
+    Ok(())
+}
+
 pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
     parent: D,
     block: &Block,
     receipts: &[TransactionReceipt],
     gas_limit: u64,
     message_gas: &[u64],
+    parameters: &CronosExecutionParams,
     begin_transfers: &[(alloy::primitives::Address, bool, U256)],
 ) -> Result<BlockFile> {
     let BlockTransactions::Full(txs) = &block.transactions else {
@@ -181,23 +266,40 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
     );
     let header = &block.header;
     let era = CronosEra::at_height(header.number).context("unsupported Cronos execution era")?;
+    // Titan changes the SDK consensus store in BeginBlock. The SDK recreates
+    // the meter immediately, one block before Comet exposes the new limit.
+    let gas_limit =
+        if era == CronosEra::Titan && CronosEra::at_height(header.number - 1) != Some(era) {
+            60_000_000
+        } else {
+            gas_limit
+        };
     let transient = era == CronosEra::BeforeHuygen;
     let spec = era.spec(header.base_fee_per_gas)?;
     let mut cfg = CfgEnv::new_with_spec(spec).with_chain_id(25);
     // Ethermint exposes zero to GASLIMIT for an unbounded block meter.
     cfg.disable_block_gas_limit = gas_limit == 0;
-    cfg.gas_params.override_gas([
-        // The genesis extra EIP-2929 reinstalls geth's refund-enabled
-        // SELFDESTRUCT gas function after the London jump table is selected.
-        (GasId::selfdestruct_refund(), 24_000),
-        (GasId::sstore_static(), 800),
-        (GasId::sstore_set_without_load_cost(), 19_200),
-        (GasId::sstore_reset_without_cold_load_cost(), 4_200),
-        (GasId::sstore_set_refund(), 19_200),
-        (GasId::sstore_reset_refund(), 4_200),
-        (GasId::cold_storage_cost(), 0),
-        (GasId::sstore_clearing_slot_refund(), 15_000),
-    ]);
+    let genesis_eips = matches!(
+        era,
+        CronosEra::BeforeHuygen | CronosEra::Huygen | CronosEra::HuygenHotfix
+    );
+    // DeliverTx escrows the effective gas price; CheckTx separately checks the cap.
+    cfg.disable_balance_check = !genesis_eips;
+    cfg.disable_eip7623 = spec == SpecId::PRAGUE;
+    if genesis_eips {
+        cfg.gas_params.override_gas([
+            // The genesis extra EIP-2929 reinstalls geth's refund-enabled
+            // SELFDESTRUCT gas function after the London jump table is selected.
+            (GasId::selfdestruct_refund(), 24_000),
+            (GasId::sstore_static(), 800),
+            (GasId::sstore_set_without_load_cost(), 19_200),
+            (GasId::sstore_reset_without_cold_load_cost(), 4_200),
+            (GasId::sstore_set_refund(), 19_200),
+            (GasId::sstore_reset_refund(), 4_200),
+            (GasId::cold_storage_cost(), 0),
+            (GasId::sstore_clearing_slot_refund(), 15_000),
+        ]);
+    }
     let env = EvmEnv::new(
         cfg,
         BlockEnv {
@@ -207,23 +309,23 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             gas_limit,
             difficulty: U256::ZERO,
             basefee: header.base_fee_per_gas.unwrap_or_default(),
-            prevrandao: None,
+            prevrandao: (spec >= SpecId::SHANGHAI).then_some(Default::default()),
             ..Default::default()
         },
     );
     let mut db = CacheDB::new(parent);
+    modern::prepare_block_hash(&mut db, header.number);
+    if era == CronosEra::V17 {
+        modern::prepare_history(
+            &mut db,
+            header.number,
+            header.hash,
+            parameters.history_serve_window,
+        )?;
+    }
+    pallene::apply_upgrade(header.number, &mut db)?;
     for &(address, credit, amount) in begin_transfers {
-        let balance = &mut db
-            .load_account(address)
-            .context(CronosArchiveRead)?
-            .info
-            .balance;
-        *balance = if credit {
-            balance.checked_add(amount)
-        } else {
-            balance.checked_sub(amount)
-        }
-        .ok_or_else(|| anyhow!("BeginBlock balance unavailable for {address}"))?;
+        adjust_balance(&mut db, address, amount, credit).context("BeginBlock transfer")?;
     }
     let mut warm: AddressMap<HashSet<U256>> = Default::default();
     let mut file = BlockFile {
@@ -252,24 +354,51 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             warm.entry(to).or_default();
         }
         let collector = alloy::primitives::address!("f1829676db577682e944fc3493d451b67ff3e29f");
+        if matches!(era, CronosEra::V15 | CronosEra::V16)
+            && envelope.to().is_none()
+            && !db
+                .load_account(tx.inner.signer())
+                .context(CronosArchiveRead)?
+                .info
+                .is_empty_code_hash()
+        {
+            return Err(anyhow!("tx {index} {hash}")
+                .context(CronosRuleGap("delegated sender creation nonce")));
+        }
         let escrow = U256::from(envelope.gas_limit())
             * U256::from(envelope.effective_gas_price(header.base_fee_per_gas));
-        db.load_account(collector)
-            .context(CronosArchiveRead)?
-            .info
-            .balance += escrow;
+        if !genesis_eips {
+            let balance = db
+                .load_account(tx.inner.signer())
+                .context(CronosArchiveRead)?
+                .info
+                .balance;
+            ensure!(
+                balance
+                    .checked_sub(escrow)
+                    .is_some_and(|available| available >= envelope.value()),
+                "insufficient funds for effective escrow and value in tx {hash}"
+            );
+        }
+        adjust_balance(&mut db, collector, escrow, true)?;
         let mut evm = EthEvmFactory::default()
-            .create_evm_with_inspector(&mut db, env.clone(), PipelineInspector::new())
+            .create_evm_with_inspector(
+                &mut db,
+                env.clone(),
+                PipelineInspector::<true>::configured(),
+            )
             .into_inner();
         // revm combines the warm dynamic SLOAD charge with its base gas.
-        evm.instruction.insert_gas(opcode::SLOAD, 900);
-        evm.instruction.insert_gas(opcode::BALANCE, 700);
-        evm.instruction.insert_gas(opcode::EXTCODEHASH, 700);
-        evm.instruction.insert_instruction(
-            opcode::SSTORE,
-            revm::interpreter::Instruction::new(ethermint_sstore),
-            0,
-        );
+        if genesis_eips {
+            evm.instruction.insert_gas(opcode::SLOAD, 900);
+            evm.instruction.insert_gas(opcode::BALANCE, 700);
+            evm.instruction.insert_gas(opcode::EXTCODEHASH, 700);
+            evm.instruction.insert_instruction(
+                opcode::SSTORE,
+                revm::interpreter::Instruction::new(ethermint_sstore),
+                0,
+            );
+        }
         evm.ctx.tx = (&tx.inner).into_tx_env();
         let mut handler = EthermintHandler {
             warm,
@@ -279,12 +408,52 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             EVMError::Database(source) => anyhow::Error::new(source).context(CronosArchiveRead),
             other => anyhow!("tx {index} {hash}: {other:?}"),
         })?;
+        if era == CronosEra::Titan && evm.inspector.ran_prevrandao {
+            return Err(anyhow!("tx {index} {hash}")
+                .context(CronosRuleGap("Titan PREVRANDAO with nil Random")));
+        }
+        if spec >= SpecId::SHANGHAI {
+            if let Some(target) = evm.inspector.cronos_native_call {
+                return Err(
+                    anyhow!("tx {index} {hash}").context(CronosNativeCall::Precompile(target))
+                );
+            }
+        }
+        if spec == SpecId::PRAGUE {
+            if evm.inspector.ran_blobbasefee {
+                return Err(anyhow!("tx {index} {hash}").context(CronosRuleGap(
+                    "BLOBBASEFEE with an unset Ethermint blob base fee",
+                )));
+            }
+            if envelope.authorization_list().is_some() && !result.is_success() {
+                return Err(anyhow!("tx {index} {hash}").context(CronosRuleGap(
+                    "failed authorization transaction state rollback",
+                )));
+            }
+        }
+        if let Some(topic) = result
+            .logs()
+            .iter()
+            .map(|log| &log.data)
+            .chain(receipt.logs().iter().map(|log| &log.inner.data))
+            .filter_map(|data| data.topics().first())
+            .find(|topic| pallene::has_native_hook(era, **topic))
+        {
+            return Err(anyhow!("tx {index} {hash}").context(CronosNativeCall::Hook(*topic)));
+        }
         warm = handler.warm;
         let state = evm.ctx.journaled_state.finalize();
-        if era != CronosEra::HuygenHotfix
+        if matches!(era, CronosEra::BeforeHuygen | CronosEra::Huygen)
             && state.values().any(|account| account.is_selfdestructed())
         {
             return Err(anyhow!("tx {index} {hash}").context(LegacySelfdestruct));
+        }
+        if state
+            .values()
+            .any(|account| account.is_selfdestructed() && !account.info.balance.is_zero())
+        {
+            return Err(anyhow!("tx {index} {hash}")
+                .context(CronosRuleGap("balance received after SELFDESTRUCT")));
         }
         ensure!(
             result.is_success() == receipt.status(),
@@ -292,22 +461,42 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             result.is_success(),
             receipt.status()
         );
-        ensure!(
-            result.tx_gas_used() == message_gas[index],
-            "tx {index} {hash} execution gas: replay {}, Comet {}",
-            result.tx_gas_used(),
-            message_gas[index]
-        );
-        // Before Huygen a revert also discarded the unused-gas refund.
-        // At H124760 tx 4 the sender paid 822893 gas; DeliverTx recorded 810418.
-        let charged = if transient && !result.is_success() {
-            envelope.gas_limit()
+        let net = result.tx_gas_used();
+        let settled = if genesis_eips {
+            // v0.6 discards the unused-gas refund when execution reverts.
+            let charged = if transient && !result.is_success() {
+                envelope.gas_limit()
+            } else {
+                net
+            };
+            galileo::SettledGas {
+                cosmos: net,
+                charged,
+                receipt: charged,
+            }
         } else {
-            result.tx_gas_used()
+            let basis = if matches!(era, CronosEra::Galileo | CronosEra::FeeMarket) {
+                galileo::GasBasis::AfterRefund
+            } else {
+                galileo::GasBasis::BeforeRefund
+            };
+            basis.settle(
+                envelope.gas_limit(),
+                result.gas().total_gas_spent(),
+                net,
+                parameters.min_gas_multiplier_atomics,
+            )?
         };
         ensure!(
-            charged == receipt.gas_used,
-            "tx {index} {hash} receipt gas: replay {charged}, receipt {}",
+            settled.cosmos == message_gas[index],
+            "tx {index} {hash} execution gas: replay {}, Comet {}",
+            settled.cosmos,
+            message_gas[index]
+        );
+        ensure!(
+            settled.receipt == receipt.gas_used,
+            "tx {index} {hash} receipt gas: replay {}, receipt {}",
+            settled.receipt,
             receipt.gas_used
         );
         ensure!(
@@ -317,24 +506,42 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
                 .eq(receipt.logs().iter().map(|log| &log.inner)),
             "tx {index} {hash} committed logs differ"
         );
-        let (arena, stores) = evm.inspector.into_traces();
+        let (mut arena, stores) = evm.inspector.into_traces();
+        if let Some(root) = arena.nodes_mut().first_mut() {
+            root.trace.gas_used = settled.cosmos;
+            root.trace.gas_limit = envelope.gas_limit();
+        }
         append_tx_traces(
             hash,
             &arena,
             &stores,
             &mut log_index,
-            &mut storage,
+            &mut BTreeSet::new(),
             &mut file,
         );
-        file.txs.push(pipeline_transaction(
+        let mut transaction = pipeline_transaction(
             envelope,
             tx.inner.signer(),
             &result,
             envelope.effective_gas_price(header.base_fee_per_gas),
             index,
-        ));
+        );
+        transaction.gas_used = settled.cosmos.try_into()?;
+        if envelope.to().is_none() {
+            transaction.to_addr = super::types::addr_hex(&Address::ZERO);
+        }
+        // The Cosmos writer only populates cap fields for a dynamic-fee (type 2) tx.
+        if envelope.authorization_list().is_some() {
+            transaction.gas_price = envelope.max_fee_per_gas();
+            transaction.max_fee_per_gas = 0;
+            transaction.max_priority_fee_per_gas = 0;
+        }
+        file.txs.push(transaction);
         for (address, account) in &state {
-            if !account.is_cold_transaction_id(TransactionId::ZERO) {
+            if account.changed_storage_slots().next().is_some() {
+                storage.insert(*address);
+            }
+            if transient && !account.is_cold_transaction_id(TransactionId::ZERO) {
                 let slots = warm.entry(*address).or_default();
                 slots.extend(
                     account
@@ -346,27 +553,17 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
             }
         }
         db.commit(state);
-        let refund = U256::from(envelope.gas_limit() - result.tx_gas_used())
-            * U256::from(envelope.effective_gas_price(header.base_fee_per_gas));
-        if charged != result.tx_gas_used() {
-            let balance = &mut db
-                .load_account(tx.inner.signer())
-                .context(CronosArchiveRead)?
-                .info
-                .balance;
-            *balance = balance
-                .checked_sub(refund)
-                .ok_or_else(|| anyhow!("sender cannot settle failed tx {hash}"))?;
-            continue;
-        }
-        let balance = &mut db
-            .load_account(collector)
-            .context(CronosArchiveRead)?
-            .info
-            .balance;
-        *balance = balance
-            .checked_sub(refund)
-            .ok_or_else(|| anyhow!("fee collector cannot refund {hash}"))?;
+        let price = U256::from(envelope.effective_gas_price(header.base_fee_per_gas));
+        let refund = U256::from(envelope.gas_limit() - settled.charged) * price;
+        adjust_balance(
+            &mut db,
+            tx.inner.signer(),
+            U256::from(settled.charged - net) * price,
+            false,
+        )
+        .with_context(|| format!("sender settlement for {hash}"))?;
+        adjust_balance(&mut db, collector, refund, false)
+            .with_context(|| format!("fee collector settlement for {hash}"))?;
     }
     file.storage_contracts = storage.iter().map(super::types::addr_hex).collect();
     check_block_file(&file, receipts)?;
@@ -497,7 +694,7 @@ mod era_tests {
             (3_982_499, Some(CronosEra::Huygen)),
             (3_982_500, Some(CronosEra::HuygenHotfix)),
             (6_542_799, Some(CronosEra::HuygenHotfix)),
-            (6_542_800, None),
+            (6_542_800, Some(CronosEra::Galileo)),
         ] {
             assert_eq!(CronosEra::at_height(height), era);
         }
