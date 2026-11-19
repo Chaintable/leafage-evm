@@ -126,8 +126,8 @@ impl CronosEra {
     pub fn version(self) -> &'static str {
         match self {
             Self::BeforeHuygen => "ethermint-transient-v3",
-            Self::Huygen => "ethermint-huygen-v3",
-            Self::HuygenHotfix => "ethermint-huygen-hotfix-v3",
+            Self::Huygen => "ethermint-huygen-v4",
+            Self::HuygenHotfix => "ethermint-huygen-hotfix-v4",
         }
     }
 
@@ -187,6 +187,9 @@ pub fn replay_cronos_ethermint<D: DatabaseRef + Debug>(
     // Ethermint exposes zero to GASLIMIT for an unbounded block meter.
     cfg.disable_block_gas_limit = gas_limit == 0;
     cfg.gas_params.override_gas([
+        // The genesis extra EIP-2929 reinstalls geth's refund-enabled
+        // SELFDESTRUCT gas function after the London jump table is selected.
+        (GasId::selfdestruct_refund(), 24_000),
         (GasId::sstore_static(), 800),
         (GasId::sstore_set_without_load_cost(), 19_200),
         (GasId::sstore_reset_without_cold_load_cost(), 4_200),
