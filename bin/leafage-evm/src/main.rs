@@ -10,6 +10,7 @@ mod db_migrate;
 mod force_compact;
 mod initializer;
 mod pipeline_export;
+mod pipeline_replay;
 mod put_code;
 mod register;
 mod rewind;

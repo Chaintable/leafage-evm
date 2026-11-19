@@ -134,6 +134,10 @@ fn genesis_tx_id(kind: u8, address: &str) -> String {
     format!("0x{kind:02}{:022}{}", 0, address.trim_start_matches("0x"))
 }
 
+pub fn native_token_genesis_block(block: &RpcBlock) -> BlockFile {
+    genesis_block_file(Vec::new(), block, true)
+}
+
 /// A synthetic transaction of the genesis block and its single trace.
 fn genesis_tx(
     kind: u8,

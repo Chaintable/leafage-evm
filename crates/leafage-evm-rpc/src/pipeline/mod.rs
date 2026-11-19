@@ -13,6 +13,12 @@ pub(crate) mod bundle;
 pub(crate) mod chain;
 pub(crate) mod changes;
 pub(crate) mod convert;
+mod cronos;
+pub use cronos::{
+    replay_cronos_ethermint, CronosArchiveRead, CronosEra, CronosExecutionParams, CronosNativeCall,
+    CronosRelease, CronosRuleGap, LegacySelfdestruct,
+};
+pub use genesis::native_token_genesis_block;
 pub(crate) mod export;
 pub(crate) mod genesis;
 pub(crate) mod inspector;
@@ -24,3 +30,11 @@ pub use bundle::{Resource, BUNDLE_SIZE};
 pub use chain::Chain;
 pub use export::{bundle_range, export_bundles, ExportConfig};
 pub use s3::S3Target;
+
+/// A native-only block has no EVM transactions or EVM traces.
+pub fn native_block_file(header: &alloy::rpc::types::Header) -> types::BlockFile {
+    types::BlockFile {
+        block: build::pipeline_block(header),
+        ..Default::default()
+    }
+}
