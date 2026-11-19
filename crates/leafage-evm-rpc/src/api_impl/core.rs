@@ -29,29 +29,6 @@ use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use std::fmt::Debug;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RpcConfig {
-    pub block_zero: Option<DebankBlock>,
-}
-
-impl RpcConfig {
-    pub(super) fn block_zero_at(&self, height: u64) -> Option<&DebankBlock> {
-        self.block_zero.as_ref().filter(|_| height == 0)
-    }
-
-    pub fn validate(&self, genesis_number: u64) -> anyhow::Result<()> {
-        if let Some(block) = &self.block_zero {
-            anyhow::ensure!(block.height == 0, "rpc.block_zero requires block height 0");
-            anyhow::ensure!(
-                genesis_number > 0,
-                "rpc.block_zero requires --genesis-number greater than 0"
-            );
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct EvmCfg<SpecId, CustomCfg> {
     pub is_archive: bool,
@@ -62,7 +39,7 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
-    pub rpc: RpcConfig,
+    pub rpc_block_zero: Option<DebankBlock>,
     /// Per-server limiter for CPU-bound EVM execution (call / multicall /
     /// estimateGas / simulate / trace). `None` keeps execution unbounded.
     pub exec_limiter: Option<Arc<tokio::sync::Semaphore>>,
@@ -81,6 +58,10 @@ pub struct EvmCfg<SpecId, CustomCfg> {
 }
 
 impl<SpecId, CustomCfg> EvmCfg<SpecId, CustomCfg> {
+    pub(super) fn block_zero_at(&self, height: u64) -> Option<&DebankBlock> {
+        self.rpc_block_zero.as_ref().filter(|_| height == 0)
+    }
+
     pub fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
         leafage_evm_storage::EvmStorageWrapper {
             db,

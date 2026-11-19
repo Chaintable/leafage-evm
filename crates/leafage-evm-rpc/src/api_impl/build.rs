@@ -10,7 +10,7 @@ use super::{InterceptorConfig, InterceptorLayer};
 use crate::api::{BlockxApiServer, DebankApiServer, EthApiServer, PreApiServer};
 use crate::api_impl::core::{
     Api, ApiBase, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, MultiChainCfgEnv,
-    RpcConfig, ToJsonRpcError,
+    ToJsonRpcError,
 };
 use crate::api_impl::historical_overload::{HistoricalOverloadHttpLayer, HistoricalOverloadRpc};
 use crate::api_impl::hyper::HyperEvmConfig;
@@ -26,7 +26,7 @@ use leafage_evm_chains::arc::ARC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{ApeYieldStorage, BlockIndex, EvmStorageRead};
-use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
+use leafage_evm_types::{Address, DebankBlock, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -38,7 +38,7 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
-    rpc: RpcConfig,
+    rpc_block_zero: Option<DebankBlock>,
     upstream_client: Option<HttpClient>,
     /// URL the upstream client was built for, kept so the HyperCore read-precompile
     /// forwarder can be built when the server starts.
@@ -69,7 +69,7 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
-            rpc: RpcConfig::default(),
+            rpc_block_zero: None,
             upstream_client: None,
             upstream_url: None,
             forward_simulate: false,
@@ -97,8 +97,8 @@ where
         self
     }
 
-    pub fn with_rpc_config(mut self, rpc: RpcConfig) -> Self {
-        self.rpc = rpc;
+    pub fn with_rpc_block_zero(mut self, rpc_block_zero: Option<DebankBlock>) -> Self {
+        self.rpc_block_zero = rpc_block_zero;
         self
     }
 
@@ -324,7 +324,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                api_impl.evm_cfg.rpc = self.rpc;
+                api_impl.evm_cfg.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -423,7 +423,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                api_impl.evm_cfg.rpc = self.rpc;
+                api_impl.evm_cfg.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -489,7 +489,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                api_impl.evm_cfg.rpc = self.rpc;
+                api_impl.evm_cfg.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
