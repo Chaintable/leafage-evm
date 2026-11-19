@@ -74,7 +74,9 @@ fn rejected_deployment<DB: DatabaseRef>(
     }))
 }
 
-fn op_error<E>(error: EVMError<E, InvalidTransaction>) -> EVMError<E, OpTransactionError> {
+pub(super) fn op_error<E>(
+    error: EVMError<E, InvalidTransaction>,
+) -> EVMError<E, OpTransactionError> {
     match error {
         EVMError::Transaction(e) => EVMError::Transaction(OpTransactionError::Base(e)),
         EVMError::Header(e) => EVMError::Header(e),
