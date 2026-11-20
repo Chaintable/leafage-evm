@@ -18,7 +18,7 @@ use leafage_evm_chains::rsk::RskHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_storage::EvmStorageRead;
 use leafage_evm_types::{
-    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
+    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId, H256,
 };
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -88,6 +88,8 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn historical_client(&self) -> Option<&HttpClient>;
 
     fn historical_height(&self) -> Option<u64>;
+
+    fn block_zero_at(&self, height: u64) -> Option<&DebankBlock>;
 
     fn upstream_client(&self) -> Option<&HttpClient>;
 

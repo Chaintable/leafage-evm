@@ -97,6 +97,7 @@ async fn formal_t11_rpc_uses_requested_timestamp_for_strict_abi() {
                 evm_cfg: tests::review_api().evm_cfg,
                 historical_client: None,
                 historical_height: None,
+                rpc_block_zero: None,
                 upstream_client: None,
                 forward_simulate: false,
                 forward_estimategas: false,
@@ -249,6 +250,7 @@ async fn review_signed_sponsor_estimate_dispatch_uses_state_nonce_without_fallba
                     .unwrap()
             }),
             historical_height: Some(101),
+            rpc_block_zero: None,
             upstream_client: None,
             forward_simulate: false,
             forward_estimategas: false,
@@ -352,6 +354,7 @@ async fn upstream_forwarding_simulate_and_estimate_gas() {
         evm_cfg: tests::review_api().evm_cfg,
         historical_client: None,
         historical_height: None,
+        rpc_block_zero: None,
         upstream_client: Some(upstream_client),
         forward_simulate: true,
         forward_estimategas: true,

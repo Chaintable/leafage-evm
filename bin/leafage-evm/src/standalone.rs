@@ -25,7 +25,7 @@ use leafage_evm_storage::{
     ArchiveSchema, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
     StorageKind,
 };
-use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
+use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -298,6 +298,11 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     genesis_number: u64,
 
+    /// JSON block metadata for missing height zero in getBlockByHeight and eth_getBlockByNumber.
+    /// Requires a nonzero genesis number.
+    #[arg(long, value_parser = parse_rpc_block_zero, value_name = "JSON")]
+    rpc_block_zero: Option<DebankBlock>,
+
     /// The size of the task queue for the s3 updater.
     /// Default: 256
     ///
@@ -547,6 +552,14 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
         interceptor_config = serde_json::from_str(arg)?;
     }
     Ok(interceptor_config)
+}
+
+fn parse_rpc_block_zero(arg: &str) -> Result<DebankBlock> {
+    let block: DebankBlock = serde_json::from_str(arg)?;
+    if block.height != 0 {
+        bail!("--rpc-block-zero requires block height 0");
+    }
+    Ok(block)
 }
 
 fn parse_ovm_address(arg: &str) -> Result<Address> {
@@ -1125,6 +1138,7 @@ impl Command {
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
+            .with_rpc_block_zero(self.rpc_block_zero.clone())
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_upstream_config(
                 self.upstream_url.clone(),
@@ -1251,6 +1265,10 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        if self.rpc_block_zero.is_some() && self.genesis_number == 0 {
+            bail!("--rpc-block-zero requires --genesis-number greater than 0");
+        }
+
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         let (updater_handle, rpc_handle, resgitry_handle) =
@@ -1354,6 +1372,32 @@ mod tests {
         ];
         argv.extend_from_slice(args);
         Command::try_parse_from(argv).expect("command should parse")
+    }
+
+    #[tokio::test]
+    async fn rpc_block_zero_requires_nonzero_genesis_and_zero_height() {
+        let mut block = serde_json::to_value(DebankBlock {
+            timestamp: 1_636_333_200,
+            ..Default::default()
+        })
+        .unwrap();
+        block["process_start_timestamp"] = 0.into();
+        let json = block.to_string();
+
+        let command = parse_command(&["--genesis-number", "1", "--rpc-block-zero", &json]);
+        assert_eq!(command.rpc_block_zero.unwrap().timestamp, 1_636_333_200);
+
+        let error = parse_command(&["--rpc-block-zero", &json])
+            .run()
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--genesis-number greater than 0"));
+
+        block["height"] = 1.into();
+        assert!(parse_rpc_block_zero(&block.to_string()).is_err());
+        assert!(parse_rpc_block_zero("{}").is_err());
     }
 
     #[test]
