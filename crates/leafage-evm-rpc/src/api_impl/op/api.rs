@@ -210,6 +210,7 @@ mod tests {
             false,
             false,
             String::new(),
+            None,
             0,
             None,
             None,
