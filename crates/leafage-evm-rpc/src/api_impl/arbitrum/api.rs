@@ -625,6 +625,7 @@ mod tests {
             true,
             false,
             "test".to_string(),
+            None,
             100,
             None,
             None,

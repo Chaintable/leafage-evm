@@ -86,8 +86,8 @@ pub struct Command {
     /// # Example
     /// --evm-type=cosmos
     /// --evm-custom-config={"native_token":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
-    #[arg(long)]
-    evm_custom_config: Option<String>,
+    #[arg(long, value_parser = parse_evm_custom_config)]
+    evm_custom_config: Option<EvmCustomConfig>,
 
     /// Execution specification ID, using the selected EVM type's numbering.
     /// For OP, use op_spec_id in --evm-custom-config instead.
@@ -549,6 +549,38 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
     Ok(interceptor_config)
 }
 
+#[derive(Clone, Debug)]
+struct EvmCustomConfig {
+    chain: Option<String>,
+    block_zero: Option<DebankBlock>,
+}
+
+fn parse_evm_custom_config(raw: &str) -> Result<EvmCustomConfig> {
+    let mut config: serde_json::Value = serde_json::from_str(raw)?;
+    let Some(rpc) = config.as_object_mut().and_then(|obj| obj.remove("rpc")) else {
+        return Ok(EvmCustomConfig {
+            chain: Some(raw.to_owned()),
+            block_zero: None,
+        });
+    };
+    let serde_json::Value::Object(mut rpc) = rpc else {
+        bail!("rpc must be an object");
+    };
+    let block_zero: Option<DebankBlock> =
+        serde_json::from_value(rpc.remove("block_zero").unwrap_or_default())?;
+    if let Some(key) = rpc.keys().next() {
+        bail!("unknown rpc option: {key}");
+    }
+    if let Some(block) = &block_zero {
+        anyhow::ensure!(block.height == 0, "rpc.block_zero requires block height 0");
+    }
+    let chain = config
+        .as_object()
+        .filter(|obj| !obj.is_empty())
+        .map(|_| config.to_string());
+    Ok(EvmCustomConfig { chain, block_zero })
+}
+
 fn parse_ovm_address(arg: &str) -> Result<Address> {
     if arg.is_empty() {
         bail!("ovm address cannot be empty");
@@ -623,40 +655,13 @@ impl Command {
         )
     }
 
-    fn take_rpc_block_zero(&mut self) -> Result<Option<DebankBlock>> {
-        let Some(raw) = &self.evm_custom_config else {
-            return Ok(None);
-        };
-        let serde_json::Value::Object(mut config) = serde_json::from_str(raw)? else {
-            return Ok(None);
-        };
-        let Some(rpc) = config.remove("rpc") else {
-            return Ok(None);
-        };
-        let serde_json::Value::Object(mut rpc) = rpc else {
-            bail!("rpc must be an object");
-        };
-        let block: Option<DebankBlock> =
-            serde_json::from_value(rpc.remove("block_zero").unwrap_or_default())?;
-        if let Some(key) = rpc.keys().next() {
-            bail!("unknown rpc option: {key}");
-        }
-        if let Some(block) = &block {
-            anyhow::ensure!(block.height == 0, "rpc.block_zero requires block height 0");
-            anyhow::ensure!(
-                self.genesis_number > 0,
-                "rpc.block_zero requires --genesis-number greater than 0"
-            );
-        }
-        self.evm_custom_config =
-            (!config.is_empty()).then(|| serde_json::Value::Object(config).to_string());
-        Ok(block)
-    }
-
     fn build_chain_cfg_env(&self) -> Result<MultiChainCfgEnv> {
         let chain_id = self.chain_cfg;
         let evm_type = self.evm_type.clone();
-        let custom_evm_cfg = self.evm_custom_config.clone();
+        let custom_evm_cfg = self
+            .evm_custom_config
+            .as_ref()
+            .and_then(|cfg| cfg.chain.clone());
         let gas_cap = self.rpc_gas_cap;
         if self.forward_read_precompiles && evm_type != "hyper" {
             bail!("--forward-read-precompiles is only supported with --evm-type=hyper");
@@ -945,7 +950,6 @@ impl Command {
     async fn start(
         &mut self,
         chain_cfg: MultiChainCfgEnv,
-        rpc_block_zero: Option<DebankBlock>,
     ) -> Result<(
         tokio::sync::watch::Sender<()>,
         jsonrpsee::server::ServerHandle,
@@ -1156,7 +1160,6 @@ impl Command {
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
-            .with_rpc_block_zero(rpc_block_zero)
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_upstream_config(
                 self.upstream_url.clone(),
@@ -1211,6 +1214,9 @@ impl Command {
                 self.archive,
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
+                self.evm_custom_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.block_zero.clone()),
                 self.estimate_gas_buffer,
                 self.listen_backlog,
             )
@@ -1283,15 +1289,21 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        let original_config = self.evm_custom_config.clone();
-        let rpc_block_zero = self.take_rpc_block_zero()?;
-        let chain_cfg = self.build_chain_cfg_env();
-        self.evm_custom_config = original_config;
+        if self
+            .evm_custom_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.block_zero.is_some())
+        {
+            anyhow::ensure!(
+                self.genesis_number > 0,
+                "rpc.block_zero requires --genesis-number greater than 0"
+            );
+        }
 
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         let (updater_handle, rpc_handle, resgitry_handle) =
-            self.start(chain_cfg?, rpc_block_zero).await?;
+            self.start(self.build_chain_cfg_env()?).await?;
         run_until_ctrl_c(async move {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
@@ -1360,13 +1372,18 @@ mod chain_config_tests {
             "op_spec_id": "Jovian",
             "rpc": {"block_zero": leafage_evm_types::DebankBlock::default()}
         });
-        let mut command = command(&[
+        let command = command(&[
             "--genesis-number",
             "1",
             "--evm-custom-config",
             &json.to_string(),
         ]);
-        assert!(command.take_rpc_block_zero().unwrap().is_some());
+        assert!(command
+            .evm_custom_config
+            .as_ref()
+            .unwrap()
+            .block_zero
+            .is_some());
         let MultiChainCfgEnv::Op(cfg) = command.build_chain_cfg_env().unwrap() else {
             panic!("expected OP configuration");
         };
@@ -1422,15 +1439,16 @@ mod tests {
         block["process_start_timestamp"] = 0.into();
         let json = serde_json::json!({"rpc": {"block_zero": block}});
 
-        let mut command = parse_command(&[
+        let command = parse_command(&[
             "--genesis-number",
             "1",
             "--evm-custom-config",
             &json.to_string(),
         ]);
-        let block = command.take_rpc_block_zero().unwrap().unwrap();
+        let config = command.evm_custom_config.unwrap();
+        let block = config.block_zero.unwrap();
         assert_eq!(block.timestamp, 1_636_333_200);
-        assert!(command.evm_custom_config.is_none());
+        assert!(config.chain.is_none());
 
         let error = parse_command(&["--evm-custom-config", &json.to_string()])
             .run()
@@ -1442,21 +1460,9 @@ mod tests {
 
         let mut invalid = json;
         invalid["rpc"]["block_zero"]["height"] = 1.into();
-        let error = parse_command(&[
-            "--genesis-number",
-            "1",
-            "--evm-custom-config",
-            &invalid.to_string(),
-        ])
-        .run()
-        .await
-        .unwrap_err();
+        let error = parse_evm_custom_config(&invalid.to_string()).unwrap_err();
         assert!(error.to_string().contains("requires block height 0"));
-        assert!(
-            parse_command(&["--evm-custom-config", r#"{"rpc":{"block_zero":{}}}"#])
-                .take_rpc_block_zero()
-                .is_err()
-        );
+        assert!(parse_evm_custom_config(r#"{"rpc":{"block_zero":{}}}"#).is_err());
     }
 
     #[test]

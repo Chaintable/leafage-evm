@@ -86,6 +86,7 @@ async fn op_config_reaches_call_estimate_multicall_and_trace() {
                 false,
                 false,
                 "test".into(),
+                None,
                 0,
                 128,
             )

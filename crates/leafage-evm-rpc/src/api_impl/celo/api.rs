@@ -124,6 +124,7 @@ mod tests {
             false,
             false,
             String::new(),
+            None,
             100,
             None,
             None,

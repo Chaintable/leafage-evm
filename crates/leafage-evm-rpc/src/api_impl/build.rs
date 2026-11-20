@@ -38,7 +38,6 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
-    rpc_block_zero: Option<DebankBlock>,
     upstream_client: Option<HttpClient>,
     /// URL the upstream client was built for, kept so the HyperCore read-precompile
     /// forwarder can be built when the server starts.
@@ -69,7 +68,6 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
-            rpc_block_zero: None,
             upstream_client: None,
             upstream_url: None,
             forward_simulate: false,
@@ -94,11 +92,6 @@ where
     #[cfg(target_os = "linux")]
     pub fn with_interceptor_cfg(mut self, interceptor_cfg: Option<InterceptorConfig>) -> Self {
         self.interceptor_cfg = interceptor_cfg;
-        self
-    }
-
-    pub fn with_rpc_block_zero(mut self, rpc_block_zero: Option<DebankBlock>) -> Self {
-        self.rpc_block_zero = rpc_block_zero;
         self
     }
 
@@ -253,6 +246,7 @@ where
         is_archive: bool,
         normalize_state_key: bool,
         version: String,
+        rpc_block_zero: Option<DebankBlock>,
         estimate_gas_buffer: u64,
         listen_backlog: u32,
     ) -> std::io::Result<ServerHandle> {
@@ -314,6 +308,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version.clone(),
+                    rpc_block_zero,
                     estimate_gas_buffer,
                     self.token_collector.clone(),
                     exec_limiter.clone(),
@@ -324,7 +319,6 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                api_impl.evm_cfg.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -413,6 +407,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version.clone(),
+                    rpc_block_zero,
                     estimate_gas_buffer,
                     self.token_collector.clone(),
                     exec_limiter.clone(),
@@ -423,7 +418,6 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                api_impl.evm_cfg.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -479,6 +473,7 @@ where
                     is_archive,
                     normalize_state_key,
                     version.clone(),
+                    rpc_block_zero,
                     estimate_gas_buffer,
                     self.token_collector.clone(),
                     exec_limiter.clone(),
@@ -489,7 +484,6 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
-                api_impl.evm_cfg.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,

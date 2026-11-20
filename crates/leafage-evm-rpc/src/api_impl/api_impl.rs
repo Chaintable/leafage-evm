@@ -2,7 +2,7 @@ use crate::api_impl::core::{ApiBase, EvmCfg, GetTransactionError, ToJsonRpcError
 use crate::api_impl::token_collector::TokenCollector;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::http_client::HttpClient;
-use leafage_evm_types::{Address, DebankErrorCode};
+use leafage_evm_types::{Address, DebankBlock, DebankErrorCode};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::CfgEnv;
 use revm::primitives::hardfork::SpecId as EthSpecId;
@@ -32,6 +32,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
         is_archive: bool,
         normalize_state_key: bool,
         version: String,
+        rpc_block_zero: Option<DebankBlock>,
         estimate_gas_buffer: u64,
         token_collector: Option<TokenCollector>,
         exec_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -48,7 +49,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
                 version,
                 estimate_gas_buffer,
                 custom_cfg,
-                rpc_block_zero: None,
+                rpc_block_zero,
                 exec_limiter,
                 state_read_limiter,
                 multicall_parallelism: 0,

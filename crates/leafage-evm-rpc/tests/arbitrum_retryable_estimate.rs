@@ -199,6 +199,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             false,
             false,
             "arbitrum-retryable-test".to_string(),
+            None,
             100,
             1024,
         )
@@ -563,6 +564,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             false,
             false,
             "arbitrum-osaka-gas-cap-test".to_string(),
+            None,
             100,
             1024,
         )

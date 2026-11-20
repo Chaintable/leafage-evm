@@ -426,6 +426,7 @@ fn build_arc_fixture_with_timestamp(
         false,
         false,
         "arc-estimate-test".to_string(),
+        None,
         estimate_gas_buffer,
         None,
         None,

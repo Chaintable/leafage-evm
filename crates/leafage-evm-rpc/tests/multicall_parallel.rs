@@ -183,6 +183,7 @@ async fn run_differential(serial_addr: &'static str, parallel_addr: &'static str
                 false,
                 false,
                 "e2e-test".to_string(),
+                None,
                 100,
                 1024,
             )
