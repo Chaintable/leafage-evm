@@ -298,7 +298,7 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     genesis_number: u64,
 
-    /// JSON block metadata to return when getBlockByHeight(0) cannot find a block.
+    /// JSON block metadata for missing height zero in getBlockByHeight and eth_getBlockByNumber.
     /// Requires a nonzero genesis number.
     #[arg(long, value_parser = parse_rpc_block_zero, value_name = "JSON")]
     rpc_block_zero: Option<DebankBlock>,

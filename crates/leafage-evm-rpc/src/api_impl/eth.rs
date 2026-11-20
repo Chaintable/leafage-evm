@@ -7,7 +7,7 @@ use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
 use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
-    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
+    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId, BlockInfo,
     BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, DebankErrorCode, Header, JsonStorageKey,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, H256, KECCAK256_EMPTY,
     U256,
@@ -386,6 +386,23 @@ where
             .db()
             .get_block_by_id_arc(block_id)
             .map_err(|e| block_lookup_err(block_id, e))?
+            .or_else(|| {
+                let BlockId::Number(BlockNumberOrTag::Number(height)) = block_id else {
+                    return None;
+                };
+                let metadata = self.inner.block_zero_at(height)?;
+                let mut block = BlockInfo::new(Block::empty(Default::default()));
+                let header = &mut block.inner.header;
+                header.hash = metadata.id;
+                header.inner.number = metadata.height;
+                header.inner.parent_hash = metadata.parent_id;
+                header.inner.timestamp = metadata.timestamp;
+                header.inner.beneficiary = metadata.miner;
+                header.inner.base_fee_per_gas = Some(metadata.base_fee_per_gas);
+                header.inner.gas_limit = metadata.gas_limit;
+                header.inner.gas_used = metadata.gas_used;
+                Some(std::sync::Arc::new(block))
+            })
             .ok_or_else(|| self.block_unavailable_err(block_id))?;
         let value = serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?;
         Ok(Some(value))

@@ -277,7 +277,28 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
         handle.stopped().await;
     }
 
+    let zero = BlockNumberOrTag::Number(0);
+    let (handle, client) = serve(missing_tree.clone(), false, Some(placeholder.clone()), None).await;
+    for full in [false, true] {
+        let block = client.get_block_by_number(zero, full).await.unwrap().unwrap();
+        assert_eq!(block["number"], "0x0");
+        assert_eq!(block["hash"], expected["id"]);
+        assert_eq!(block["parentHash"], expected["parent_id"]);
+        assert_eq!(block["miner"], expected["miner"]);
+        assert_eq!(block["timestamp"], format!("0x{:x}", placeholder.timestamp));
+        assert_eq!(block["baseFeePerGas"], "0x0");
+        assert_eq!(block["gasLimit"], "0x0");
+        assert_eq!(block["gasUsed"], "0x0");
+        assert_eq!(block["transactions"], serde_json::json!([]));
+    }
+    assert_eq!(error_code(client.get_block_by_hash(H256::ZERO, false).await), -39006);
+    assert_eq!(error_code(client.get_block_by_number(BlockNumberOrTag::Number(99), false).await), -39006);
+    handle.stop().unwrap();
+    handle.stopped().await;
+
     let (handle, client) = serve(real_tree, false, Some(placeholder), None).await;
+    let block = client.get_block_by_number(zero, false).await.unwrap().unwrap();
+    assert_eq!(block["hash"], serde_json::json!(H256::repeat_byte(0xaa)));
     assert_eq!(
         client.get_block_by_height(U256::ZERO).await.unwrap().id,
         H256::repeat_byte(0xaa)
@@ -286,6 +307,7 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
     handle.stopped().await;
 
     let (handle, client) = serve(missing_tree, false, None, None).await;
+    assert_eq!(error_code(client.get_block_by_number(zero, false).await), -39006);
     assert_eq!(
         error_code(client.get_block_by_height(U256::ZERO).await),
         -39006
