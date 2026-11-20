@@ -39,7 +39,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub version: String,
     pub estimate_gas_buffer: u64,
     pub custom_cfg: Option<CustomCfg>,
-    pub rpc_block_zero: Option<DebankBlock>,
     /// Per-server limiter for CPU-bound EVM execution (call / multicall /
     /// estimateGas / simulate / trace). `None` keeps execution unbounded.
     pub exec_limiter: Option<Arc<tokio::sync::Semaphore>>,
@@ -58,10 +57,6 @@ pub struct EvmCfg<SpecId, CustomCfg> {
 }
 
 impl<SpecId, CustomCfg> EvmCfg<SpecId, CustomCfg> {
-    pub(super) fn block_zero_at(&self, height: u64) -> Option<&DebankBlock> {
-        self.rpc_block_zero.as_ref().filter(|_| height == 0)
-    }
-
     pub fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
         leafage_evm_storage::EvmStorageWrapper {
             db,
@@ -93,6 +88,8 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
     fn historical_client(&self) -> Option<&HttpClient>;
 
     fn historical_height(&self) -> Option<u64>;
+
+    fn block_zero_at(&self, height: u64) -> Option<&DebankBlock>;
 
     fn upstream_client(&self) -> Option<&HttpClient>;
 
@@ -426,7 +423,6 @@ mod tests {
             false,
             false,
             String::new(),
-            None,
             100,
             None,
             None,

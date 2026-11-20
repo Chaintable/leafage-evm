@@ -1160,6 +1160,7 @@ impl Command {
 
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
+            .with_rpc_block_zero(self.evm_custom_config.as_ref().and_then(|cfg| cfg.block_zero.clone()))
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
             .with_upstream_config(
                 self.upstream_url.clone(),
@@ -1214,9 +1215,6 @@ impl Command {
                 self.archive,
                 self.normalize_state_key,
                 self.kafka_s3_config.clone().unwrap_or_default().version,
-                self.evm_custom_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.block_zero.clone()),
                 self.estimate_gas_buffer,
                 self.listen_backlog,
             )

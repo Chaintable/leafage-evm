@@ -213,7 +213,6 @@ fn setup(
                     false,
                     false,
                     "bench".to_string(),
-                    None,
                     100,
                     1024,
                 ),

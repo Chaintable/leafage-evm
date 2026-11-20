@@ -192,7 +192,6 @@ fn setup(enable_cache: bool, block_cache_mb: usize, sets: usize, addr: &str) -> 
                 false,
                 false,
                 "bench".to_string(),
-                None,
                 100,
                 1024,
             ),

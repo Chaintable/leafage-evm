@@ -122,7 +122,6 @@ async fn rpc_smoke_over_layered_state() {
             false,
             false,
             "e2e-test".to_string(),
-            None,
             100,
             1024,
         )
@@ -360,7 +359,6 @@ async fn multicall_prefetch_matches_scalar_semantics() {
             false,
             false,
             "e2e-test".to_string(),
-            None,
             100,
             1024,
         )

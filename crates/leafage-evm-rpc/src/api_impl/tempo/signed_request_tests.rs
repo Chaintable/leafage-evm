@@ -665,7 +665,6 @@ fn review_malformed_tempo_fields_rejected_only_by_tempo() {
         true,
         false,
         String::new(),
-        None,
         0,
         None,
         None,

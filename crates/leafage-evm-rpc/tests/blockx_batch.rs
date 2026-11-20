@@ -212,7 +212,6 @@ async fn batch_matches_single_methods_byte_for_byte() {
             false,
             false,
             "blockx-batch-test".to_string(),
-            None,
             100,
             1024,
         )
@@ -399,7 +398,6 @@ async fn virtual_balance_answers_before_state_resolution() {
             false,
             false,
             "blockx-vb-test".to_string(),
-            None,
             100,
             1024,
         )
@@ -516,7 +514,6 @@ async fn batch_falls_back_to_historical_per_item() {
             false,
             false,
             "blockx-hist-test".to_string(),
-            None,
             100,
             1024,
         )
@@ -548,7 +545,6 @@ async fn batch_falls_back_to_historical_per_item() {
             false,
             false,
             "blockx-primary-test".to_string(),
-            None,
             100,
             1024,
         )

@@ -218,7 +218,6 @@ async fn ape_balances_and_precompiles_follow_yield_fields() {
         false,
         false,
         "ape-yield-test".to_string(),
-        None,
         100,
         1024,
     )

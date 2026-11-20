@@ -138,7 +138,6 @@ fn setup() -> Fixture {
                 false,
                 false,
                 "bench".to_string(),
-                None,
                 100,
                 1024,
             ),

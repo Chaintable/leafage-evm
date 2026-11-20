@@ -911,7 +911,6 @@ mod tests {
             true,
             false,
             String::new(),
-            None,
             0,
             None,
             None,

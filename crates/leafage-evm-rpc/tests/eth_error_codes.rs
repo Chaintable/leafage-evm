@@ -106,6 +106,7 @@ async fn serve(
     cfg.disable_base_fee = true;
     cfg.chain_id = 1;
     let handle = ApiBuilder::new(tree, MultiChainCfgEnv::Mainnet(cfg))
+        .with_rpc_block_zero(block_zero)
         .with_historical_config(historical_rpc, Some(1))
         .build_and_run(
             &addr.to_string(),
@@ -114,7 +115,6 @@ async fn serve(
             is_archive,
             false,
             "eth-error-codes-test".to_string(),
-            block_zero,
             100,
             1024,
         )
