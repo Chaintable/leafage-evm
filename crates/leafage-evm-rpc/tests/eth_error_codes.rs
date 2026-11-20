@@ -279,6 +279,8 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
 
     let zero = BlockNumberOrTag::Number(0);
     let (handle, client) = serve(missing_tree.clone(), false, Some(placeholder.clone()), None).await;
+    let block = client.get_block_by_height(U256::ZERO).await.unwrap();
+    assert_eq!(serde_json::to_value(block).unwrap(), expected);
     for full in [false, true] {
         let block = client.get_block_by_number(zero, full).await.unwrap().unwrap();
         assert_eq!(block["number"], "0x0");
