@@ -19,16 +19,20 @@ use std::fmt::Debug;
 type BscApiImpl<DB> = ApiImpl<DB, BscHardfork, NoneEvmCustomConfig>;
 
 /// The configured cfg with the hardfork of the executing block. On BSC mainnet the
-/// spec follows the fork schedule (as `trace_debankBlock` replay does), so a new fork takes
-/// effect at its activation block without a redeploy; any other chain id keeps the
-/// configured spec.
+/// spec and its gas params follow the fork schedule (as `trace_debankBlock` replay does),
+/// so a new fork takes effect at its activation block without a redeploy; any other chain
+/// id keeps the configured spec. A block of the configured fork keeps the configured gas
+/// params.
 fn block_cfg(cfg: &CfgEnv<BscHardfork>, block_env: &BlockEnv) -> CfgEnv<BscHardfork> {
     let mut cfg = cfg.clone();
     if cfg.chain_id == BSC_MAINNET_CHAIN_ID {
-        cfg.spec = bsc_mainnet_spec_at(
+        let spec = bsc_mainnet_spec_at(
             block_env.number.saturating_to(),
             block_env.timestamp.saturating_to(),
         );
+        if spec != cfg.spec {
+            cfg.set_spec_and_mainnet_gas_params(spec);
+        }
     }
     cfg
 }
@@ -168,6 +172,31 @@ mod tests {
             BscHardfork::Fermi
         );
         assert_eq!(block_cfg(&cfg, &block(1, 0)).spec, BscHardfork::Niels);
+    }
+
+    /// The gas table is the block's fork's, not the configured fork's: Niels runs
+    /// Istanbul rules, without the cold access costs of the default Maxwell (Prague).
+    #[test]
+    fn mainnet_gas_params_follow_the_block() {
+        use revm::context_interface::cfg::GasParams;
+
+        let mut cfg = CfgEnv::<BscHardfork>::default();
+        cfg.chain_id = BSC_MAINNET_CHAIN_ID;
+        let niels = block_cfg(&cfg, &block(1, 0));
+        assert_eq!(niels.spec, BscHardfork::Niels);
+        assert_eq!(
+            niels.gas_params.table(),
+            GasParams::new_spec(SpecId::ISTANBUL).table()
+        );
+        assert_ne!(niels.gas_params.table(), cfg.gas_params.table());
+
+        // A gas table set on the configured fork stays for a block of that fork.
+        let mut cfg = CfgEnv::new_with_spec(BscHardfork::Fermi);
+        cfg.chain_id = BSC_MAINNET_CHAIN_ID;
+        cfg.gas_params = GasParams::new_spec(SpecId::ISTANBUL);
+        let fermi = block_cfg(&cfg, &block(60_000_000, 1_777_343_399));
+        assert_eq!(fermi.spec, BscHardfork::Fermi);
+        assert_eq!(fermi.gas_params.table(), cfg.gas_params.table());
     }
 
     #[test]

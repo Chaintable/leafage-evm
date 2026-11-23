@@ -3008,7 +3008,6 @@ fn new_state_iterators(
 }
 
 pub struct StateDB {
-    db: Arc<DataBaseRef>,
     block_num: u64,
     /// `None` when the database is empty (no blocks committed yet).
     /// Stores full BlockInfo to preserve `other` fields (e.g. l1FeeRate).
@@ -3027,6 +3026,9 @@ pub struct StateDB {
     /// Schema v3: read options at the cache view's head, for state cache
     /// probes; created on the first probe.
     udt_head: std::sync::OnceLock<udt::UdtReader>,
+    /// Declared last, so dropped last: dropping the last reference closes
+    /// the database, and the iterators above must be gone by then.
+    db: Arc<DataBaseRef>,
 }
 
 impl Clone for StateDB {

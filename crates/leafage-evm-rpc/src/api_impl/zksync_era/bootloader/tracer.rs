@@ -84,24 +84,36 @@ pub fn to_hash(args: &[&str]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// The selector of `Error(string)`.
+const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+
+/// A 32-byte ABI word as a `usize`; `None` when it does not fit.
+fn word_as_usize(word: &[u8]) -> Option<usize> {
+    let (high, low) = word.split_at(word.len().checked_sub(8)?);
+    if high.iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    usize::try_from(u64::from_be_bytes(low.try_into().ok()?)).ok()
+}
+
+/// The message of an `Error(string)` revert; `None` when the payload is not
+/// one. The payload is the contract's, so its offset and length are checked
+/// rather than trusted.
+fn decode_error_string(bytes: &[u8]) -> Option<String> {
+    let rest = bytes.strip_prefix(&ERROR_STRING_SELECTOR)?;
+    let offset = word_as_usize(rest.get(..32)?)?;
+    if offset < 32 {
+        return None;
+    }
+    let data = rest.get(offset..)?;
+    let str_len = word_as_usize(data.get(..32)?)?;
+    let str_bytes = data.get(32..)?.get(..str_len)?;
+    Some(String::from_utf8_lossy(str_bytes).to_string())
+}
+
 pub fn decode_vm_revert_reason(bytes: &[u8]) -> String {
-    if bytes.len() >= 4 && &bytes[0..4] == &[0x08, 0xc3, 0x79, 0xa0] {
-        let rest = &bytes[4..];
-        if rest.len() >= 64 {
-            let offset_bytes: [u8; 32] = rest[0..32].try_into().unwrap();
-            let offset = primitive_types::U256::from_big_endian(&offset_bytes).as_usize();
-            if offset >= 32 && offset < rest.len() {
-                let data = &rest[offset..];
-                if data.len() >= 32 {
-                    let len_bytes: [u8; 32] = data[0..32].try_into().unwrap();
-                    let str_len = primitive_types::U256::from_big_endian(&len_bytes).as_usize();
-                    if 32 + str_len <= data.len() {
-                        let str_bytes = &data[32..32 + str_len];
-                        return String::from_utf8_lossy(str_bytes).to_string();
-                    }
-                }
-            }
-        }
+    if let Some(reason) = decode_error_string(bytes) {
+        return reason;
     }
     if bytes.is_empty() {
         "Error function_selector = 0x, data = 0x".to_string()
@@ -109,6 +121,14 @@ pub fn decode_vm_revert_reason(bytes: &[u8]) -> String {
         let hex_data = alloy::primitives::hex::encode(bytes);
         if bytes.len() >= 4 {
             let sel = alloy::primitives::hex::encode(&bytes[0..4]);
+            // As zksync-era's `VmRevertReason` has it: the data of a selector
+            // it does not know is the whole payload, that of an
+            // `Error(string)` it cannot parse is what follows the selector.
+            let hex_data = if bytes[0..4] == ERROR_STRING_SELECTOR {
+                alloy::primitives::hex::encode(&bytes[4..])
+            } else {
+                hex_data
+            };
             format!("Error function_selector = 0x{}, data = 0x{}", sel, hex_data)
         } else {
             format!("Error function_selector = 0x{}, data = 0x", hex_data)
@@ -509,5 +529,74 @@ impl Tracer for EraCallTracer {
         }
 
         ShouldStop::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error_string(offset: [u8; 32], len: [u8; 32], text: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x08, 0xc3, 0x79, 0xa0];
+        bytes.extend_from_slice(&offset);
+        bytes.extend_from_slice(&len);
+        bytes.extend_from_slice(text);
+        bytes
+    }
+
+    fn word(value: u64) -> [u8; 32] {
+        let mut word = [0u8; 32];
+        word[24..].copy_from_slice(&value.to_be_bytes());
+        word
+    }
+
+    #[test]
+    fn decodes_an_error_string() {
+        let bytes = error_string(word(32), word(5), b"oops!\0\0\0");
+        assert_eq!(decode_vm_revert_reason(&bytes), "oops!");
+    }
+
+    /// The offset and length are the contract's: ones that do not fit the
+    /// payload, or a `usize`, fall back to the raw form instead of panicking.
+    /// As in zksync-era, its data is what follows the selector.
+    #[test]
+    fn malformed_error_strings_fall_back_to_the_raw_form() {
+        let raw = |bytes: &[u8]| {
+            format!(
+                "Error function_selector = 0x08c379a0, data = 0x{}",
+                alloy::primitives::hex::encode(&bytes[4..])
+            )
+        };
+        for bytes in [
+            error_string([0xff; 32], word(5), b"oops!"),
+            error_string(word(32), [0xff; 32], b"oops!"),
+            error_string(word(32), word(u64::MAX), b"oops!"),
+            error_string(word(u64::MAX), word(5), b"oops!"),
+            error_string(word(32), word(6), b"oops!"),
+            error_string(word(31), word(5), b"oops!"),
+        ] {
+            assert_eq!(decode_vm_revert_reason(&bytes), raw(&bytes));
+        }
+        assert_eq!(
+            decode_vm_revert_reason(&ERROR_STRING_SELECTOR),
+            "Error function_selector = 0x08c379a0, data = 0x"
+        );
+    }
+
+    /// The data of any other selector is the whole payload, selector included.
+    #[test]
+    fn other_payloads_keep_the_raw_form() {
+        assert_eq!(
+            decode_vm_revert_reason(&[0x12, 0x34, 0x56, 0x78, 0x9a]),
+            "Error function_selector = 0x12345678, data = 0x123456789a"
+        );
+        assert_eq!(
+            decode_vm_revert_reason(&[0x12, 0x34]),
+            "Error function_selector = 0x1234, data = 0x"
+        );
+        assert_eq!(
+            decode_vm_revert_reason(&[]),
+            "Error function_selector = 0x, data = 0x"
+        );
     }
 }
