@@ -9,7 +9,6 @@ use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::EVMError;
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
 use revm::inspector::NoOpInspector;
-use revm::ExecuteEvm;
 use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
@@ -62,7 +61,7 @@ where
             state,
             NoOpInspector {},
         );
-        evm.transact(tx).map(|res| res.result.into())
+        evm.transact_read_only(tx).map(Into::into)
     }
 
     fn inspect_tx_commit<

@@ -14,7 +14,6 @@ use revm::context::result::{EVMError, HaltReason, InvalidTransaction};
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
 use revm::inspector::NoOpInspector;
 use revm::primitives::hardfork::SpecId;
-use revm::ExecuteEvm;
 use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
@@ -98,8 +97,7 @@ where
             NoOpInspector {},
         );
 
-        let res = evm.transact(tx).map(|res| res.result.into());
-        res
+        evm.transact_read_only(tx).map(Into::into)
     }
 
     fn inspect_tx_commit<
