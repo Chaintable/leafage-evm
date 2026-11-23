@@ -71,6 +71,9 @@ where
         loop {
             if self.block_queue.len() > self.max_diff_depth {
                 info!(target:"updater", "can't find parent block before max diff depth, drop");
+                // Start over from the tree's head on the next tick: with the
+                // queue left as it is, every later update would stop here.
+                self.block_queue.clear();
                 return Ok(false);
             }
             let first_output = self.block_queue.front().unwrap();

@@ -19,16 +19,16 @@ use std::fmt::Debug;
 type BscApiImpl<DB> = ApiImpl<DB, BscHardfork, NoneEvmCustomConfig>;
 
 /// The configured cfg with the hardfork of the executing block. On BSC mainnet the
-/// spec follows the fork schedule (as `trace_debankBlock` replay does), so a new fork takes
-/// effect at its activation block without a redeploy; any other chain id keeps the
-/// configured spec.
+/// spec and its gas params follow the fork schedule (as `trace_debankBlock` replay does),
+/// so a new fork takes effect at its activation block without a redeploy; any other chain
+/// id keeps the configured spec.
 fn block_cfg(cfg: &CfgEnv<BscHardfork>, block_env: &BlockEnv) -> CfgEnv<BscHardfork> {
     let mut cfg = cfg.clone();
     if cfg.chain_id == BSC_MAINNET_CHAIN_ID {
-        cfg.spec = bsc_mainnet_spec_at(
+        cfg.set_spec_and_mainnet_gas_params(bsc_mainnet_spec_at(
             block_env.number.saturating_to(),
             block_env.timestamp.saturating_to(),
-        );
+        ));
     }
     cfg
 }
@@ -168,6 +168,29 @@ mod tests {
             BscHardfork::Fermi
         );
         assert_eq!(block_cfg(&cfg, &block(1, 0)).spec, BscHardfork::Niels);
+    }
+
+    /// The gas table is the block's fork's, not the configured fork's: Niels runs
+    /// Istanbul rules, without the cold access costs of the default Maxwell (Prague).
+    #[test]
+    fn mainnet_gas_params_follow_the_block() {
+        use revm::context_interface::cfg::GasParams;
+
+        let mut cfg = CfgEnv::<BscHardfork>::default();
+        cfg.chain_id = BSC_MAINNET_CHAIN_ID;
+        let niels = block_cfg(&cfg, &block(1, 0));
+        assert_eq!(niels.spec, BscHardfork::Niels);
+        assert_eq!(
+            niels.gas_params.table(),
+            GasParams::new_spec(SpecId::ISTANBUL).table()
+        );
+        assert_ne!(niels.gas_params.table(), cfg.gas_params.table());
+
+        let pasteur = block_cfg(&cfg, &block(70_000_000, 1_787_625_000));
+        assert_eq!(
+            pasteur.gas_params.table(),
+            GasParams::new_spec(BscHardfork::Pasteur.into()).table()
+        );
     }
 
     #[test]

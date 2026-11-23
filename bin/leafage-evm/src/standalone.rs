@@ -1259,9 +1259,11 @@ impl Command {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
-            // wait for lease to unregist
+            // The registration has no lease: the key is deleted. Keep serving
+            // while that happens and the callers that still know this node
+            // finish.
             info!(
-                "waiting for etcd lease to expire in {} seconds...",
+                "unregistering from etcd, stopping the rpc server in {} seconds...",
                 self.stop_wait_timeout
             );
             time::sleep(std::time::Duration::from_secs(

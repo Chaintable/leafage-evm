@@ -43,6 +43,19 @@ fn estimate_gas_limit_cap(
     consensus_cap.min(rpc_cap).min(block_gas_limit)
 }
 
+/// The estimate with the configured buffer applied (a percentage; it takes
+/// effect above 100), kept within `cap`: a transaction sent with more gas than
+/// the cap is rejected, however little of it it uses.
+fn buffered_gas_estimate(estimate: u64, buffer: u64, cap: u64) -> u64 {
+    if buffer <= 100 {
+        return estimate;
+    }
+    let buffered = (estimate as u128 * buffer as u128) / 100;
+    (buffered.min(u64::MAX as u128) as u64)
+        .min(cap)
+        .max(estimate)
+}
+
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 
 pub const CALL_STIPEND_GAS: u64 = 2_300;
@@ -1580,13 +1593,11 @@ where
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
-        let buffer = self.inner.evm_cfg().estimate_gas_buffer;
-        let final_gas = if buffer > 100 {
-            let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
-            buffered.min(u64::MAX as u128) as u64
-        } else {
-            highest_gas_limit
-        };
+        let final_gas = buffered_gas_estimate(
+            highest_gas_limit,
+            self.inner.evm_cfg().estimate_gas_buffer,
+            max_gas_limit,
+        );
 
         tx.set_gas_limit(final_gas);
         let l1_overhead =
@@ -1657,7 +1668,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::estimate_gas_limit_cap;
+    use super::{buffered_gas_estimate, estimate_gas_limit_cap};
+
+    #[test]
+    fn the_estimate_buffer_stays_within_the_gas_cap() {
+        // No buffer at or below 100 percent.
+        assert_eq!(buffered_gas_estimate(100_000, 0, 16_777_216), 100_000);
+        assert_eq!(buffered_gas_estimate(100_000, 100, 16_777_216), 100_000);
+        assert_eq!(buffered_gas_estimate(100_000, 120, 16_777_216), 120_000);
+        // 16M with a 20% buffer is 19.2M, above the EIP-7825 cap.
+        assert_eq!(
+            buffered_gas_estimate(16_000_000, 120, 16_777_216),
+            16_777_216
+        );
+        assert_eq!(buffered_gas_estimate(u64::MAX, 200, u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn zero_rpc_gas_cap_is_unlimited_but_consensus_and_block_caps_still_apply() {
