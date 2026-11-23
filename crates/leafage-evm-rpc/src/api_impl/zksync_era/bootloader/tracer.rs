@@ -84,6 +84,9 @@ pub fn to_hash(args: &[&str]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// The selector of `Error(string)`.
+const ERROR_STRING_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+
 /// A 32-byte ABI word as a `usize`; `None` when it does not fit.
 fn word_as_usize(word: &[u8]) -> Option<usize> {
     let (high, low) = word.split_at(word.len().checked_sub(8)?);
@@ -97,7 +100,7 @@ fn word_as_usize(word: &[u8]) -> Option<usize> {
 /// one. The payload is the contract's, so its offset and length are checked
 /// rather than trusted.
 fn decode_error_string(bytes: &[u8]) -> Option<String> {
-    let rest = bytes.strip_prefix(&[0x08, 0xc3, 0x79, 0xa0])?;
+    let rest = bytes.strip_prefix(&ERROR_STRING_SELECTOR)?;
     let offset = word_as_usize(rest.get(..32)?)?;
     if offset < 32 {
         return None;
@@ -118,6 +121,14 @@ pub fn decode_vm_revert_reason(bytes: &[u8]) -> String {
         let hex_data = alloy::primitives::hex::encode(bytes);
         if bytes.len() >= 4 {
             let sel = alloy::primitives::hex::encode(&bytes[0..4]);
+            // As zksync-era's `VmRevertReason` has it: the data of a selector
+            // it does not know is the whole payload, that of an
+            // `Error(string)` it cannot parse is what follows the selector.
+            let hex_data = if bytes[0..4] == ERROR_STRING_SELECTOR {
+                alloy::primitives::hex::encode(&bytes[4..])
+            } else {
+                hex_data
+            };
             format!("Error function_selector = 0x{}, data = 0x{}", sel, hex_data)
         } else {
             format!("Error function_selector = 0x{}, data = 0x", hex_data)
@@ -547,12 +558,13 @@ mod tests {
 
     /// The offset and length are the contract's: ones that do not fit the
     /// payload, or a `usize`, fall back to the raw form instead of panicking.
+    /// As in zksync-era, its data is what follows the selector.
     #[test]
     fn malformed_error_strings_fall_back_to_the_raw_form() {
         let raw = |bytes: &[u8]| {
             format!(
                 "Error function_selector = 0x08c379a0, data = 0x{}",
-                alloy::primitives::hex::encode(bytes)
+                alloy::primitives::hex::encode(&bytes[4..])
             )
         };
         for bytes in [
@@ -565,5 +577,26 @@ mod tests {
         ] {
             assert_eq!(decode_vm_revert_reason(&bytes), raw(&bytes));
         }
+        assert_eq!(
+            decode_vm_revert_reason(&ERROR_STRING_SELECTOR),
+            "Error function_selector = 0x08c379a0, data = 0x"
+        );
+    }
+
+    /// The data of any other selector is the whole payload, selector included.
+    #[test]
+    fn other_payloads_keep_the_raw_form() {
+        assert_eq!(
+            decode_vm_revert_reason(&[0x12, 0x34, 0x56, 0x78, 0x9a]),
+            "Error function_selector = 0x12345678, data = 0x123456789a"
+        );
+        assert_eq!(
+            decode_vm_revert_reason(&[0x12, 0x34]),
+            "Error function_selector = 0x1234, data = 0x"
+        );
+        assert_eq!(
+            decode_vm_revert_reason(&[]),
+            "Error function_selector = 0x, data = 0x"
+        );
     }
 }
