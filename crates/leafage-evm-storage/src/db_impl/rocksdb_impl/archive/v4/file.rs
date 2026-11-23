@@ -6,7 +6,7 @@
 //! Frames are compressed with the file's dictionary and carry zstd's
 //! content checksum. Files are written once and never modified.
 
-use super::codec::{self, key_len, rd32, rd64, PageEnc, Val, PAGE_TARGET};
+use super::codec::{self, key_len, page_target, rd32, rd64, PageEnc, Val};
 use super::index::{Index, IndexBuilder, UNIT};
 use super::{corrupt, io_stats};
 use crate::db_impl::error::Error;
@@ -744,7 +744,7 @@ impl PageWriter {
     /// Whether the open page is short enough that the next stored page
     /// should be merged into it instead of copied after it.
     pub(crate) fn open_page_is_short(&self) -> bool {
-        self.enc.len() > 0 && self.enc.size() < PAGE_TARGET / 2
+        self.enc.len() > 0 && self.enc.size() < page_target() / 2
     }
 
     /// Whether the file may end before `key`: the last record is known (it
@@ -763,7 +763,7 @@ impl PageWriter {
     }
 
     pub(crate) fn add(&mut self, key: &[u8], block: u64, val: &Val) -> Result<(), Error> {
-        if self.enc.len() > 0 && self.enc.size() >= PAGE_TARGET {
+        if self.enc.len() > 0 && self.enc.size() >= page_target() {
             self.flush_page()?;
         }
         if self.enc.len() == 0 {
@@ -879,7 +879,7 @@ pub(crate) fn train_dict<'a>(storage: bool, samples: impl Iterator<Item = &'a [R
     let mut enc = PageEnc::new(storage);
     for recs in samples {
         for r in recs {
-            if enc.len() > 0 && enc.size() >= PAGE_TARGET {
+            if enc.len() > 0 && enc.size() >= page_target() {
                 let mut page = Vec::new();
                 enc.finish(&mut page);
                 pages.push(page);

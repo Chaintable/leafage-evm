@@ -17,9 +17,25 @@ pub(crate) const KECCAK_EMPTY: [u8; 32] = [
     0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ];
 
-/// Raw size at which a page is closed. Measured on bsc: smaller pages lose
-/// the prefetch of neighbouring keys, larger ones cost cache memory.
-pub(crate) const PAGE_TARGET: usize = 12 << 10;
+/// Default raw size at which a page is closed, in KiB. Measured on bsc:
+/// smaller pages lose the prefetch of neighbouring keys, larger ones cost
+/// cache memory.
+const PAGE_KB_DEFAULT: usize = 12;
+
+/// Raw size at which a page is closed: `ARCHIVE_V4_PAGE_KB` (4 to 32,
+/// default 12), read once per process. It shapes only the pages this process
+/// writes (conversion, flushes, merges, rewrites); a reader takes pages of any
+/// size, so archives and segments of different page sizes mix.
+pub(crate) fn page_target() -> usize {
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("ARCHIVE_V4_PAGE_KB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(PAGE_KB_DEFAULT, |kb| kb.clamp(4, 32))
+            << 10
+    })
+}
 
 /// Restart period in records.
 const R_STORAGE: usize = 32;
@@ -270,7 +286,7 @@ impl PageEnc {
     }
 
     /// Append a version. Versions come in (key, block) order, and a page is
-    /// closed ([`Self::finish`]) once it reaches [`PAGE_TARGET`], which keeps
+    /// closed ([`Self::finish`]) once it reaches [`page_target`], which keeps
     /// every stream offset within the restart table's `u16`.
     pub(crate) fn add(&mut self, key: &[u8], block: u64, val: &Val) {
         let k = key.len();
@@ -953,7 +969,7 @@ mod tests {
         for storage in [false, true] {
             let k = key_len(storage);
             let recs = sample(storage, 600, 42);
-            for target in [300, 2000, PAGE_TARGET] {
+            for target in [300, 2000, page_target()] {
                 let pages = pages(storage, &recs, target);
                 let mut all = Vec::new();
                 for (first, page) in &pages {
@@ -1036,7 +1052,7 @@ mod tests {
     #[test]
     fn malformed_pages_are_errors() {
         let recs = sample(false, 50, 3);
-        let page = pages(false, &recs, PAGE_TARGET).remove(0).1;
+        let page = pages(false, &recs, page_target()).remove(0).1;
         assert!(lookup(&page[..page.len() / 2], false, &recs[0].0[..32], 9).is_err());
         assert!(for_each(&[], false, |_, _, _| {}).is_err());
         let mut bad = page.clone();

@@ -1982,7 +1982,7 @@ impl Store {
         let inner = Arc::new(Inner {
             dir: dir.to_path_buf(),
             cache: QuickCache::with_weighter(
-                (cache_bytes / (codec::PAGE_TARGET as u64 + 1024)) as usize,
+                (cache_bytes / (codec::page_target() as u64 + 1024)) as usize,
                 cache_bytes,
                 PageWeighter,
             ),
