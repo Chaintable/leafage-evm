@@ -105,11 +105,11 @@ followed one after the other, each prefixed by its length:
 
 At a restart the value state starts from zero, so a lookup binary-searches
 the restart entries and decodes at most one run of records. A page is closed
-once it reaches 12 KiB raw; it is then compressed with zstd and the file's
-dictionary, with zstd's content checksum, and stored as
-`length u32 | frame | zero padding` up to a multiple of 64 bytes. On bsc a
-storage record takes 16.2 bytes stored: 9.0 of value, 4.7 of key, 1.6 of
-block, 0.9 of the rest.
+once it reaches 12 KiB raw (`ARCHIVE_V4_PAGE_KB`, see "Configuration"); it is
+then compressed with zstd and the file's dictionary, with zstd's content
+checksum, and stored as `length u32 | frame | zero padding` up to a multiple
+of 64 bytes. On bsc a storage record takes 16.2 bytes stored: 9.0 of value,
+4.7 of key, 1.6 of block, 0.9 of the rest.
 
 The page size is a measured optimum, not a constant of nature: with the
 memory a production replica has, 6 KiB and 24 KiB pages both read the device
@@ -531,6 +531,7 @@ replicas from the snapshot, as for v2 → v3. `--db-cache` stays as it is.
 | `ARCHIVE_V4_DELTA_PERCENT` / `ARCHIVE_V4_DELTA_MIN_MB` | 4 / 4096 | delta size, relative to the base and absolute, that starts a base rewrite |
 | `ARCHIVE_V4_DELTA_FILTER_MB` | 1024 | segment filter memory that starts one; reserved from `--db-cache` |
 | `ARCHIVE_V4_REWRITE_MBPS` | 32 | device IO of segment merges and base rewrites together, read plus written (0: no limit); about 1.2 for even writes on bsc ("Base rewrite") |
+| `ARCHIVE_V4_PAGE_KB` | 12 | raw size at which a page is closed (4 to 32): applies to the pages a process writes (conversion, flushes, merges, rewrites); readers take any page size |
 | `ARCHIVE_V4_BASE_FILE_MB` | 2048 | size at which a base file is closed: what a rewrite that is interrupted loses, and the free space a pass needs beside the delta. A larger file of an older archive is cut when a pass rewrites it |
 | `ARCHIVE_V4_BASE_ZSTD_LEVEL` | 3 | zstd level of base files (15 – 19: about 3 % smaller, 5 – 10 times slower to write) |
 | `ARCHIVE_V4_BLOCK_CACHE_MB` | 64 | memory for decoded chunks of block infos |
