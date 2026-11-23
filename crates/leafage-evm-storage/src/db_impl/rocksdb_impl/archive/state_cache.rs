@@ -131,6 +131,17 @@ pub(super) enum Probe {
 /// [`Entry::newest`] of a key not to probe again.
 const VOLATILE: u64 = u64::MAX;
 
+/// Position of a missed block relative to the spans cached for a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MissReason {
+    /// Above every cached span for the key.
+    Above,
+    /// Below every cached span for the key.
+    Below,
+    /// Strictly between cached spans for the key.
+    Gap,
+}
+
 #[derive(Debug)]
 pub(super) struct Entry<V> {
     /// The highest version of the key known to exist (0: none), or
@@ -147,6 +158,28 @@ impl<V> Entry<V> {
             self.newest > read.lo
         } else {
             self.newest > 0
+        }
+    }
+
+    /// Whether probing marked this key volatile (short span).
+    pub(super) fn is_volatile(&self) -> bool {
+        self.newest == VOLATILE
+    }
+
+    /// Classify a warm miss at `block` (not covered by any cached span).
+    pub(super) fn miss_reason(&self, block: u64) -> MissReason {
+        let mut min_lo = u64::MAX;
+        let mut max_hi = 0u64;
+        for s in &self.spans {
+            min_lo = min_lo.min(s.lo);
+            max_hi = max_hi.max(s.hi);
+        }
+        if block > max_hi {
+            MissReason::Above
+        } else if block < min_lo {
+            MissReason::Below
+        } else {
+            MissReason::Gap
         }
     }
 }
@@ -595,6 +628,29 @@ mod tests {
         record(&cache, 12, 150, found(100, 150, 1), false);
         record(&cache, 12, 250, found(200, 250, 2), false);
         assert_eq!(probe(12, 160, 1000, found(100, 160, 1)), Probe::Yes);
+    }
+
+    #[test]
+    fn miss_reason_classifies_warm_misses_and_volatility() {
+        let cache = StateCache::new(1 << 20);
+        record(&cache, 13, 120, found(100, 120, 1), false);
+        record(&cache, 13, 320, found(300, 320, 2), false);
+
+        let above = miss(&cache, 13, 400).unwrap();
+        assert_eq!(above.miss_reason(400), MissReason::Above);
+        assert!(!above.is_volatile());
+
+        let below = miss(&cache, 13, 50).unwrap();
+        assert_eq!(below.miss_reason(50), MissReason::Below);
+
+        let gap = miss(&cache, 13, 200).unwrap();
+        assert_eq!(gap.miss_reason(200), MissReason::Gap);
+
+        // Recording a short probed span marks the entry volatile.
+        cache.storage.record(key(13), found(350, 355, 3), true);
+        let vol = miss(&cache, 13, 400).unwrap();
+        assert!(vol.is_volatile());
+        assert_eq!(vol.miss_reason(400), MissReason::Above);
     }
 
     #[test]

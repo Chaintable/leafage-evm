@@ -61,6 +61,7 @@ impl IoStats {
         let m = &crate::metrics::ARCHIVE_V4_METRICS;
         m.page_reads.increment(1);
         m.page_read_bytes.increment(bytes);
+        m.page_read_latency.record(took.as_secs_f64());
     }
 
     /// Reads, bytes and nanoseconds so far.

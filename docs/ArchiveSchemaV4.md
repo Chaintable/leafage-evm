@@ -542,8 +542,10 @@ block index is always on (`ARCHIVE_BLOCK_INDEX` is not read), and the
 
 ## Metrics
 
-`leafage_archive_v4_*`: `page_reads`, `page_read_bytes`, `extra_pages`,
-`memtable_hits`, `segment_probes`, `segment_hits`, `flushes`, `merges`, `rewrites`, `rewrite_bytes` (counters);
+`leafage_archive_v4_*`: `page_reads`, `page_read_bytes`, `page_read_latency`,
+`absent_page_reads`, `extra_pages`, `memtable_hits`, `segment_probes`,
+`segment_hits`, `flushes`, `merges`, `rewrites`, `rewrite_bytes` (counters;
+`page_read_latency` is a histogram);
 `memtable_versions`, `segments`, `delta_bytes`, `base_files`, `base_bytes`,
 `index_bytes`, `segment_filter_bytes`, `page_cache_capacity_bytes`, `page_cache_usage_bytes`, `durable_block`
 (gauges). The read latencies, state cache counters and
