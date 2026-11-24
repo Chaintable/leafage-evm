@@ -77,27 +77,13 @@ where
         StateDB: DatabaseRef + std::fmt::Debug + Clone,
         StateDB::Error: Sync + Send + 'static,
     {
-        let build = || {
-            create_base_evm_from_state(
-                block_env.clone(),
-                self.evm_cfg.cfg.clone(),
-                state.clone(),
-                NoOpInspector {},
-            )
-        };
-        let mut evm = build();
-        // A call that unwound (a panic the caller caught) may have left the
-        // journal mid-transaction: the next call starts on a fresh EVM.
-        let mut interrupted = false;
-        f(&mut |tx| {
-            if interrupted {
-                evm = build();
-            }
-            interrupted = true;
-            let res = evm.transact_read_only(tx);
-            interrupted = false;
-            res
-        })
+        let mut evm = create_base_evm_from_state(
+            block_env.clone(),
+            self.evm_cfg.cfg.clone(),
+            state,
+            NoOpInspector {},
+        );
+        f(&mut |tx| evm.transact_read_only(tx))
     }
 
     fn inspect_tx_commit<

@@ -225,7 +225,9 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
     /// call behaves exactly like [`Self::transact`] and never sees another
     /// call's state changes. The default builds a fresh EVM for every call;
     /// chains whose EVM is costly to set up per call override it to keep one
-    /// EVM for the whole run.
+    /// EVM for the whole run. A call that panics may leave that EVM
+    /// mid-transaction, so the executor must not be called again after a
+    /// panic.
     fn with_call_executor<StateDB, R>(
         &self,
         block_env: &BlockEnv,

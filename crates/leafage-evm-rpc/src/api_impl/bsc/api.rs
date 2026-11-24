@@ -117,29 +117,12 @@ where
         StateDB::Error: Sync + Send + 'static,
     {
         let cfg = block_cfg(&self.evm_cfg.cfg, block_env);
-        let build = || {
-            let evm_env = EvmEnv::new(cfg.clone(), block_env.clone());
-            BscEvm::new(
-                evm_env,
-                WrapDatabaseRef(state.clone()),
-                NoOpInspector {},
-                false,
-            )
-        };
-        let mut evm = build();
-        // A call that unwound (a panic the caller caught) may have left the
-        // journal mid-transaction: the next call starts on a fresh EVM.
-        let mut interrupted = false;
+        let evm_env = EvmEnv::new(cfg, block_env.clone());
+        let mut evm = BscEvm::new(evm_env, WrapDatabaseRef(state), NoOpInspector {}, false);
         f(&mut |tx| {
-            if interrupted {
-                evm = build();
-            }
-            interrupted = true;
             // `transact` finalizes the journal on success and on error, so the
             // next call starts from the unchanged state.
-            let res = evm.transact(tx).map(|res| res.result);
-            interrupted = false;
-            res
+            evm.transact(tx).map(|res| res.result)
         })
     }
 

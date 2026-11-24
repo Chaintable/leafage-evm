@@ -118,27 +118,8 @@ where
             return f(&mut |tx| legacy::transact(&self.evm_cfg.cfg, block_env, state.clone(), tx));
         }
         let cfg = block_cfg(&self.evm_cfg.cfg, block_env);
-        let build = || {
-            create_op_evm_from_state(
-                block_env.clone(),
-                cfg.clone(),
-                state.clone(),
-                NoOpInspector {},
-            )
-        };
-        let mut evm = build();
-        // A call that unwound (a panic the caller caught) may have left the
-        // journal mid-transaction: the next call starts on a fresh EVM.
-        let mut interrupted = false;
-        f(&mut |tx| {
-            if interrupted {
-                evm = build();
-            }
-            interrupted = true;
-            let res = evm.transact_read_only(tx);
-            interrupted = false;
-            res
-        })
+        let mut evm = create_op_evm_from_state(block_env.clone(), cfg, state, NoOpInspector {});
+        f(&mut |tx| evm.transact_read_only(tx))
     }
 
     fn inspect_tx_commit<

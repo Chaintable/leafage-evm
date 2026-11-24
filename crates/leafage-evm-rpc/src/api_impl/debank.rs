@@ -761,6 +761,9 @@ where
         fast_fail: bool,
         cancel_token: &CancellationToken,
     ) {
+        // A caught panic stores an `Err` and lowers `stop_after` to its index,
+        // so this worker skips every later index and never calls `exec` again,
+        // as `with_call_executor` requires.
         self.inner.with_call_executor(block_env, db, |exec| loop {
             let index = next.fetch_add(1, Ordering::SeqCst);
             if index >= requests.len() || cancel_token.is_cancelled() {
