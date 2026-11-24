@@ -1,6 +1,7 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
-    ApiCore, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, CallExecutor, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError,
+    ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
@@ -123,6 +124,47 @@ where
         res
     }
 
+    /// Keeps one EVM for the whole run, so its frame stack, instruction table
+    /// and precompile set are built once instead of per call. zkSync calls
+    /// keep the per-call path.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        if self.evm_cfg.zksync {
+            return f(&mut |tx| self.transact(block_env, state.clone(), tx));
+        }
+        let build = || {
+            create_main_evm_from_state(
+                block_env.clone(),
+                self.evm_cfg.cfg.clone(),
+                state.clone(),
+                NoOpInspector {},
+            )
+        };
+        let mut evm = build();
+        // A call that unwound (a panic the caller caught) may have left the
+        // journal mid-transaction: the next call starts on a fresh EVM.
+        let mut interrupted = false;
+        f(&mut |tx| {
+            if interrupted {
+                evm = build();
+            }
+            interrupted = true;
+            // `transact` finalizes the journal on success and on error, so the
+            // next call starts from the unchanged state.
+            let res = evm.transact(tx).map(|res| res.result);
+            interrupted = false;
+            res
+        })
+    }
+
     fn apply_pre_execution_changes<StateDB>(
         &self,
         header: impl BlockHeader,
@@ -216,3 +258,100 @@ impl GetHaltReason for HaltReason {
 
 impl<DB> ApiCore for MainnetApiImpl<DB> where DB: Sync + Send + 'static {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_impl::api_impl::NoneEvmCustomConfig;
+    use alloy::primitives::{Address, Bytes, U256};
+    use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+
+    /// A multicall's calls run on one EVM (`with_call_executor`) give the same
+    /// results as a fresh EVM per call (`transact`): no call sees another's
+    /// writes, value transfers or fee payments, and a rejected call does not
+    /// leak into the next one.
+    #[test]
+    fn call_executor_matches_per_call_transact() {
+        let api = ApiImpl::<(), MainnetSpecId, NoneEvmCustomConfig>::new(
+            (),
+            CfgEnv::new_with_spec(SpecId::OSAKA),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            100,
+            None,
+            None,
+            None,
+        );
+        let caller = Address::repeat_byte(0x11);
+        let counter = Address::repeat_byte(0x21);
+        let reverter = Address::repeat_byte(0x22);
+        let payee = Address::repeat_byte(0x23);
+        let mut state = InMemoryDB::default();
+        state.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                ..Default::default()
+            },
+        );
+        // slot0 += 1; return slot0
+        let counter_code = Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x80, 0x60, 0x00, 0x55, 0x60, 0x00, 0x52, 0x60,
+            0x20, 0x60, 0x00, 0xf3,
+        ]));
+        state.insert_account_info(counter, AccountInfo::from_bytecode(counter_code));
+        // revert(0, 0)
+        let reverter_code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]));
+        state.insert_account_info(reverter, AccountInfo::from_bytecode(reverter_code));
+        let block_env = BlockEnv {
+            basefee: 3,
+            beneficiary: Address::repeat_byte(0xbb),
+            ..Default::default()
+        };
+        let tx = |to: Address, value: u64, nonce: u64| {
+            TxEnv::builder()
+                .caller(caller)
+                .to(to)
+                .nonce(nonce)
+                .gas_limit(100_000)
+                .gas_price(5)
+                .value(U256::from(value))
+                .build()
+                .unwrap()
+        };
+        let txs = [
+            tx(counter, 0, 0),
+            tx(counter, 0, 0),
+            tx(payee, 1_000, 0),
+            tx(reverter, 0, 0),
+            tx(counter, 0, 7),
+            tx(counter, 0, 0),
+        ];
+
+        let per_call: Vec<_> = txs
+            .iter()
+            .map(|tx| {
+                api.transact(&block_env, &state, tx.clone())
+                    .map_err(|e| e.to_string())
+            })
+            .collect();
+        let reused: Vec<_> = api.with_call_executor(&block_env, &state, |exec| {
+            txs.iter()
+                .map(|tx| exec(tx.clone()).map_err(|e| e.to_string()))
+                .collect()
+        });
+
+        assert_eq!(reused, per_call);
+        let one = Bytes::from(U256::from(1).to_be_bytes::<32>().to_vec());
+        for i in [0, 1, 5] {
+            assert_eq!(reused[i].as_ref().unwrap().output(), Some(&one), "call {i}");
+        }
+        assert!(reused[2].as_ref().unwrap().is_success());
+        assert!(!reused[3].as_ref().unwrap().is_success());
+        assert!(reused[4].is_err(), "a wrong nonce is rejected");
+    }
+}
