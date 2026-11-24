@@ -68,11 +68,20 @@
       {"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"pure","type":"function"},
       {"anonymous":false,"inputs":[{"indexed":true,"type":"address"},{"indexed":true,"type":"address"},{"indexed":true,"type":"uint256"}],"name":"BurnAt","type":"event"},
       {"inputs":[],"name":"BURN_AT_ROLE","outputs":[{"type":"bytes32"}],"stateMutability":"view","type":"function"},
-      {"inputs":[{"type":"address"},{"type":"uint256"}],"name":"burnAt","outputs":[],"stateMutability":"nonpayable","type":"function"}
+      {"inputs":[{"type":"address"},{"type":"uint256"}],"name":"burnAt","outputs":[],"stateMutability":"nonpayable","type":"function"},
+      {"inputs":[{"type":"address"}],"name":"RootKeyRetired","type":"error"}
     ],
     "removed": [
       {"inputs":[],"name":"SpendingLimitExceeded","type":"error"},
       {"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}
+    ]
+  },
+  "ITIP20ChannelReserve": {
+    "added": [
+      {"inputs":[{"type":"address"}],"name":"RootKeyRetired","type":"error"}
+    ],
+    "removed": [
+
     ]
   },
   "IRolesAuth": {

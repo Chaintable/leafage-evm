@@ -17,6 +17,10 @@ eth_precompile_fn!(
     tendermint_header_validation_run_nano_precompile,
     tendermint_header_validation_run_nano
 );
+eth_precompile_fn!(
+    tendermint_header_validation_run_pasteur_precompile,
+    tendermint_header_validation_run_pasteur
+);
 
 /// Tendermint precompile for BSC.
 pub(crate) const TENDERMINT_HEADER_VALIDATION: Precompile = Precompile::new(
@@ -31,6 +35,24 @@ pub(crate) const TENDERMINT_HEADER_VALIDATION_NANO: Precompile = Precompile::new
     u64_to_address(100),
     tendermint_header_validation_run_nano_precompile,
 );
+
+/// Tendermint precompile for BSC after Pasteur hardfork (go-bsc `tmHeaderValidateDeprecated`).
+pub(crate) const TENDERMINT_HEADER_VALIDATION_PASTEUR: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BSC_TENDERMINT_HEADER_VALIDATION_PASTEUR")),
+    u64_to_address(100),
+    tendermint_header_validation_run_pasteur_precompile,
+);
+
+/// Run the Tendermint header validation precompile after Pasteur hardfork: the base gas is
+/// still charged, then the call fails.
+fn tendermint_header_validation_run_pasteur(_input: &[u8], gas_limit: u64) -> EthPrecompileResult {
+    const TENDERMINT_HEADER_VALIDATION_BASE: u64 = 3_000;
+
+    if TENDERMINT_HEADER_VALIDATION_BASE > gas_limit {
+        return Err(PrecompileHalt::OutOfGas);
+    }
+    Err(PrecompileHalt::other("deprecated"))
+}
 
 /// Run the Tendermint header validation precompile after Nano hardfork.
 fn tendermint_header_validation_run_nano(input: &[u8], _gas_limit: u64) -> EthPrecompileResult {

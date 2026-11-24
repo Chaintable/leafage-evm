@@ -449,7 +449,7 @@ fn anchor_context() -> Option<DebankBlockContext> {
 fn call_request(from: Address, to: Address) -> CallRequest {
     CallRequest {
         inner: TransactionRequest::default().from(from).to(to),
-        tempo: None,
+        other: Default::default(),
     }
 }
 
@@ -471,11 +471,7 @@ fn execute_arc_estimate_probe(
     let block = state.block_info_arc().unwrap();
     request.nonce = None;
     request.gas = Some(gas_limit);
-    let mut cache_db = CacheDB::new(EvmStorageWrapper {
-        db: state,
-        ovm_address: None,
-        normalize_state_key: false,
-    });
+    let mut cache_db = CacheDB::new(EvmStorageWrapper::new(state));
     let mut block_env = block_env_from_block(&block);
     if let Some(overrides) = overrides {
         utils::apply_block_overrides(
@@ -519,7 +515,7 @@ fn request_with_input(from: Address, to: Address, input: Bytes) -> CallRequest {
             .from(from)
             .to(to)
             .input(TransactionInput::new(input)),
-        tempo: None,
+        other: Default::default(),
     }
 }
 
@@ -570,7 +566,7 @@ async fn arc_call_uses_shared_environment_and_overrides() {
             .gas_price(ANCHOR_BASE_FEE as u128)
             // call-like semantics ignore an explicitly supplied nonce.
             .nonce(999),
-        tempo: None,
+        other: Default::default(),
     };
     let output = fixture
         .api
@@ -598,7 +594,7 @@ async fn arc_call_uses_shared_environment_and_overrides() {
             .from(addresses.funded)
             .to(addresses.environment)
             .gas_price(OVERRIDDEN_BASE_FEE as u128),
-        tempo: None,
+        other: Default::default(),
     };
     let output = fixture
         .api
@@ -702,7 +698,7 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
             .gas_limit(500_000)
             .max_fee_per_gas(5)
             .max_priority_fee_per_gas(2),
-        tempo: None,
+        other: Default::default(),
     };
     let second = call_request(addresses.funded, addresses.counter);
     let counter_balance = request_with_input(
@@ -785,14 +781,14 @@ async fn arc_simulation_commits_sequential_state_fees_and_exact_fast_stop() {
                 .from(addresses.funded)
                 .to(addresses.counter)
                 .nonce(0),
-            tempo: None,
+            other: Default::default(),
         },
         CallRequest {
             inner: TransactionRequest::default()
                 .from(addresses.funded)
                 .to(addresses.counter)
                 .nonce(0),
-            tempo: None,
+            other: Default::default(),
         },
     ];
     let explicit_nonce = fixture
@@ -841,7 +837,7 @@ async fn arc_simulation_zero8_commits_drain_cleanup_and_value_recreation() {
             .from(addresses.funded)
             .to(addresses.drain_target)
             .value(recredited_balance),
-        tempo: None,
+        other: Default::default(),
     };
     let simulated = fixture
         .api
@@ -976,7 +972,7 @@ async fn arc_pre_traces_expose_post_zero7_callfrom_as_the_logical_child() {
             .to(MEMO_ADDRESS)
             .gas_limit(500_000)
             .input(TransactionInput::new(input)),
-        tempo: None,
+        other: Default::default(),
     };
     let anchor = Some(BlockId::Number(BlockNumberOrTag::Number(ANCHOR_NUMBER)));
 
@@ -1044,7 +1040,7 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
 
     let estimate_request = CallRequest {
         inner: authorize.clone(),
-        tempo: None,
+        other: Default::default(),
     };
     let estimated = estimate(&fixture.api, estimate_request.clone(), None)
         .await
@@ -1055,14 +1051,12 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
             .unwrap(),
         estimated
     );
-    let original_state = EvmStorageWrapper {
-        db: fixture
+    let original_state = EvmStorageWrapper::new(
+        fixture
             .api
             .debank_get_state_by_ctx_impl(anchor_context())
             .unwrap(),
-        ovm_address: None,
-        normalize_state_key: false,
-    };
+    );
     assert!(original_state.basic_ref(authority).unwrap().is_none());
 
     let simulated = fixture
@@ -1071,7 +1065,7 @@ async fn arc_simulation_commits_eip7702_delegation_for_the_next_transaction() {
             vec![
                 CallRequest {
                     inner: authorize,
-                    tempo: None,
+                    other: Default::default(),
                 },
                 call_request(addresses.funded, authority),
             ],
@@ -1210,7 +1204,7 @@ async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
             .from(addresses.funded)
             .to(to)
             .value(U256::from(5)),
-        tempo: None,
+        other: Default::default(),
     };
     let create = |init_code: Vec<u8>| {
         let mut inner = TransactionRequest::default()
@@ -1219,7 +1213,11 @@ async fn arc_simulation_native_transfer_events_use_the_system_emitter() {
             .gas_limit(200_000)
             .input(TransactionInput::new(init_code.into()));
         inner.to = Some(TxKind::Create);
-        CallRequest { inner, tempo: None }
+        CallRequest {
+            inner,
+            other: Default::default(),
+            ..Default::default()
+        }
     };
     let created = addresses.funded.create(0);
     // Receives value from the created contract, by SELFDESTRUCT or by a nested CALL.
@@ -1594,7 +1592,7 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
             .from(addresses.funded)
             .to(addresses.empty)
             .gas_limit(20_000),
-        tempo: None,
+        other: Default::default(),
     };
     assert_eq!(
         estimate(&fixture.api, transfer_with_low_request_gas, None)
@@ -1608,7 +1606,7 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
             .from(addresses.empty)
             .to(addresses.funded)
             .value(U256::ONE),
-        tempo: None,
+        other: Default::default(),
     };
     // Writer-style estimation does not synthesize a balance to pay tx.value.
     // Ordinary calls retain their existing balance-check-disabled policy.
@@ -1633,7 +1631,7 @@ async fn arc_estimate_uses_shared_transfer_and_validation_policy() {
             .from(addresses.empty)
             .to(addresses.funded)
             .gas_price(1),
-        tempo: None,
+        other: Default::default(),
     };
     assert_eq!(
         estimate(&fixture.api, fee_without_balance, None)
@@ -1765,7 +1763,7 @@ async fn arc_estimate_preserves_revert_and_normal_transaction_errors() {
             .to(addresses.empty)
             .gas_price(1)
             .max_fee_per_gas(2),
-        tempo: None,
+        other: Default::default(),
     };
     let invalid_fee = estimate(&fixture.api, invalid_fee, None).await.unwrap_err();
     assert_eq!(invalid_fee.code(), DebankErrorCode::InvalidParams as i32);
@@ -1779,7 +1777,7 @@ async fn arc_estimate_preserves_revert_and_normal_transaction_errors() {
         &fixture.api,
         CallRequest {
             inner: empty_authorization,
-            tempo: None,
+            other: Default::default(),
         },
         None,
     )

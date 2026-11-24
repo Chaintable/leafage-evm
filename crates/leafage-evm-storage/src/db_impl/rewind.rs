@@ -101,8 +101,33 @@ fn reset_offset(file: &Path) -> Result<(), StorageError> {
 }
 
 impl MultiStorage {
+    /// Offline rewind of the archive at `path` to block `number`. A v3
+    /// RocksDB archive first drops its versions above `number` with RocksDB's
+    /// trim-on-open, a full compaction of the versioned CFs; then every
+    /// archive truncates its block index and publishes the target.
+    /// Interrupted after the trim, a rerun trims again (a no-op compaction).
+    pub fn rewind_archive_offline(
+        path: &Path,
+        cache_size: usize,
+        kind: StorageKind,
+        number: u64,
+        encoding: Option<bool>,
+        offset_file: &Path,
+    ) -> Result<BlockInfo, StorageError> {
+        if matches!(kind, StorageKind::Rocksdb) && super::rocksdb_impl::is_udt_archive(path)? {
+            super::rocksdb_impl::check_udt_rewind_target(path, number)?;
+            reset_offset(offset_file)?;
+            super::rocksdb_impl::trim_udt_history(path, number)?;
+        }
+        Self::open_for_archive_rewind(path, cache_size, kind)?.rewind_archive(
+            number,
+            encoding,
+            offset_file,
+        )
+    }
+
     /// Exclusive maintenance open: never create missing databases or tables.
-    pub fn open_for_archive_rewind(
+    pub(crate) fn open_for_archive_rewind(
         path: &Path,
         cache_size: usize,
         kind: StorageKind,
@@ -111,7 +136,9 @@ impl MultiStorage {
             StorageKind::Rocksdb => "CURRENT",
             StorageKind::MDBX => "mdbx.dat",
         };
-        if !path.join(data_file).is_file() {
+        let v4 = matches!(kind, StorageKind::Rocksdb)
+            && super::rocksdb_impl::is_archive_schema_v4(path)?;
+        if !v4 && !path.join(data_file).is_file() {
             return Err(StorageError::UnSupported(format!(
                 "archive database does not exist at {}",
                 path.display()
@@ -167,7 +194,7 @@ impl MultiStorage {
     /// Without a stored marker or explicit encoding, use legacy keys.
     /// Batches are durable; the whole operation has no atomicity or recovery guarantee.
     /// All database users must remain stopped until this method succeeds.
-    pub fn rewind_archive(
+    pub(crate) fn rewind_archive(
         &self,
         number: u64,
         encoding: Option<bool>,
@@ -212,12 +239,21 @@ impl MultiStorage {
         let target = self.rewind_block(Some(number))?;
         reset_offset(offset_file)?;
         set_inverted_block_encoding(inverted);
-        match self {
+        let landed = match self {
             Self::RocksDBArchive(db) => db.rewind_to(&target, inverted)?,
-            Self::MDBXArchive(db) => db.rewind_to(&target, inverted)?,
+            Self::MDBXArchive(db) => {
+                db.rewind_to(&target, inverted)?;
+                number
+            }
             _ => unreachable!(),
+        };
+        // A schema v4 archive whose head was below the target stays where
+        // it was.
+        if landed == number {
+            Ok(target)
+        } else {
+            self.rewind_block(Some(landed))
         }
-        Ok(target)
     }
 }
 

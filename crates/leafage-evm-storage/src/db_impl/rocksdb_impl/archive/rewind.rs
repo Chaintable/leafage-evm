@@ -5,9 +5,18 @@ use crate::db_impl::rewind::{
 
 impl DataBaseRef {
     pub(crate) fn rewind_layout(&self) -> Result<(Option<Vec<u8>>, bool), Error> {
+        // A v4 archive is in the inverted encoding and has no RocksDB.
+        if self.v4.is_some() {
+            return Ok((Some(vec![1]), false));
+        }
         let marker = self
             .db
             .get_cf(self.db.cf_handle("1").unwrap(), ENCODING_MARKER_KEY)?;
+        // A v3 archive is converted from a marked one, and its versions were
+        // trimmed before this open (`MultiStorage::rewind_archive_offline`).
+        if self.udt {
+            return Ok((marker, false));
+        }
         let mut populated = false;
         for (cf, table) in [("4", RewindTable::Accounts), ("5", RewindTable::Storage)] {
             let mut opts = ReadOptions::default();
@@ -26,7 +35,13 @@ impl DataBaseRef {
         Ok((marker, populated))
     }
 
-    pub(crate) fn rewind_to(&self, target: &BlockInfo, inverted: bool) -> Result<(), Error> {
+    /// Truncate the archive to `target`. Returns the block it then ends at:
+    /// the target (on schema v4 see `v4::Store::rewind`); the node fetches
+    /// the blocks after it again.
+    pub(crate) fn rewind_to(&self, target: &BlockInfo, inverted: bool) -> Result<u64, Error> {
+        if let Some(store) = &self.v4 {
+            return store.rewind(target.header.number);
+        }
         let meta = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -35,13 +50,20 @@ impl DataBaseRef {
         options.set_sync(true);
 
         for table in REWIND_TABLES {
+            if self.udt && matches!(table, RewindTable::Accounts | RewindTable::Storage) {
+                continue;
+            }
             let name = match table {
                 RewindTable::Accounts => StorageTypeColumn::AddressToAccount,
                 RewindTable::Storage => StorageTypeColumn::AddressToStorage,
                 RewindTable::BlockNumbers => StorageTypeColumn::BlockNumToBlockHash,
                 RewindTable::Headers => StorageTypeColumn::BlockHashToBlockInfo,
             };
-            let cf = self.db.cf_handle(name.to_str()).unwrap();
+            // `BlockHashToBlockInfo` is dropped once `BlockNumToBlockInfo`
+            // replaced it.
+            let Some(cf) = self.db.cf_handle(name.to_str()) else {
+                continue;
+            };
             let mut read_options = ReadOptions::default();
             read_options.set_total_order_seek(true);
             read_options.set_verify_checksums(true);
@@ -69,12 +91,25 @@ impl DataBaseRef {
             info!(target: "rewind", ?table, deleted, "archive table truncated");
         }
 
+        if let Some(cf) = self
+            .db
+            .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
+        {
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(
+                cf,
+                &block_index::key(target.header.number + 1)[..],
+                &[0xff; 9][..],
+            );
+            self.db.write_opt(batch, &options)?;
+        }
+
         // Keep all content-addressed code. Only reachable account code hashes
         // affect state; collecting unused code is independent of rewind.
         let mut batch = WriteBatch::default();
         batch.put_cf(meta, [1u8], target.header.hash.as_slice());
         self.db.write_opt(batch, &options)?;
-        Ok(())
+        Ok(target.header.number)
     }
 }
 

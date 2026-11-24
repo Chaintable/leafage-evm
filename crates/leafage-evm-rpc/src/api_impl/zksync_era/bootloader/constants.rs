@@ -1,0 +1,160 @@
+#![allow(dead_code)]
+
+use primitive_types::{H160, U256};
+
+pub const BOOTLOADER_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x01,
+]);
+
+pub const ACCOUNT_CODE_STORAGE_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x02,
+]);
+
+pub const NONCE_HOLDER_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x03,
+]);
+
+pub const KNOWN_CODES_STORAGE_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x04,
+]);
+
+pub const IMMUTABLE_SIMULATOR_STORAGE_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x05,
+]);
+
+pub const CONTRACT_DEPLOYER_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x06,
+]);
+
+pub const EVENT_WRITER_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x0d,
+]);
+
+pub const L1_MESSENGER_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x08,
+]);
+
+pub const MSG_VALUE_SIMULATOR_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x09,
+]);
+
+pub const L2_BASE_TOKEN_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x0a,
+]);
+
+pub const SYSTEM_CONTEXT_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x0b,
+]);
+
+pub fn eth_balance_storage_key(address: H160) -> U256 {
+    use tiny_keccak::{Hasher, Keccak};
+    let mut bytes = [0u8; 64];
+    bytes[12..32].copy_from_slice(address.as_bytes());
+    let mut hasher = Keccak::v256();
+    let mut out = [0u8; 32];
+    hasher.update(&bytes);
+    hasher.finalize(&mut out);
+    U256::from_big_endian(&out)
+}
+
+pub fn bootloader_balance_key() -> U256 {
+    eth_balance_storage_key(BOOTLOADER_ADDRESS)
+}
+
+pub const BOOTLOADER_UTILITIES_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x0c,
+]);
+
+pub const KECCAK256_PRECOMPILE_ADDRESS: H160 = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x10,
+]);
+
+// Initial memory slots (0..7)
+pub const OPERATOR_ADDRESS_SLOT: usize = 0;
+pub const PREV_BLOCK_HASH_SLOT: usize = 1;
+pub const NEW_BLOCK_TIMESTAMP_SLOT: usize = 2;
+pub const NEW_BLOCK_NUMBER_SLOT: usize = 3;
+pub const FAIR_PUBDATA_PRICE_SLOT: usize = 4;
+pub const FAIR_L2_GAS_PRICE_SLOT: usize = 5;
+pub const EXPECTED_BASE_FEE_SLOT: usize = 6;
+pub const SHOULD_SET_NEW_BLOCK_SLOT: usize = 7;
+
+// Memory layout offsets for vm_1_5_0_increased_memory
+pub const DEBUG_SLOTS_OFFSET: usize = 8;
+pub const DEBUG_FIRST_SLOTS: usize = 32;
+pub const PAYMASTER_CONTEXT_SLOTS: usize = 33;
+pub const CURRENT_L2_TX_HASHES_SLOTS: usize = 2;
+pub const MAX_NEW_FACTORY_DEPS: usize = 32;
+pub const NEW_FACTORY_DEPS_RESERVED_SLOTS: usize = MAX_NEW_FACTORY_DEPS + 4; // 36
+pub const MAX_TXS_IN_BATCH: usize = 10000;
+
+// Offsets for MediumInterop (playground_batch.yul.zbin)
+pub const MEDIUM_INTEROP_OPERATOR_REFUNDS_OFFSET: usize = 143;
+pub const MEDIUM_INTEROP_TX_OVERHEAD_OFFSET: usize = 10143;
+pub const MEDIUM_INTEROP_TX_TRUSTED_GAS_LIMIT_OFFSET: usize = 20143;
+pub const MEDIUM_INTEROP_TX_OPERATOR_L2_BLOCK_INFO_OFFSET: usize = 30143;
+pub const MEDIUM_INTEROP_INTEROP_BLOCKS_BEGIN_OFFSET: usize = 70150;
+pub const MEDIUM_INTEROP_SETTLEMENT_LAYER_OFFSET: usize = 80656;
+pub const MEDIUM_INTEROP_INTEROP_FEE_OFFSET: usize = 80657;
+pub const MEDIUM_INTEROP_BOOTLOADER_TX_DESCRIPTION_OFFSET: usize = 1637269;
+pub const MEDIUM_INTEROP_TX_DESCRIPTION_OFFSET: usize = 1657309;
+
+pub const OPERATOR_REFUNDS_OFFSET: usize = DEBUG_SLOTS_OFFSET
+    + DEBUG_FIRST_SLOTS
+    + PAYMASTER_CONTEXT_SLOTS
+    + CURRENT_L2_TX_HASHES_SLOTS
+    + NEW_FACTORY_DEPS_RESERVED_SLOTS; // 111
+
+pub const TX_OVERHEAD_OFFSET: usize = OPERATOR_REFUNDS_OFFSET + MAX_TXS_IN_BATCH; // 10111
+pub const TX_TRUSTED_GAS_LIMIT_OFFSET: usize = TX_OVERHEAD_OFFSET + MAX_TXS_IN_BATCH; // 20111
+pub const TX_OPERATOR_SLOTS_PER_L2_BLOCK_INFO: usize = 4;
+pub const TX_OPERATOR_L2_BLOCK_INFO_OFFSET: usize = TX_TRUSTED_GAS_LIMIT_OFFSET + MAX_TXS_IN_BATCH; // 30111
+pub const TX_OPERATOR_L2_BLOCK_INFO_SLOTS: usize = (MAX_TXS_IN_BATCH + 1) * TX_OPERATOR_SLOTS_PER_L2_BLOCK_INFO; // 40004
+
+pub const COMPRESSED_BYTECODES_OFFSET: usize = TX_OPERATOR_L2_BLOCK_INFO_OFFSET + TX_OPERATOR_L2_BLOCK_INFO_SLOTS; // 70115
+pub const COMPRESSED_BYTECODES_SLOTS: usize = 196608;
+
+pub const PRIORITY_TXS_L1_DATA_OFFSET: usize = COMPRESSED_BYTECODES_OFFSET + COMPRESSED_BYTECODES_SLOTS; // 266723
+pub const PRIORITY_TXS_L1_DATA_SLOTS: usize = 2;
+
+pub const OPERATOR_PROVIDED_L1_MESSENGER_PUBDATA_OFFSET: usize = PRIORITY_TXS_L1_DATA_OFFSET + PRIORITY_TXS_L1_DATA_SLOTS; // 266725
+pub const OPERATOR_PROVIDED_L1_MESSENGER_PUBDATA_SLOTS: usize = 1360000;
+
+pub const BOOTLOADER_TX_DESCRIPTION_OFFSET: usize = OPERATOR_PROVIDED_L1_MESSENGER_PUBDATA_OFFSET + OPERATOR_PROVIDED_L1_MESSENGER_PUBDATA_SLOTS; // 1626725
+pub const BOOTLOADER_TX_DESCRIPTION_SIZE: usize = 2;
+pub const MAX_POSTOP_SLOTS: usize = PAYMASTER_CONTEXT_SLOTS + 7; // 40
+
+pub const TX_DESCRIPTION_OFFSET: usize = BOOTLOADER_TX_DESCRIPTION_OFFSET + BOOTLOADER_TX_DESCRIPTION_SIZE * MAX_TXS_IN_BATCH + MAX_POSTOP_SLOTS; // 1646765
+pub const TX_GAS_LIMIT_OFFSET: usize = 4;
+
+// Bootloader memory size & VM hooks
+pub const USED_BOOTLOADER_MEMORY_BYTES: usize = 63_800_000;
+pub const USED_BOOTLOADER_MEMORY_WORDS: usize = USED_BOOTLOADER_MEMORY_BYTES / 32; // 1_993_750
+pub const RESULT_SUCCESS_FIRST_SLOT: u32 = ((USED_BOOTLOADER_MEMORY_BYTES as u32) - (MAX_TXS_IN_BATCH as u32) * 32) / 32; // 1_983_750
+pub const VM_HOOK_POSITION: u32 = RESULT_SUCCESS_FIRST_SLOT - 1; // 1_983_749
+pub const VM_HOOK_ADDRESS: u32 = VM_HOOK_POSITION * 32; // 63_479_968
+pub const VM_HOOK_PARAMS_COUNT: u32 = 3;
+pub const VM_HOOK_PARAMS_START_POSITION: u32 = VM_HOOK_POSITION - VM_HOOK_PARAMS_COUNT; // 1_983_746
+
+pub const INITIAL_FRAME_FORMAL_EH_LOCATION: u16 = u16::MAX;
+pub const BATCH_COMPUTATIONAL_GAS_LIMIT: u32 = u32::MAX;
+pub const MAX_L2_TX_GAS_LIMIT: u64 = 80_000_000;
+pub const MAX_GAS_PER_PUBDATA_BYTE: u64 = 50_000;
+pub const TX_SLOT_OVERHEAD_GAS: u32 = 10_000;
+pub const TX_MEMORY_OVERHEAD_GAS: u32 = 10;
+pub const EIP_712_TX_TYPE: u8 = 0x71;
+pub const DEFAULT_GAS_PER_PUBDATA: u64 = 800;
+pub const DEFAULT_L2_BASE_FEE: u64 = 250_000_000;

@@ -336,4 +336,20 @@ pub trait BscHardforks: EthereumHardforks {
                 .bsc_fork_activation(BscHardfork::Mendel)
                 .active_at_timestamp(timestamp)
     }
+
+    /// Convenience method to check if [`BscHardfork::Pasteur`] is active at a given timestamp.
+    fn is_pasteur_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number)
+            && self
+                .bsc_fork_activation(BscHardfork::Pasteur)
+                .active_at_timestamp(timestamp)
+    }
+
+    /// Convenience method to check if [`BscHardfork::Jenner`] is active at a given timestamp.
+    fn is_jenner_active_at_timestamp(&self, block_number: u64, timestamp: u64) -> bool {
+        self.is_london_active_at_block(block_number)
+            && self
+                .bsc_fork_activation(BscHardfork::Jenner)
+                .active_at_timestamp(timestamp)
+    }
 }

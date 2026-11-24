@@ -173,7 +173,7 @@ impl LinkedHandle {
 const PROBE_KEYS: usize = 8192;
 
 /// Storage keys absent from every diff layer; after one warm pass they
-/// live in the bottom moka cache — the common production case (slot not
+/// live in the bottom CacheDiskLayer cache — the common production case (slot not
 /// touched in the last `depth` blocks, hot in cache).
 fn probe_keys() -> (H256, Vec<H256>) {
     let address = h256(NS_PROBE);

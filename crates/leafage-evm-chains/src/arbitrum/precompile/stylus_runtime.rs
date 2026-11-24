@@ -1,7 +1,8 @@
 use super::state::{StylusParams, WasmActivation};
 use alloy::primitives::{Address, B256, Bytes, U256};
 use libloading::Library;
-use moka::sync::Cache;
+use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 use once_cell::sync::OnceCell;
 use std::env;
 use std::fs;
@@ -193,30 +194,65 @@ impl StylusRuntimeConfig {
     }
 }
 
+/// Weighs a compiled module by its size.
+#[derive(Clone, Copy)]
+struct AsmWeighter;
+
+impl Weighter<NativeAsmCacheKey, Arc<[u8]>> for AsmWeighter {
+    fn weight(&self, _: &NativeAsmCacheKey, asm: &Arc<[u8]>) -> u64 {
+        asm.len() as u64
+    }
+}
+
+/// Typical size of a compiled module, to size the cache's table.
+const TYPICAL_ASM_BYTES: u64 = 256 * 1024;
+
+type AsmCache = Cache<
+    NativeAsmCacheKey,
+    Arc<[u8]>,
+    AsmWeighter,
+    DefaultHashBuilder,
+    DefaultLifecycle<NativeAsmCacheKey, Arc<[u8]>>,
+>;
+
 #[derive(Clone)]
 struct NativeAsmCache {
-    entries: Cache<NativeAsmCacheKey, Arc<[u8]>>,
+    entries: Arc<AsmCache>,
 }
 
 impl NativeAsmCache {
     fn new(capacity_bytes: u64) -> Self {
+        let entries = (capacity_bytes / TYPICAL_ASM_BYTES).max(1);
+        // One shard: a shard holds its share of the capacity, and a module
+        // larger than that would never be cached. Off the hot path, so the
+        // single lock costs nothing.
+        let options = OptionsBuilder::new()
+            .estimated_items_capacity(entries.try_into().unwrap_or(usize::MAX))
+            .weight_capacity(capacity_bytes)
+            .shards(1)
+            .build()
+            .expect("valid cache options");
         Self {
-            entries: Cache::builder()
-                .max_capacity(capacity_bytes)
-                .weigher(|_key: &NativeAsmCacheKey, asm: &Arc<[u8]>| {
-                    asm.len().try_into().unwrap_or(u32::MAX)
-                })
-                .build(),
+            entries: Arc::new(AsmCache::with_options(
+                options,
+                AsmWeighter,
+                DefaultHashBuilder::default(),
+                DefaultLifecycle::default(),
+            )),
         }
     }
 
+    /// The module under `key`, compiling it with `init` on a miss. Concurrent
+    /// misses on one key wait for the first compile; a failed compile is not
+    /// cached, and a waiter then compiles itself.
     fn try_get_with<F, E>(&self, key: NativeAsmCacheKey, init: F) -> Result<Arc<[u8]>, Arc<E>>
     where
         F: FnOnce() -> Result<Vec<u8>, E>,
         E: Send + Sync + 'static,
     {
         self.entries
-            .try_get_with(key, || init().map(Arc::<[u8]>::from))
+            .get_or_insert_with(&key, || init().map(Arc::<[u8]>::from))
+            .map_err(Arc::new)
     }
 
     fn get(&self, key: &NativeAsmCacheKey) -> Option<Arc<[u8]>> {
@@ -1407,10 +1443,8 @@ mod tests {
                 )
                 .expect("insert asm");
         }
-        cache.entries.run_pending_tasks();
-
-        assert!(cache.entries.weighted_size() <= 8);
-        assert!(cache.entries.entry_count() <= 2);
+        assert!(cache.entries.weight() <= 8);
+        assert!(cache.entries.len() <= 2);
     }
 
     #[test]

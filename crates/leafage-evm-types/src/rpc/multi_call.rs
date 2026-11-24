@@ -83,7 +83,8 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
                 code: MultiCallErrorCode::EVMReverted as i32,
                 err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
-                result: Bytes::default(),
+                // Custom errors carry no reason string, and EIP-3668 clients need the raw data.
+                result: output,
                 gas_used: gas.tx_gas_used() as i64,
                 time_cost: 0.0,
             },
@@ -97,5 +98,24 @@ impl<T: Clone + Debug> From<ExecutionResult<T>> for SingleCallResult {
             },
         };
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use revm::context::result::{HaltReason, ResultGas};
+
+    #[test]
+    fn reverted_call_keeps_revert_data() {
+        let output = Bytes::from_static(&[0x55, 0x6f, 0x18, 0x30, 0xde, 0xad]);
+        let res: SingleCallResult = ExecutionResult::<HaltReason>::Revert {
+            gas: ResultGas::default().with_total_gas_spent(21_000),
+            logs: vec![],
+            output: output.clone(),
+        }
+        .into();
+        assert_eq!(res.code, MultiCallErrorCode::EVMReverted as i32);
+        assert_eq!(res.result, output);
     }
 }

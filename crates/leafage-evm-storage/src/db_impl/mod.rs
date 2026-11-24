@@ -20,10 +20,15 @@ pub use mdbx_impl::{
 pub use rocksdb;
 #[cfg(test)]
 pub(crate) use rocksdb_impl::ARCHIVE_DB_TEST_LOCK;
+pub use rocksdb_impl::{
+    init_archive_schema, is_archive_schema_v4, replay_get_trace, verify_udt_against_v2,
+    verify_v4_against_source, ArchiveRocksDBStorage, ArchiveSchema, ArchiveStateDB, BulkColumn,
+    RocksDBStorage, UdtConvertReport, UdtVerifyReport, V4ConvertReport, V4ReplayReport,
+    V4VerifyReport,
+};
 pub(crate) use rocksdb_impl::{
     state_account_value, state_block_num_key, state_sst_writer_options, state_storage_key, SstSink,
 };
-pub use rocksdb_impl::{ArchiveRocksDBStorage, ArchiveStateDB, BulkColumn, RocksDBStorage};
 
 use crate::db::{BlockIterator, LatestStateDBIterator, StateDBProvider, StateDBRead, StateDBWrite};
 use leafage_evm_types::{BlockId, BlockInfo, Bytes, NewAccount, H256, U256};
@@ -254,6 +259,18 @@ impl StateDBRead for MultiStateDB {
             MultiStateDB::RocksDBArchive(db) => db.read_block_info(block_hash),
             MultiStateDB::MDBXState(db) => db.read_block_info(block_hash),
             MultiStateDB::MDBXArchive(db) => db.read_block_info(block_hash),
+        }
+    }
+
+    fn read_block_info_arc(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<Arc<BlockInfo>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_block_info_arc(block_hash),
+            MultiStateDB::RocksDBArchive(db) => db.read_block_info_arc(block_hash),
+            MultiStateDB::MDBXState(db) => db.read_block_info_arc(block_hash),
+            MultiStateDB::MDBXArchive(db) => db.read_block_info_arc(block_hash),
         }
     }
 
@@ -554,6 +571,7 @@ mod tests {
                 db: &wrapped,
                 ovm_address: None,
                 normalize_state_key: false,
+                zksync: false,
             }
             .supports_batched_reads());
             // The OVM balance override forces the scalar account path,
@@ -562,6 +580,15 @@ mod tests {
                 db: &wrapped,
                 ovm_address: Some(H256::repeat_byte(1)),
                 normalize_state_key: false,
+                zksync: false,
+            }
+            .supports_batched_reads());
+            // ZKsync Era system contracts also force the scalar account path.
+            assert!(!EvmStorageWrapper {
+                db: &wrapped,
+                ovm_address: None,
+                normalize_state_key: false,
+                zksync: true,
             }
             .supports_batched_reads());
         }

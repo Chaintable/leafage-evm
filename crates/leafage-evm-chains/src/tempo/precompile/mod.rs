@@ -542,7 +542,7 @@ fn create_zone_factory_precompile(chain_id: u64) -> DynPrecompile {
 
 /// Tempo gas price scaling factor (1e12).
 /// Ported from Tempo writer: `tempo_primitives::transaction::TEMPO_GAS_PRICE_SCALING_FACTOR`.
-const TEMPO_GAS_PRICE_SCALING_FACTOR: alloy::primitives::U256 =
+pub(crate) const TEMPO_GAS_PRICE_SCALING_FACTOR: alloy::primitives::U256 =
     alloy::primitives::uint!(1_000_000_000_000_U256);
 
 /// Computes the maximum gas the caller can afford, based on TIP-20 fee token balance.
@@ -567,7 +567,7 @@ where
     DB::Error: core::fmt::Debug,
 {
     use crate::tempo::{
-        fee_token::{resolve_from_storage, FeeTokenCandidates},
+        fee_token::{max_fee_in_token_units, resolve_from_storage, FeeTokenCandidates},
         hardfork::TempoHardfork,
     };
 
@@ -578,13 +578,19 @@ where
     let spec = TempoHardfork::from_timestamp(timestamp);
 
     let candidates = FeeTokenCandidates::from_tx(tx, payer, spec);
+    let max_fee = max_fee_in_token_units(tx.base.gas_limit, gas_price);
     let balance = storage::with_read_only_storage_ctx(
         db,
         spec,
         chain_id,
         || -> Result<alloy::primitives::U256> {
-            let fee_token = resolve_from_storage(candidates, payer)?;
-            tip20::TIP20Token::from_address_unchecked(fee_token).balances[payer].read()
+            match resolve_from_storage(candidates, payer, spec, max_fee)? {
+                Ok(fee_token) => {
+                    tip20::TIP20Token::from_address_unchecked(fee_token).balances[payer].read()
+                }
+                // No fallback token covers the gas bound; cap it by the largest balance.
+                Err(insufficient) => Ok(insufficient.available),
+            }
         },
     )
     .ok()?;
@@ -957,6 +963,50 @@ mod tests {
         db.insert_account_storage(inferred, U256::from(4), short_currency(b"USD"))
             .unwrap();
         assert_eq!(allowance(&db), Some(77));
+    }
+
+    #[test]
+    fn caller_gas_allowance_uses_t13_fallback_fee_tokens() {
+        use crate::tempo::{hardfork::TempoHardfork, tx::TempoTxEnv};
+        use revm::{
+            context::TxEnv,
+            database::{in_memory_db::CacheDB, EmptyDB},
+            primitives::TxKind,
+        };
+
+        const T12_TIME: u64 = 1_791_900_000;
+        const T13_TIME: u64 = 1_793_718_000;
+        let payer = Address::repeat_byte(0x11);
+        let [path_usd, ousd] = *TempoHardfork::T13.fallback_fee_tokens() else {
+            panic!("T13 has two fallback fee tokens");
+        };
+        // gas_limit * gas_price / 1e12 = 1_000_000 token units.
+        let tx = TempoTxEnv {
+            base: TxEnv {
+                caller: payer,
+                kind: TxKind::Call(Address::repeat_byte(0x33)),
+                gas_limit: 1_000_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let allowance = |path_usd_balance: u64, ousd_balance: u64, timestamp: u64| {
+            let mut db = CacheDB::new(EmptyDB::default());
+            for (token, balance) in [(path_usd, path_usd_balance), (ousd, ousd_balance)] {
+                db.insert_account_storage(
+                    token,
+                    payer.mapping_slot(U256::from(9)),
+                    U256::from(balance),
+                )
+                .unwrap();
+            }
+            tempo_caller_gas_allowance(&db, &tx, payer, 1_000_000_000_000, timestamp, 4217)
+        };
+
+        assert_eq!(allowance(10, 2_000_000, T13_TIME), Some(2_000_000));
+        // No token covers the bound: cap it by the largest fallback balance.
+        assert_eq!(allowance(10, 20, T13_TIME), Some(20));
+        assert_eq!(allowance(10, 2_000_000, T12_TIME), Some(10));
     }
 
     #[test]

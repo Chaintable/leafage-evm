@@ -17,7 +17,7 @@ use leafage_evm_chains::rsk::RskHardfork;
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_storage::EvmStorageRead;
 use leafage_evm_types::{
-    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, MainnetSpecId, OpSpecId, H256,
+    BlockEnv, BlockId, BlockInfo, CallRequest, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId, H256,
 };
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::result::{ExecutionResult, HaltReason};
@@ -32,6 +32,7 @@ use std::sync::Arc;
 pub struct EvmCfg<SpecId, CustomCfg> {
     pub is_archive: bool,
     pub normalize_state_key: bool,
+    pub zksync: bool,
     pub cfg: CfgEnv<SpecId>,
     pub ovm_address: Option<H256>,
     pub version: String,
@@ -54,6 +55,17 @@ pub struct EvmCfg<SpecId, CustomCfg> {
     pub multicall_parallelism: usize,
 }
 
+impl<SpecId, CustomCfg> EvmCfg<SpecId, CustomCfg> {
+    pub fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
+        leafage_evm_storage::EvmStorageWrapper {
+            db,
+            ovm_address: self.ovm_address,
+            normalize_state_key: self.normalize_state_key,
+            zksync: self.zksync,
+        }
+    }
+}
+
 pub(crate) trait ApiCore:
     ApiBase + EvmExecutor + GasFeeHandler<Tx = <Self as EvmExecutor>::Tx>
 {
@@ -68,9 +80,21 @@ pub(crate) trait ApiBase: Sync + Send + 'static {
 
     fn evm_cfg(&self) -> &EvmCfg<Self::SpecId, Self::CustomCfg>;
 
+    fn wrap_storage<T>(&self, db: T) -> leafage_evm_storage::EvmStorageWrapper<T> {
+        self.evm_cfg().wrap_storage(db)
+    }
+
     fn historical_client(&self) -> Option<&HttpClient>;
 
     fn historical_height(&self) -> Option<u64>;
+
+    fn block_zero_at(&self, height: u64) -> Option<&DebankBlock>;
+
+    fn upstream_client(&self) -> Option<&HttpClient>;
+
+    fn forward_simulate(&self) -> bool;
+
+    fn forward_estimategas(&self) -> bool;
 
     fn token_collector(&self) -> Option<&TokenCollector>;
 }
@@ -197,6 +221,27 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         self.transact(block_env, state, tx)
     }
 
+    /// Runs `f` with an executor for a run of independent read-only calls that
+    /// share `block_env` and `state`, such as the calls of one multicall. Each
+    /// call behaves exactly like [`Self::transact`] and never sees another
+    /// call's state changes. The default builds a fresh EVM for every call;
+    /// chains whose EVM is costly to set up per call override it to keep one
+    /// EVM for the whole run. A call that panics may leave that EVM
+    /// mid-transaction, so the executor must not be called again after a
+    /// panic.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        f(&mut |tx| self.transact(block_env, state.clone(), tx))
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
@@ -213,6 +258,14 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 }
+
+/// One read-only call of a [`EvmExecutor::with_call_executor`] run.
+pub(crate) type CallExecutor<'a, E, StateDB> = dyn FnMut(
+        <E as EvmExecutor>::Tx,
+    ) -> Result<
+        ExecutionResult<<E as EvmExecutor>::EvmHaltReason>,
+        EVMError<<StateDB as DatabaseRef>::Error, <E as EvmExecutor>::TransactionError>,
+    > + 'a;
 
 pub(crate) trait TxSetter {
     fn set_gas_limit(&mut self, gas_limit: u64);
@@ -299,10 +352,13 @@ where
 #[derive(Clone, Debug)]
 pub enum MultiChainCfgEnv {
     Mainnet(CfgEnv<MainnetSpecId>),
+    /// HyperEVM: mainnet execution rules with HyperCore-backed read precompiles.
+    Hyper(CfgEnv<MainnetSpecId>),
+    Zksync(CfgEnv<MainnetSpecId>),
     Arc((CfgEnv<MainnetSpecId>, ArcChainConfig)),
     Arbitrum((CfgEnv<ArbitrumHardfork>, Option<ArbitrumEvmConfig>)),
     Op(CfgEnv<OpSpecId>),
-    Celo(CfgEnv<OpSpecId>),
+    Celo(leafage_evm_chains::celo::CeloCfgEnv),
     Base(CfgEnv<BaseHardfork>),
     Bsc(CfgEnv<BscHardfork>),
     Cosmos((CfgEnv<CosmosHardfork>, Option<CosmosEvmConfig>)),
@@ -321,9 +377,12 @@ impl MultiChainCfgEnv {
     pub fn chain_id(&self) -> u64 {
         match self {
             MultiChainCfgEnv::Mainnet(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Hyper(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Zksync(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Arc(cfg) => cfg.0.chain_id,
             MultiChainCfgEnv::Arbitrum(cfg) => cfg.0.chain_id,
-            MultiChainCfgEnv::Op(cfg) | MultiChainCfgEnv::Celo(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Op(cfg) => cfg.chain_id,
+            MultiChainCfgEnv::Celo(cfg) => cfg.chain_id(),
             MultiChainCfgEnv::Base(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Bsc(cfg) => cfg.chain_id,
             MultiChainCfgEnv::Cosmos(cfg) => cfg.0.chain_id,
@@ -338,6 +397,107 @@ impl MultiChainCfgEnv {
             MultiChainCfgEnv::Citrea(cfg) => cfg.chain_id,
         }
     }
+
+    pub fn is_zksync(&self) -> bool {
+        matches!(self, MultiChainCfgEnv::Zksync(_))
+    }
+}
+
+/// Shared checks for [`EvmExecutor::with_call_executor`] overrides.
+#[cfg(test)]
+pub(crate) mod call_executor_test {
+    use super::EvmExecutor;
+    use alloy::primitives::{Address, Bytes, U256};
+    use revm::context::result::ExecutionResult;
+    use revm::context::{BlockEnv, TxEnv};
+    use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+
+    /// Runs the same calls through `with_call_executor` (one EVM for the run)
+    /// and through `transact` (a fresh EVM per call) and asserts the results are
+    /// equal: a counter that writes storage (each call must see the stored 0),
+    /// a value transfer, a revert, a tx rejected for its nonce and the counter
+    /// again, so no call may see another's writes, transfers or fee payments
+    /// and a rejected call must not leak into the next one.
+    pub(crate) fn assert_matches_transact<E>(
+        api: &E,
+        block_env: &BlockEnv,
+        to_tx: impl Fn(TxEnv) -> E::Tx,
+    ) where
+        E: EvmExecutor,
+        E::EvmHaltReason: PartialEq,
+    {
+        let caller = Address::repeat_byte(0x11);
+        let counter = Address::repeat_byte(0x21);
+        let reverter = Address::repeat_byte(0x22);
+        let payee = Address::repeat_byte(0x23);
+        let mut state = InMemoryDB::default();
+        state.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                ..Default::default()
+            },
+        );
+        // slot0 += 1; return slot0
+        let counter_code = Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x80, 0x60, 0x00, 0x55, 0x60, 0x00, 0x52, 0x60,
+            0x20, 0x60, 0x00, 0xf3,
+        ]));
+        state.insert_account_info(counter, AccountInfo::from_bytecode(counter_code));
+        // revert(0, 0)
+        let reverter_code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]));
+        state.insert_account_info(reverter, AccountInfo::from_bytecode(reverter_code));
+        let tx = |to: Address, value: u64, nonce: u64| {
+            to_tx(
+                TxEnv::builder()
+                    .caller(caller)
+                    .to(to)
+                    .nonce(nonce)
+                    .gas_limit(100_000)
+                    .gas_price(5)
+                    .value(U256::from(value))
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let txs = [
+            tx(counter, 0, 0),
+            tx(counter, 0, 0),
+            tx(payee, 1_000, 0),
+            tx(reverter, 0, 0),
+            tx(counter, 0, 7),
+            tx(counter, 0, 0),
+        ];
+
+        let per_call: Vec<Result<ExecutionResult<E::EvmHaltReason>, String>> = txs
+            .iter()
+            .map(|tx| {
+                api.transact(block_env, &state, tx.clone())
+                    .map_err(|e| e.to_string())
+            })
+            .collect();
+        let reused: Vec<Result<ExecutionResult<E::EvmHaltReason>, String>> = api
+            .with_call_executor(block_env, &state, |exec| {
+                txs.iter()
+                    .map(|tx| exec(tx.clone()).map_err(|e| e.to_string()))
+                    .collect()
+            });
+
+        assert_eq!(reused, per_call);
+        let one = Bytes::from(U256::from(1).to_be_bytes::<32>().to_vec());
+        for i in [0, 1, 5] {
+            assert_eq!(reused[i].as_ref().unwrap().output(), Some(&one), "call {i}");
+        }
+        assert!(
+            reused[2].as_ref().unwrap().is_success(),
+            "the transfer succeeds"
+        );
+        assert!(
+            !reused[3].as_ref().unwrap().is_success(),
+            "the revert stays a revert"
+        );
+        assert!(reused[4].is_err(), "a wrong nonce is rejected");
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +509,14 @@ mod tests {
 
     impl GasFeeHandler for DefaultGasFeeHandler {
         type Tx = TxEnv;
+    }
+
+    #[test]
+    fn test_multichain_cfg_env_zksync() {
+        let env = MultiChainCfgEnv::Zksync(CfgEnv::new_with_spec(MainnetSpecId::OSAKA));
+        assert!(env.is_zksync());
+        let mainnet_env = MultiChainCfgEnv::Mainnet(CfgEnv::new_with_spec(MainnetSpecId::OSAKA));
+        assert!(!mainnet_env.is_zksync());
     }
 
     #[test]

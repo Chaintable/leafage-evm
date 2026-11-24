@@ -4,6 +4,7 @@ use crate::arbitrum::precompile::ArbitrumContext;
 use alloy::primitives::{Address, U256};
 use revm::bytecode::opcode;
 use revm::context::{ContextTr, Host, JournalEntry};
+use revm::context_interface::context::ContextError;
 use revm::context_interface::{
     cfg::gas_params::GasParams,
     transaction::{AccessListItemTr, TransactionType},
@@ -542,6 +543,38 @@ where
 }
 
 fn selfdestruct<DB>(
+    context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
+) -> InstructionExecResult
+where
+    DB: Database + DatabaseRef,
+{
+    let address = context.interpreter.input.target_address();
+    let result = selfdestruct_metered(InstructionContext {
+        interpreter: &mut *context.interpreter,
+        host: &mut *context.host,
+    });
+    // ApeChain: nitro `StateDB.SelfDestruct` also unwinds the yield fields when
+    // the contract was created in this transaction.
+    if context.host.chain().ape_yield()
+        && matches!(result, Err(InstructionResult::SelfDestruct))
+        && context
+            .host
+            .journal()
+            .state
+            .get(&address)
+            .is_some_and(|account| account.is_selfdestructed())
+    {
+        if let Err(error) =
+            crate::arbitrum::precompile::ape_on_selfdestruct(&mut *context.host, address)
+        {
+            *context.host.error() = Err(ContextError::Db(error));
+            return Err(InstructionResult::FatalExternalError);
+        }
+    }
+    result
+}
+
+fn selfdestruct_metered<DB>(
     mut context: InstructionContext<'_, ArbitrumContext<DB>, EthInterpreter>,
 ) -> InstructionExecResult
 where

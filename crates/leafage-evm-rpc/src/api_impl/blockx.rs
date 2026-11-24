@@ -3,9 +3,9 @@
 //! One batch resolves N `getAddressCode` / `getStorageAt` /
 //! `getAddressBalance` / `getAddressNonce` reads against a single state
 //! view of a fixed block: one `state_at`, deduplicated keys, and
-//! batched storage reads (RocksDB MultiGet on the non-archive backend,
-//! scalar fallback elsewhere). Code, balance and nonce reads share one
-//! account pool — the same address requested by several kinds costs one
+//! batched storage reads (RocksDB MultiGet, including schema v3 archive
+//! cache misses; scalar fallback elsewhere). Code, balance and nonce share
+//! one account pool — the same address requested by several kinds costs one
 //! account read. The wire payload is BSRB/1 binary in a JSON-RPC hex
 //! shell; item order is the correlation. Per-item results keep the
 //! exact value shapes and error code/message text of the single methods
@@ -21,7 +21,7 @@ use crate::api_impl::core::{
 use crate::error::{internal_rpc_err, invalid_params_rpc_err};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::http_client::HttpClient;
-use leafage_evm_storage::{BlockIndex, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
     Address, BlockId, BlockNumberOrTag, BlockType, BsrbContext, BsrbOutcome, BsrbRead, BsrbRequest,
     BsrbResponse, Bytes, DebankBlockContext, DebankErrorCode, JsonStorageKey, H256,
@@ -93,11 +93,7 @@ where
         let state = self.debank_get_state_by_ctx_impl(Some(block_ctx.clone()))?;
         histogram!("leafage_state_batch_latency_seconds", "stage" => "state_at")
             .record(stage_start.elapsed().as_secs_f64());
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
 
         // Per-kind logical item counts, before deduplication.
         let mut kind_counts = [0usize; 4];

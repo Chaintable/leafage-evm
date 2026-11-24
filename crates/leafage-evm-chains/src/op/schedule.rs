@@ -1,0 +1,541 @@
+//! Hardfork schedules of the OP-stack chains served by the `op` evm-type.
+//!
+//! Every OP-stack chain runs the same fork rules but activates them at its own
+//! times. A chain listed here executes each call under the fork of its block; a
+//! chain that is not listed keeps the configured spec.
+//!
+//! Timestamps come from the superchain-registry (`superchain/configs/mainnet`), or
+//! from the chain's own node configuration where a schedule says so, and each
+//! chain's boundaries were checked against its public RPC.
+//!
+//! A schedule ends at the chain's latest activated fork. When a chain schedules a
+//! new fork, add it here before it activates: until then its calls keep running
+//! the previous fork's rules.
+
+use super::mainnet::{
+    op_mainnet_spec_at, OP_MAINNET_CANYON_TIMESTAMP, OP_MAINNET_CHAIN_ID,
+    OP_MAINNET_ECOTONE_TIMESTAMP, OP_MAINNET_FJORD_TIMESTAMP, OP_MAINNET_GRANITE_TIMESTAMP,
+    OP_MAINNET_HOLOCENE_TIMESTAMP, OP_MAINNET_ISTHMUS_TIMESTAMP, OP_MAINNET_JOVIAN_TIMESTAMP,
+    OP_MAINNET_KARST_TIMESTAMP,
+};
+use leafage_evm_types::OpSpecId;
+
+pub const SONEIUM_CHAIN_ID: u64 = 1868;
+pub const UNICHAIN_CHAIN_ID: u64 = 130;
+pub const CYBER_CHAIN_ID: u64 = 7560;
+pub const FRAXTAL_CHAIN_ID: u64 = 252;
+pub const MODE_CHAIN_ID: u64 = 34443;
+pub const BOB_CHAIN_ID: u64 = 60808;
+pub const WORLD_CHAIN_ID: u64 = 480;
+pub const MANTA_CHAIN_ID: u64 = 169;
+pub const KATANA_CHAIN_ID: u64 = 747474;
+
+/// A chain that started after Bedrock: `genesis` rules from block 0, then each
+/// `(activation timestamp, fork)` in ascending order.
+struct TimestampSchedule {
+    genesis: OpSpecId,
+    forks: &'static [(u64, OpSpecId)],
+}
+
+impl TimestampSchedule {
+    fn spec_at(&self, timestamp: u64) -> OpSpecId {
+        self.forks
+            .iter()
+            .rev()
+            .find(|(activation, _)| timestamp >= *activation)
+            .map_or(self.genesis, |(_, spec)| *spec)
+    }
+}
+
+/// Soneium: Canyon..Granite at genesis (2024-12-02).
+const SONEIUM: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::GRANITE,
+    forks: &[
+        (1_738_573_200, OpSpecId::HOLOCENE),
+        (1_746_806_401, OpSpecId::ISTHMUS),
+        (1_764_691_201, OpSpecId::JOVIAN),
+        (1_783_526_401, OpSpecId::KARST),
+    ],
+};
+
+/// Unichain: Canyon..Granite at genesis (2024-11-04).
+const UNICHAIN: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::GRANITE,
+    forks: &[
+        (1_736_445_601, OpSpecId::HOLOCENE),
+        (1_746_806_401, OpSpecId::ISTHMUS),
+        (1_764_691_201, OpSpecId::JOVIAN),
+        (1_783_526_401, OpSpecId::KARST),
+    ],
+};
+
+/// Cyber: Canyon..Ecotone at genesis (2024-04-18). Holocene (2026-01-09) is its
+/// latest fork: no Isthmus, Jovian or Karst yet.
+const CYBER: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::ECOTONE,
+    forks: &[
+        (1_767_754_800, OpSpecId::FJORD),
+        (1_767_841_200, OpSpecId::GRANITE),
+        (1_767_927_600, OpSpecId::HOLOCENE),
+    ],
+};
+
+/// Fraxtal: Canyon at genesis (2024-02-01). Isthmus (2025-08-20) is its latest
+/// fork: no Jovian or Karst yet. The superchain-registry stops at Granite; Holocene
+/// and Isthmus come from FraxFinance/fraxtal-node `mainnet/rollup.json`.
+const FRAXTAL: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::CANYON,
+    forks: &[
+        (1_717_009_201, OpSpecId::ECOTONE),
+        (1_733_947_201, OpSpecId::FJORD),
+        (1_738_958_401, OpSpecId::GRANITE),
+        (1_744_052_401, OpSpecId::HOLOCENE),
+        (1_755_716_401, OpSpecId::ISTHMUS),
+    ],
+};
+
+/// Mode: Regolith at genesis (2023-11-16), then every fork at OP Mainnet's timestamp.
+const MODE: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::REGOLITH,
+    forks: &[
+        (OP_MAINNET_CANYON_TIMESTAMP, OpSpecId::CANYON),
+        (OP_MAINNET_ECOTONE_TIMESTAMP, OpSpecId::ECOTONE),
+        (OP_MAINNET_FJORD_TIMESTAMP, OpSpecId::FJORD),
+        (OP_MAINNET_GRANITE_TIMESTAMP, OpSpecId::GRANITE),
+        (OP_MAINNET_HOLOCENE_TIMESTAMP, OpSpecId::HOLOCENE),
+        (OP_MAINNET_ISTHMUS_TIMESTAMP, OpSpecId::ISTHMUS),
+        (OP_MAINNET_JOVIAN_TIMESTAMP, OpSpecId::JOVIAN),
+        (OP_MAINNET_KARST_TIMESTAMP, OpSpecId::KARST),
+    ],
+};
+
+/// BOB: Canyon..Ecotone at genesis (2024-04-11). Fjord..Isthmus are at OP Mainnet's
+/// timestamps; Jovian (2026-03-12) and Karst (2026-09-23) are BOB's own. The
+/// superchain-registry stops at Isthmus; Jovian and Karst come from
+/// bob-collective/bob `docs/bob-chain/full-node.md` and match the chain.
+const BOB: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::ECOTONE,
+    forks: &[
+        (OP_MAINNET_FJORD_TIMESTAMP, OpSpecId::FJORD),
+        (OP_MAINNET_GRANITE_TIMESTAMP, OpSpecId::GRANITE),
+        (OP_MAINNET_HOLOCENE_TIMESTAMP, OpSpecId::HOLOCENE),
+        (OP_MAINNET_ISTHMUS_TIMESTAMP, OpSpecId::ISTHMUS),
+        (1_773_325_801, OpSpecId::JOVIAN),
+        (1_790_179_201, OpSpecId::KARST),
+    ],
+};
+
+/// World Chain: Canyon..Ecotone at genesis (2024-06-25), then every fork at its own
+/// time (Karst on 2026-09-21).
+const WORLD: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::ECOTONE,
+    forks: &[
+        (1_721_826_000, OpSpecId::FJORD),
+        (1_727_780_400, OpSpecId::GRANITE),
+        (1_738_238_400, OpSpecId::HOLOCENE),
+        (1_764_072_000, OpSpecId::ISTHMUS),
+        (1_777_593_600, OpSpecId::JOVIAN),
+        (1_789_992_000, OpSpecId::KARST),
+    ],
+};
+
+/// Manta Pacific: Regolith at genesis (2023-09-09). Canyon, Delta and Ecotone
+/// activated together (2024-09-19); Fjord, Granite, Holocene and Isthmus followed two
+/// hours apart on 2026-09-16. Isthmus is its latest fork: no Jovian or Karst yet.
+/// Manta is not in the superchain-registry; the times are the `--override.*` values
+/// its op-node runs with.
+const MANTA: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::REGOLITH,
+    forks: &[
+        (1_726_783_200, OpSpecId::ECOTONE),
+        (1_789_560_000, OpSpecId::FJORD),
+        (1_789_567_200, OpSpecId::GRANITE),
+        (1_789_574_400, OpSpecId::HOLOCENE),
+        (1_789_581_600, OpSpecId::ISTHMUS),
+    ],
+};
+
+/// Katana: Canyon..Holocene at genesis (2025-05-08). Isthmus is at OP Mainnet's
+/// timestamp; Jovian (2026-03-09) and Karst (2026-09-23) are Katana's own. Katana is
+/// not in the superchain-registry; the times are its `rollup.json` and the
+/// `--override.*` values its op-node runs with.
+const KATANA: TimestampSchedule = TimestampSchedule {
+    genesis: OpSpecId::HOLOCENE,
+    forks: &[
+        (OP_MAINNET_ISTHMUS_TIMESTAMP, OpSpecId::ISTHMUS),
+        (1_773_066_601, OpSpecId::JOVIAN),
+        (1_790_179_201, OpSpecId::KARST),
+    ],
+};
+
+/// The fork active on `chain_id` at `(block_number, timestamp)`, or `None` for a
+/// chain without a built-in schedule.
+pub fn op_stack_spec_at(chain_id: u64, block_number: u64, timestamp: u64) -> Option<OpSpecId> {
+    match chain_id {
+        OP_MAINNET_CHAIN_ID => Some(op_mainnet_spec_at(block_number, timestamp)),
+        SONEIUM_CHAIN_ID => Some(SONEIUM.spec_at(timestamp)),
+        UNICHAIN_CHAIN_ID => Some(UNICHAIN.spec_at(timestamp)),
+        CYBER_CHAIN_ID => Some(CYBER.spec_at(timestamp)),
+        FRAXTAL_CHAIN_ID => Some(FRAXTAL.spec_at(timestamp)),
+        MODE_CHAIN_ID => Some(MODE.spec_at(timestamp)),
+        BOB_CHAIN_ID => Some(BOB.spec_at(timestamp)),
+        WORLD_CHAIN_ID => Some(WORLD.spec_at(timestamp)),
+        MANTA_CHAIN_ID => Some(MANTA.spec_at(timestamp)),
+        KATANA_CHAIN_ID => Some(KATANA.spec_at(timestamp)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_boundaries(schedule: &TimestampSchedule) {
+        let mut previous = schedule.genesis;
+        assert_eq!(schedule.spec_at(0), previous);
+        for &(activation, spec) in schedule.forks {
+            assert!(spec > previous, "forks must ascend");
+            assert_eq!(schedule.spec_at(activation - 1), previous);
+            assert_eq!(schedule.spec_at(activation), spec);
+            previous = spec;
+        }
+        assert_eq!(schedule.spec_at(u64::MAX), previous);
+    }
+
+    #[test]
+    fn each_fork_starts_at_its_timestamp() {
+        assert_boundaries(&SONEIUM);
+        assert_boundaries(&UNICHAIN);
+        assert_boundaries(&CYBER);
+        assert_boundaries(&FRAXTAL);
+        assert_boundaries(&MODE);
+        assert_boundaries(&BOB);
+        assert_boundaries(&WORLD);
+        assert_boundaries(&MANTA);
+        assert_boundaries(&KATANA);
+    }
+
+    /// Real boundary blocks (number, header timestamp) from each chain.
+    #[test]
+    fn chain_boundary_blocks() {
+        for (chain_id, block, timestamp, spec) in [
+            (SONEIUM_CHAIN_ID, 1, 1_733_134_753, OpSpecId::GRANITE),
+            (
+                SONEIUM_CHAIN_ID,
+                2_719_224,
+                1_738_573_199,
+                OpSpecId::GRANITE,
+            ),
+            (
+                SONEIUM_CHAIN_ID,
+                2_719_225,
+                1_738_573_201,
+                OpSpecId::HOLOCENE,
+            ),
+            (
+                SONEIUM_CHAIN_ID,
+                6_835_824,
+                1_746_806_399,
+                OpSpecId::HOLOCENE,
+            ),
+            (
+                SONEIUM_CHAIN_ID,
+                6_835_825,
+                1_746_806_401,
+                OpSpecId::ISTHMUS,
+            ),
+            (
+                SONEIUM_CHAIN_ID,
+                15_778_224,
+                1_764_691_199,
+                OpSpecId::ISTHMUS,
+            ),
+            (
+                SONEIUM_CHAIN_ID,
+                15_778_225,
+                1_764_691_201,
+                OpSpecId::JOVIAN,
+            ),
+            (
+                SONEIUM_CHAIN_ID,
+                25_195_824,
+                1_783_526_399,
+                OpSpecId::JOVIAN,
+            ),
+            (SONEIUM_CHAIN_ID, 25_195_825, 1_783_526_401, OpSpecId::KARST),
+            // Unichain has 1s blocks.
+            (UNICHAIN_CHAIN_ID, 1, 1_730_748_360, OpSpecId::GRANITE),
+            (
+                UNICHAIN_CHAIN_ID,
+                5_697_241,
+                1_736_445_600,
+                OpSpecId::GRANITE,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                5_697_242,
+                1_736_445_601,
+                OpSpecId::HOLOCENE,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                16_058_041,
+                1_746_806_400,
+                OpSpecId::HOLOCENE,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                16_058_042,
+                1_746_806_401,
+                OpSpecId::ISTHMUS,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                33_942_841,
+                1_764_691_200,
+                OpSpecId::ISTHMUS,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                33_942_842,
+                1_764_691_201,
+                OpSpecId::JOVIAN,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                52_778_041,
+                1_783_526_400,
+                OpSpecId::JOVIAN,
+            ),
+            (
+                UNICHAIN_CHAIN_ID,
+                52_778_042,
+                1_783_526_401,
+                OpSpecId::KARST,
+            ),
+        ] {
+            assert_eq!(
+                op_stack_spec_at(chain_id, block, timestamp),
+                Some(spec),
+                "chain {chain_id} block {block}"
+            );
+        }
+    }
+
+    /// Cyber and Fraxtal are behind OP Mainnet: their head is not Karst.
+    #[test]
+    fn chains_behind_the_latest_fork() {
+        for (chain_id, block, timestamp, spec) in [
+            (CYBER_CHAIN_ID, 1, 1_713_428_569, OpSpecId::ECOTONE),
+            (CYBER_CHAIN_ID, 27_163_116, 1_767_754_799, OpSpecId::ECOTONE),
+            (CYBER_CHAIN_ID, 27_163_117, 1_767_754_801, OpSpecId::FJORD),
+            (CYBER_CHAIN_ID, 27_206_316, 1_767_841_199, OpSpecId::FJORD),
+            (CYBER_CHAIN_ID, 27_206_317, 1_767_841_201, OpSpecId::GRANITE),
+            (CYBER_CHAIN_ID, 27_249_516, 1_767_927_599, OpSpecId::GRANITE),
+            (
+                CYBER_CHAIN_ID,
+                27_249_517,
+                1_767_927_601,
+                OpSpecId::HOLOCENE,
+            ),
+            // 2026-11-16, after OP Mainnet's Karst.
+            (
+                CYBER_CHAIN_ID,
+                40_686_578,
+                1_794_801_723,
+                OpSpecId::HOLOCENE,
+            ),
+            (FRAXTAL_CHAIN_ID, 1, 1_706_810_713, OpSpecId::CANYON),
+            (FRAXTAL_CHAIN_ID, 5_099_244, 1_717_009_199, OpSpecId::CANYON),
+            (
+                FRAXTAL_CHAIN_ID,
+                5_099_245,
+                1_717_009_201,
+                OpSpecId::ECOTONE,
+            ),
+            (
+                FRAXTAL_CHAIN_ID,
+                13_568_244,
+                1_733_947_199,
+                OpSpecId::ECOTONE,
+            ),
+            (FRAXTAL_CHAIN_ID, 13_568_245, 1_733_947_201, OpSpecId::FJORD),
+            (FRAXTAL_CHAIN_ID, 16_073_844, 1_738_958_399, OpSpecId::FJORD),
+            (
+                FRAXTAL_CHAIN_ID,
+                16_073_845,
+                1_738_958_401,
+                OpSpecId::GRANITE,
+            ),
+            (
+                FRAXTAL_CHAIN_ID,
+                18_620_844,
+                1_744_052_399,
+                OpSpecId::GRANITE,
+            ),
+            (
+                FRAXTAL_CHAIN_ID,
+                18_620_845,
+                1_744_052_401,
+                OpSpecId::HOLOCENE,
+            ),
+            (
+                FRAXTAL_CHAIN_ID,
+                24_452_844,
+                1_755_716_399,
+                OpSpecId::HOLOCENE,
+            ),
+            (
+                FRAXTAL_CHAIN_ID,
+                24_452_845,
+                1_755_716_401,
+                OpSpecId::ISTHMUS,
+            ),
+            // 2026-11-16, after OP Mainnet's Karst.
+            (
+                FRAXTAL_CHAIN_ID,
+                43_995_519,
+                1_794_801_749,
+                OpSpecId::ISTHMUS,
+            ),
+        ] {
+            assert_eq!(
+                op_stack_spec_at(chain_id, block, timestamp),
+                Some(spec),
+                "chain {chain_id} block {block}"
+            );
+        }
+    }
+
+    /// Real boundary blocks of Mode, BOB and World Chain (2s blocks): the last block
+    /// before each fork and its first block.
+    #[test]
+    fn mode_bob_world_boundary_blocks() {
+        use OpSpecId::*;
+        let mode = [
+            (1, 1_700_167_585, REGOLITH),
+            (2_412_408, 1_704_992_399, REGOLITH),
+            (2_412_409, 1_704_992_401, CANYON),
+            (5_103_408, 1_710_374_399, CANYON),
+            (5_103_409, 1_710_374_401, ECOTONE),
+            (10_229_808, 1_720_627_199, ECOTONE),
+            (10_229_809, 1_720_627_201, FJORD),
+            (12_951_408, 1_726_070_399, FJORD),
+            (12_951_409, 1_726_070_401, GRANITE),
+            (18_139_008, 1_736_445_599, GRANITE),
+            (18_139_009, 1_736_445_601, HOLOCENE),
+            (23_319_408, 1_746_806_399, HOLOCENE),
+            (23_319_409, 1_746_806_401, ISTHMUS),
+            (32_261_808, 1_764_691_199, ISTHMUS),
+            (32_261_809, 1_764_691_201, JOVIAN),
+            (41_679_408, 1_783_526_399, JOVIAN),
+            (41_679_409, 1_783_526_401, KARST),
+        ];
+        let bob = [
+            (1, 1_712_861_989, ECOTONE),
+            (3_882_606, 1_720_627_199, ECOTONE),
+            (3_882_607, 1_720_627_201, FJORD),
+            (6_604_206, 1_726_070_399, FJORD),
+            (6_604_207, 1_726_070_401, GRANITE),
+            (11_791_806, 1_736_445_599, GRANITE),
+            (11_791_807, 1_736_445_601, HOLOCENE),
+            (16_972_206, 1_746_806_399, HOLOCENE),
+            (16_972_207, 1_746_806_401, ISTHMUS),
+            (30_231_906, 1_773_325_799, ISTHMUS),
+            (30_231_907, 1_773_325_801, JOVIAN),
+            (38_658_606, 1_790_179_199, JOVIAN),
+            (38_658_607, 1_790_179_201, KARST),
+        ];
+        let world = [
+            (1, 1_719_335_641, ECOTONE),
+            (1_245_180, 1_721_825_999, ECOTONE),
+            (1_245_181, 1_721_826_001, FJORD),
+            (4_222_380, 1_727_780_399, FJORD),
+            (4_222_381, 1_727_780_401, GRANITE),
+            (9_451_380, 1_738_238_399, GRANITE),
+            (9_451_381, 1_738_238_401, HOLOCENE),
+            (22_368_180, 1_764_071_999, HOLOCENE),
+            (22_368_181, 1_764_072_001, ISTHMUS),
+            (29_128_980, 1_777_593_599, ISTHMUS),
+            (29_128_981, 1_777_593_601, JOVIAN),
+            (35_328_180, 1_789_991_999, JOVIAN),
+            (35_328_181, 1_789_992_001, KARST),
+        ];
+        for (chain_id, blocks) in [
+            (MODE_CHAIN_ID, &mode[..]),
+            (BOB_CHAIN_ID, &bob[..]),
+            (WORLD_CHAIN_ID, &world[..]),
+        ] {
+            for &(block, timestamp, spec) in blocks {
+                assert_eq!(
+                    op_stack_spec_at(chain_id, block, timestamp),
+                    Some(spec),
+                    "chain {chain_id} block {block}"
+                );
+            }
+        }
+    }
+
+    /// Real boundary blocks of Manta Pacific (10s blocks) and Katana (1s blocks): the
+    /// last block before each fork and its first block.
+    #[test]
+    fn manta_katana_boundary_blocks() {
+        use OpSpecId::*;
+        let manta = [
+            (1, 1_694_223_969, REGOLITH),
+            (3_255_924, 1_726_783_199, REGOLITH),
+            // Canyon, Delta and Ecotone in one block.
+            (3_255_925, 1_726_783_209, ECOTONE),
+            (9_533_604, 1_789_559_999, ECOTONE),
+            (9_533_605, 1_789_560_009, FJORD),
+            (9_534_324, 1_789_567_199, FJORD),
+            (9_534_325, 1_789_567_209, GRANITE),
+            (9_535_044, 1_789_574_399, GRANITE),
+            (9_535_045, 1_789_574_409, HOLOCENE),
+            (9_535_764, 1_789_581_599, HOLOCENE),
+            (9_535_765, 1_789_581_609, ISTHMUS),
+            // 2026-11-16, after OP Mainnet's Karst: Manta is still on Isthmus.
+            (10_059_354, 1_794_817_499, ISTHMUS),
+        ];
+        let katana = [
+            (1, 1_746_742_812, HOLOCENE),
+            (63_589, 1_746_806_400, HOLOCENE),
+            (63_590, 1_746_806_401, ISTHMUS),
+            (26_323_789, 1_773_066_600, ISTHMUS),
+            (26_323_790, 1_773_066_601, JOVIAN),
+            (43_436_389, 1_790_179_200, JOVIAN),
+            (43_436_390, 1_790_179_201, KARST),
+        ];
+        for (chain_id, blocks) in [(MANTA_CHAIN_ID, &manta[..]), (KATANA_CHAIN_ID, &katana[..])] {
+            for &(block, timestamp, spec) in blocks {
+                assert_eq!(
+                    op_stack_spec_at(chain_id, block, timestamp),
+                    Some(spec),
+                    "chain {chain_id} block {block}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn op_mainnet_keeps_its_own_schedule() {
+        // Pre-Bedrock, Regolith and Karst blocks.
+        for (block, timestamp, spec) in [
+            (105_235_062, 1_686_068_901, OpSpecId::BEDROCK),
+            (105_235_063, 1_686_068_903, OpSpecId::REGOLITH),
+            (153_963_812, 1_783_526_401, OpSpecId::KARST),
+        ] {
+            assert_eq!(
+                op_stack_spec_at(OP_MAINNET_CHAIN_ID, block, timestamp),
+                Some(spec)
+            );
+        }
+    }
+
+    #[test]
+    fn unlisted_chains_have_no_schedule() {
+        for chain_id in [1, 196, 4153, 5000, 8453, 57073, 59144] {
+            assert_eq!(op_stack_spec_at(chain_id, 1, 1_783_526_401), None);
+        }
+    }
+}

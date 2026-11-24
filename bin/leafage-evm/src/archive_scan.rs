@@ -38,9 +38,9 @@ pub struct Command {
     #[arg(long, value_name = "PATH")]
     db_path: PathBuf,
 
-    /// Column family to scan. Readable name or raw number (1-6):
+    /// Column family to scan. Readable name or raw number (1-7):
     /// account(4), storage(5), code(6), block-info(2), block-hash(3),
-    /// latest-block-hash(1).
+    /// latest-block-hash(1), block-num-to-block-info(7).
     #[arg(long, default_value = "account")]
     cf: String,
 
@@ -80,11 +80,14 @@ impl Command {
             self.cf, cf_num, self.db_path, alloy::hex::encode(&prefix),
         );
 
-        // Read-only open. RocksDB requires every existing CF to be listed; the
-        // archive backend uses the numeric names 1..=6.
+        // Read-only open of the CFs the archive has (numeric names; `2` is
+        // dropped once `7` replaces it).
         let mut opts = Options::default();
         opts.set_max_open_files(self.max_open_files);
-        let cfs = ["1", "2", "3", "4", "5", "6"];
+        let cfs = DB::list_cf(&opts, &self.db_path)
+            .map_err(|e| anyhow!("list column families: {e}"))?
+            .into_iter()
+            .filter(|name| name != "default");
         let db = DB::open_cf_for_read_only(&opts, &self.db_path, cfs, false).map_err(|e| {
             anyhow!("open read-only failed (is the node stopped / DB lock free?): {e}")
         })?;
@@ -187,6 +190,7 @@ fn resolve_cf(name: &str) -> Result<&'static str> {
     Ok(match n.as_str() {
         "1" | "latestblockhash" => "1",
         "2" | "blockhashtoblockinfo" | "blockinfo" => "2",
+        "7" | "blocknumtoblockinfo" | "blockinfobynumber" => "7",
         "3" | "blocknumtoblockhash" | "blockhash" => "3",
         "4" | "addresstoaccount" | "account" | "accounts" => "4",
         "5" | "addresstostorage" | "storage" | "storages" => "5",
@@ -194,7 +198,8 @@ fn resolve_cf(name: &str) -> Result<&'static str> {
         _ => {
             return Err(anyhow!(
                 "unknown column family {name:?}; use one of: \
-                 account, storage, code, block-info, block-hash, latest-block-hash (or 1-6)"
+                 account, storage, code, block-info, block-hash, latest-block-hash, \
+                 block-num-to-block-info (or 1-7)"
             ))
         }
     })

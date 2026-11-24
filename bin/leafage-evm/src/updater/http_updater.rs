@@ -5,10 +5,14 @@ use leafage_evm_rpc::{EthApiClient, TraceApiClient};
 use leafage_evm_storage::{BlockContext, EvmStorageRead, EvmStorageWrite};
 use leafage_evm_types::{Block, BlockId, BlockInfo, BlockNumberOrTag, BlockStorageDiff, DebankOutPut, HeaderInfo};
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time::interval;
 use tracing::{debug, error, info};
+
+/// How long the updater waits after it gave up connecting the upstream chain to
+/// the tree, before it walks that chain's parents again.
+const UNCONNECTED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// [`Updater`] is used to update the snapshot tree to the latest block
 pub struct Updater<Tree> {
@@ -17,6 +21,9 @@ pub struct Updater<Tree> {
     block_queue: VecDeque<DebankOutPut>,
     update_interval: Duration,
     max_diff_depth: usize,
+    /// Set when the upstream chain did not connect to the tree: no update
+    /// before this time.
+    retry_at: Option<Instant>,
 }
 
 impl<Tree> Updater<Tree>
@@ -40,12 +47,17 @@ where
             block_queue: VecDeque::new(),
             update_interval,
             max_diff_depth,
+            retry_at: None,
         })
     }
 
     /// Update the snapshot tree to the latest block
     /// Return true if the snapshot tree is updated
     async fn update(&mut self) -> Result<bool> {
+        if self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(false);
+        }
+        self.retry_at = None;
         if self.block_queue.is_empty() {
             let current_block_info = self
                 .tree
@@ -71,6 +83,12 @@ where
         loop {
             if self.block_queue.len() > self.max_diff_depth {
                 info!(target:"updater", "can't find parent block before max diff depth, drop");
+                // Start over from the tree's head: with the queue left as it
+                // is, every later update would stop here. Not on the next
+                // tick, which would fetch the same blocks again each time
+                // while the upstream stays on that chain.
+                self.block_queue.clear();
+                self.retry_at = Some(Instant::now() + UNCONNECTED_RETRY_INTERVAL);
                 return Ok(false);
             }
             let first_output = self.block_queue.front().unwrap();
