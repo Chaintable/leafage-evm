@@ -262,6 +262,18 @@ impl StateDBRead for MultiStateDB {
         }
     }
 
+    fn read_block_info_arc(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<Arc<BlockInfo>>, StorageError> {
+        match self {
+            MultiStateDB::RocksDBState(db) => db.read_block_info_arc(block_hash),
+            MultiStateDB::RocksDBArchive(db) => db.read_block_info_arc(block_hash),
+            MultiStateDB::MDBXState(db) => db.read_block_info_arc(block_hash),
+            MultiStateDB::MDBXArchive(db) => db.read_block_info_arc(block_hash),
+        }
+    }
+
     fn read_block_hash(&self, block_num: u64) -> Result<H256, StorageError> {
         match self {
             MultiStateDB::RocksDBState(db) => db.read_block_hash(block_num),

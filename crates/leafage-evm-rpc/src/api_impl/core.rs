@@ -222,6 +222,27 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         self.transact(block_env, state, tx)
     }
 
+    /// Runs `f` with an executor for a run of independent read-only calls that
+    /// share `block_env` and `state`, such as the calls of one multicall. Each
+    /// call behaves exactly like [`Self::transact`] and never sees another
+    /// call's state changes. The default builds a fresh EVM for every call;
+    /// chains whose EVM is costly to set up per call override it to keep one
+    /// EVM for the whole run. A call that panics may leave that EVM
+    /// mid-transaction, so the executor must not be called again after a
+    /// panic.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        f(&mut |tx| self.transact(block_env, state.clone(), tx))
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
@@ -238,6 +259,14 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 }
+
+/// One read-only call of a [`EvmExecutor::with_call_executor`] run.
+pub(crate) type CallExecutor<'a, E, StateDB> = dyn FnMut(
+        <E as EvmExecutor>::Tx,
+    ) -> Result<
+        ExecutionResult<<E as EvmExecutor>::EvmHaltReason>,
+        EVMError<<StateDB as DatabaseRef>::Error, <E as EvmExecutor>::TransactionError>,
+    > + 'a;
 
 pub(crate) trait TxSetter {
     fn set_gas_limit(&mut self, gas_limit: u64);
@@ -372,6 +401,103 @@ impl MultiChainCfgEnv {
 
     pub fn is_zksync(&self) -> bool {
         matches!(self, MultiChainCfgEnv::Zksync(_))
+    }
+}
+
+/// Shared checks for [`EvmExecutor::with_call_executor`] overrides.
+#[cfg(test)]
+pub(crate) mod call_executor_test {
+    use super::EvmExecutor;
+    use alloy::primitives::{Address, Bytes, U256};
+    use revm::context::result::ExecutionResult;
+    use revm::context::{BlockEnv, TxEnv};
+    use revm::{bytecode::Bytecode, database::InMemoryDB, state::AccountInfo};
+
+    /// Runs the same calls through `with_call_executor` (one EVM for the run)
+    /// and through `transact` (a fresh EVM per call) and asserts the results are
+    /// equal: a counter that writes storage (each call must see the stored 0),
+    /// a value transfer, a revert, a tx rejected for its nonce and the counter
+    /// again, so no call may see another's writes, transfers or fee payments
+    /// and a rejected call must not leak into the next one.
+    pub(crate) fn assert_matches_transact<E>(
+        api: &E,
+        block_env: &BlockEnv,
+        to_tx: impl Fn(TxEnv) -> E::Tx,
+    ) where
+        E: EvmExecutor,
+        E::EvmHaltReason: PartialEq,
+    {
+        let caller = Address::repeat_byte(0x11);
+        let counter = Address::repeat_byte(0x21);
+        let reverter = Address::repeat_byte(0x22);
+        let payee = Address::repeat_byte(0x23);
+        let mut state = InMemoryDB::default();
+        state.insert_account_info(
+            caller,
+            AccountInfo {
+                balance: U256::from(10u128.pow(18)),
+                ..Default::default()
+            },
+        );
+        // slot0 += 1; return slot0
+        let counter_code = Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x80, 0x60, 0x00, 0x55, 0x60, 0x00, 0x52, 0x60,
+            0x20, 0x60, 0x00, 0xf3,
+        ]));
+        state.insert_account_info(counter, AccountInfo::from_bytecode(counter_code));
+        // revert(0, 0)
+        let reverter_code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]));
+        state.insert_account_info(reverter, AccountInfo::from_bytecode(reverter_code));
+        let tx = |to: Address, value: u64, nonce: u64| {
+            to_tx(
+                TxEnv::builder()
+                    .caller(caller)
+                    .to(to)
+                    .nonce(nonce)
+                    .gas_limit(100_000)
+                    .gas_price(5)
+                    .value(U256::from(value))
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let txs = [
+            tx(counter, 0, 0),
+            tx(counter, 0, 0),
+            tx(payee, 1_000, 0),
+            tx(reverter, 0, 0),
+            tx(counter, 0, 7),
+            tx(counter, 0, 0),
+        ];
+
+        let per_call: Vec<Result<ExecutionResult<E::EvmHaltReason>, String>> = txs
+            .iter()
+            .map(|tx| {
+                api.transact(block_env, &state, tx.clone())
+                    .map_err(|e| e.to_string())
+            })
+            .collect();
+        let reused: Vec<Result<ExecutionResult<E::EvmHaltReason>, String>> = api
+            .with_call_executor(block_env, &state, |exec| {
+                txs.iter()
+                    .map(|tx| exec(tx.clone()).map_err(|e| e.to_string()))
+                    .collect()
+            });
+
+        assert_eq!(reused, per_call);
+        let one = Bytes::from(U256::from(1).to_be_bytes::<32>().to_vec());
+        for i in [0, 1, 5] {
+            assert_eq!(reused[i].as_ref().unwrap().output(), Some(&one), "call {i}");
+        }
+        assert!(
+            reused[2].as_ref().unwrap().is_success(),
+            "the transfer succeeds"
+        );
+        assert!(
+            !reused[3].as_ref().unwrap().is_success(),
+            "the revert stays a revert"
+        );
+        assert!(reused[4].is_err(), "a wrong nonce is rejected");
     }
 }
 

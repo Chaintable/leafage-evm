@@ -33,7 +33,7 @@ use crate::db_impl::rocksdb_impl::sst::{
     ingest_external_file_options, sst_writer_options, SstSink,
 };
 use crate::metrics::STORAGE_METRICS;
-use alloy::primitives::B64;
+use alloy::primitives::{keccak256, B64};
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
     Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
@@ -64,7 +64,7 @@ use block_index::BlockIndex;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
-use state_cache::{CachedAccount, Entry, Lookup, Probe, Span, StateCache, Table};
+use state_cache::{CachedAccount, Entry, Lookup, MissReason, Probe, Span, StateCache, Table};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -140,12 +140,12 @@ fn disable_perf_counters() {
 }
 
 /// Default entry count of the block-info cache (block hash -> header).
-const DEFAULT_BLOCK_INFO_CACHE_ENTRIES: u64 = 16384;
+const DEFAULT_BLOCK_INFO_CACHE_ENTRIES: u64 = 65536;
 
 /// Build the block-info cache honoring `ARCHIVE_BLOCK_INFO_CACHE` (entries;
 /// `0` disables). Keyed by block hash, so an entry never goes stale. Every
 /// request resolves its block through it.
-fn build_block_info_cache() -> Option<QuickCache<H256, BlockInfo>> {
+fn build_block_info_cache() -> Option<QuickCache<H256, Arc<BlockInfo>>> {
     let entries = env::var("ARCHIVE_BLOCK_INFO_CACHE")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -349,7 +349,7 @@ pub struct DataBaseRef {
     /// Block hash -> block info. A hash names one block, so entries never go
     /// stale; rewound blocks stay cached to serve requests for fork blocks.
     /// `None` = disabled via `ARCHIVE_BLOCK_INFO_CACHE=0`.
-    block_info_cache: Option<QuickCache<H256, BlockInfo>>,
+    block_info_cache: Option<QuickCache<H256, Arc<BlockInfo>>>,
     /// Hash -> number of the canonical blocks, when block infos are in
     /// `BlockNumToBlockInfo` (see [`block_index`]).
     block_index: Option<Arc<BlockIndex>>,
@@ -1672,7 +1672,7 @@ impl DataBaseRef {
         Ok(block_hash)
     }
 
-    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+    pub fn read_block_info_arc(&self, block_hash: H256) -> Result<Option<Arc<BlockInfo>>, Error> {
         if let Some(info) = self
             .block_info_cache
             .as_ref()
@@ -1684,11 +1684,18 @@ impl DataBaseRef {
         let info = match &self.block_index {
             Some(index) => self.read_block_info_by_number(index, block_hash)?,
             None => self.read_block_info_from_db(block_hash)?,
-        };
+        }
+        .map(Arc::new);
         if let (Some(cache), Some(info)) = (&self.block_info_cache, &info) {
-            cache.insert(block_hash, info.clone());
+            cache.insert(block_hash, Arc::clone(info));
         }
         Ok(info)
+    }
+
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+        Ok(self
+            .read_block_info_arc(block_hash)?
+            .map(|info| info.as_ref().clone()))
     }
 
     fn read_block_info_from_db(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
@@ -1834,7 +1841,7 @@ impl DataBaseRef {
         if latest_hash == H256::ZERO {
             return Ok(None);
         }
-        let block_info = self.read_block_info(latest_hash)?;
+        let block_info = self.read_block_info_arc(latest_hash)?;
         match block_info {
             Some(block) => Ok(Some(block.header.number)),
             None => Ok(None),
@@ -2792,10 +2799,10 @@ impl StateDBProvider for Arc<DataBaseRef> {
     type StateDBReadWrite = StateDB;
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;
-        let cached_block_info: Option<BlockInfo>;
+        let cached_block_info: Option<Arc<BlockInfo>>;
         match block_id {
             BlockId::Hash(hash) => {
-                let info = self.read_block_info(hash.block_hash)?;
+                let info = self.read_block_info_arc(hash.block_hash)?;
                 if info.is_none() {
                     return Ok(None);
                 }
@@ -2817,7 +2824,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                     let info = if latest_hash == H256::ZERO {
                         None
                     } else {
-                        self.read_block_info(latest_hash)?
+                        self.read_block_info_arc(latest_hash)?
                     };
                     match info {
                         Some(info) => {
@@ -2836,7 +2843,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                     if block_hash == H256::ZERO {
                         return Ok(None);
                     }
-                    let info = self.read_block_info(block_hash)?;
+                    let info = self.read_block_info_arc(block_hash)?;
                     if info.is_none() {
                         return Ok(None);
                     }
@@ -3011,7 +3018,7 @@ pub struct StateDB {
     block_num: u64,
     /// `None` when the database is empty (no blocks committed yet).
     /// Stores full BlockInfo to preserve `other` fields (e.g. l1FeeRate).
-    block_info: Option<BlockInfo>,
+    block_info: Option<Arc<BlockInfo>>,
     /// Shared iterators
     iterators: Arc<SharedIterators>,
     /// The state cache view the iterators read under; `None` reads bypass
@@ -3167,11 +3174,20 @@ impl StateDB {
                     }
                     Lookup::Miss(entry) => {
                         misses.increment(1);
-                        if entry.is_none() {
-                            STORAGE_METRICS.state_cache_cold_misses.increment(1);
-                        }
+                        record_state_cache_miss(&entry, self.block_num);
                         cached = entry;
                     }
+                }
+            }
+            if is_op_system_address(key[..32].try_into().unwrap()) {
+                match col {
+                    StorageTypeColumn::AddressToAccount => {
+                        STORAGE_METRICS.archive_op_system_account_gets.increment(1);
+                    }
+                    StorageTypeColumn::AddressToStorage => {
+                        STORAGE_METRICS.archive_op_system_storage_gets.increment(1);
+                    }
+                    _ => {}
                 }
             }
             pending.push((i, cached));
@@ -3196,6 +3212,44 @@ impl StateDB {
         }
         Ok(out)
     }
+}
+
+/// Record whether a state-cache miss was cold or warm (above/below/gap and volatile).
+fn record_state_cache_miss<V>(entry: &Option<Arc<Entry<V>>>, block: u64) {
+    match entry {
+        None => STORAGE_METRICS.state_cache_cold_misses.increment(1),
+        Some(entry) => {
+            match entry.miss_reason(block) {
+                MissReason::Above => STORAGE_METRICS.state_cache_warm_misses_above.increment(1),
+                MissReason::Below => STORAGE_METRICS.state_cache_warm_misses_below.increment(1),
+                MissReason::Gap => STORAGE_METRICS.state_cache_warm_misses_gap.increment(1),
+            }
+            if entry.is_volatile() {
+                STORAGE_METRICS.state_cache_warm_misses_volatile.increment(1);
+            }
+        }
+    }
+}
+
+/// Keccak256 hashes of fixed OP-stack system addresses whose archive reads are
+/// counted for observability:
+/// - `0x4200000000000000000000000000000000000015` (L1Block)
+/// - `0x4200000000000000000000000000000000000019` (BaseFeeVault)
+/// - `0x420000000000000000000000000000000000001A` (L1FeeVault)
+/// - `0x420000000000000000000000000000000000001B` (OperatorFeeVault)
+static OP_SYSTEM_ADDR_HASHES: LazyLock<[[u8; 32]; 4]> = LazyLock::new(|| {
+    const ADDRS: [[u8; 20]; 4] = [
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15],
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x19],
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1a],
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1b],
+    ];
+    ADDRS.map(|a| keccak256(a).0)
+});
+
+#[inline]
+fn is_op_system_address(addr_hash: &[u8; 32]) -> bool {
+    OP_SYSTEM_ADDR_HASHES.iter().any(|h| h == addr_hash)
 }
 
 /// Count a miss's probe decision; whether it probes.
@@ -3245,12 +3299,13 @@ impl StateDB {
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.storage_cache_misses.increment(1);
-                    if entry.is_none() {
-                        STORAGE_METRICS.state_cache_cold_misses.increment(1);
-                    }
+                    record_state_cache_miss(&entry, self.block_num);
                     cached = entry;
                 }
             }
+        }
+        if is_op_system_address(&address.0) {
+            STORAGE_METRICS.archive_op_system_storage_gets.increment(1);
         }
 
         if let Some(store) = &self.db.v4 {
@@ -3423,12 +3478,13 @@ impl StateDBRead for StateDB {
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.account_cache_misses.increment(1);
-                    if entry.is_none() {
-                        STORAGE_METRICS.state_cache_cold_misses.increment(1);
-                    }
+                    record_state_cache_miss(&entry, self.block_num);
                     cached = entry;
                 }
             }
+        }
+        if is_op_system_address(&address.0) {
+            STORAGE_METRICS.archive_op_system_account_gets.increment(1);
         }
         if let Some(store) = &self.db.v4 {
             let start = std::time::Instant::now();
@@ -3604,12 +3660,18 @@ impl StateDBRead for StateDB {
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+        Ok(self
+            .read_block_info_arc(block_hash)?
+            .map(|info| info.as_ref().clone()))
+    }
+
+    fn read_block_info_arc(&self, block_hash: H256) -> Result<Option<Arc<BlockInfo>>, Error> {
         if let Some(info) = &self.block_info {
             if block_hash == info.header.hash {
-                return Ok(Some(info.clone()));
+                return Ok(Some(Arc::clone(info)));
             }
         }
-        self.db.read_block_info(block_hash)
+        self.db.read_block_info_arc(block_hash)
     }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
         match &self.block_info {

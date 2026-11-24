@@ -64,8 +64,21 @@ pub struct StorageMetrics {
     pub state_cache_probes_skipped_capped: Counter,
     /// Archive state-cache misses on a key not in the cache.
     pub state_cache_cold_misses: Counter,
+    /// Archive state-cache warm misses where the requested block is above every cached span.
+    pub state_cache_warm_misses_above: Counter,
+    /// Archive state-cache warm misses where the requested block is below every cached span.
+    pub state_cache_warm_misses_below: Counter,
+    /// Archive state-cache warm misses where the requested block sits in a gap between cached spans.
+    pub state_cache_warm_misses_gap: Counter,
+    /// Archive state-cache warm misses on a key marked volatile (short span).
+    pub state_cache_warm_misses_volatile: Counter,
     /// Archive block-info cache hits (cumulative).
     pub block_info_cache_hits: Counter,
+    /// Archive account Gets targeting fixed OP-stack system addresses
+    /// (L1Block, BaseFeeVault, L1FeeVault, OperatorFeeVault).
+    pub archive_op_system_account_gets: Counter,
+    /// Archive storage Gets targeting fixed OP-stack system addresses (L1Block).
+    pub archive_op_system_storage_gets: Counter,
     /// Schema v3 archive account Gets that found a version at or below the
     /// read height.
     pub archive_account_gets_found: Counter,
@@ -154,6 +167,10 @@ pub struct ArchiveV4Metrics {
     pub page_reads: Counter,
     /// Bytes of those reads.
     pub page_read_bytes: Counter,
+    /// Latency of individual page reads (`pread` into the page cache).
+    pub page_read_latency: Histogram,
+    /// Page reads made for lookups whose final answer was absent (no version <= h).
+    pub absent_page_reads: Counter,
     /// Lookups that read a second page: the index pointed at a neighbour.
     pub extra_pages: Counter,
     /// Lookups answered by the memtable.

@@ -811,3 +811,123 @@ mod pre_bedrock {
         }
     }
 }
+
+/// A multicall's calls run on one EVM (`with_call_executor`) give the same
+/// results as a fresh EVM per call (`transact`), and read the L1 block info
+/// once for the run.
+#[test]
+fn call_executor_matches_per_call_transact_and_fetches_l1_info_once() {
+    use revm::DatabaseRef;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingDb {
+        inner: CacheDB<EmptyDB>,
+        l1_block_reads: AtomicUsize,
+    }
+
+    impl DatabaseRef for CountingDb {
+        type Error = std::convert::Infallible;
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            self.inner.basic_ref(address)
+        }
+        fn code_by_hash_ref(
+            &self,
+            code_hash: leafage_evm_types::H256,
+        ) -> Result<Bytecode, Self::Error> {
+            self.inner.code_by_hash_ref(code_hash)
+        }
+        fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            if address == op_revm::constants::L1_BLOCK_CONTRACT {
+                self.l1_block_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.storage_ref(address, index)
+        }
+        fn block_hash_ref(&self, number: u64) -> Result<leafage_evm_types::H256, Self::Error> {
+            self.inner.block_hash_ref(number)
+        }
+    }
+
+    let api: ApiImpl<(), OpSpecId, NoneEvmCustomConfig> = ApiImpl::new(
+        (),
+        cfg(RISE),
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+        String::new(),
+        0,
+        None,
+        None,
+        None,
+    );
+    let counter = Address::repeat_byte(0x31);
+    let reverter = Address::repeat_byte(0x32);
+    let mut inner = CacheDB::new(EmptyDB::default());
+    // slot0 += 1; return slot0
+    inner.insert_account_info(
+        counter,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            alloy::hex::decode("6000546001018060005560005260206000f3")
+                .unwrap()
+                .into(),
+        )),
+    );
+    // revert(0, 0)
+    inner.insert_account_info(
+        reverter,
+        AccountInfo::default().with_code(Bytecode::new_raw(
+            alloy::hex::decode("60006000fd").unwrap().into(),
+        )),
+    );
+    let db = CountingDb {
+        inner,
+        l1_block_reads: AtomicUsize::new(0),
+    };
+    let block = BlockEnv {
+        number: U256::from(1_000),
+        ..Default::default()
+    };
+    let txs: Vec<_> = [counter, reverter, counter, counter]
+        .into_iter()
+        .map(|to| {
+            let req = TransactionRequest::default()
+                .from(Address::repeat_byte(0x11))
+                .to(to)
+                .gas_limit(1_000_000);
+            api.create_txn_env(
+                &BlockInfo::default(),
+                &block,
+                CallRequest {
+                    inner: req,
+                    other: Default::default(),
+                },
+                &db,
+                1,
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let per_call: Vec<_> = txs
+        .iter()
+        .map(|tx| api.transact(&block, &db, tx.clone()).unwrap())
+        .collect();
+    let per_call_reads = db.l1_block_reads.swap(0, Ordering::SeqCst);
+    let reused: Vec<_> = api.with_call_executor(&block, &db, |exec| {
+        txs.iter().map(|tx| exec(tx.clone()).unwrap()).collect()
+    });
+    let reused_reads = db.l1_block_reads.load(Ordering::SeqCst);
+
+    assert_eq!(reused, per_call);
+    assert_eq!(
+        reused[0].output(),
+        reused[3].output(),
+        "no call sees another's writes"
+    );
+    assert!(!reused[1].is_success());
+    assert!(reused_reads > 0);
+    assert_eq!(per_call_reads, reused_reads * txs.len());
+}

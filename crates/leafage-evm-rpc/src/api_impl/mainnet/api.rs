@@ -1,6 +1,7 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
-    ApiCore, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, CallExecutor, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError,
+    ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::mainnet::evm::{create_main_evm_from_state, create_mainnet_txn_env};
 use crate::api_impl::ApiImpl;
@@ -123,6 +124,35 @@ where
         res
     }
 
+    /// Keeps one EVM for the whole run, so its frame stack, instruction table
+    /// and precompile set are built once instead of per call. zkSync calls
+    /// keep the per-call path.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        if self.evm_cfg.zksync {
+            return f(&mut |tx| self.transact(block_env, state.clone(), tx));
+        }
+        let mut evm = create_main_evm_from_state(
+            block_env.clone(),
+            self.evm_cfg.cfg.clone(),
+            state,
+            NoOpInspector {},
+        );
+        f(&mut |tx| {
+            // `transact` finalizes the journal on success and on error, so the
+            // next call starts from the unchanged state.
+            evm.transact(tx).map(|res| res.result)
+        })
+    }
+
     fn apply_pre_execution_changes<StateDB>(
         &self,
         header: impl BlockHeader,
@@ -216,3 +246,36 @@ impl GetHaltReason for HaltReason {
 
 impl<DB> ApiCore for MainnetApiImpl<DB> where DB: Sync + Send + 'static {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_impl::api_impl::NoneEvmCustomConfig;
+    use crate::api_impl::core::call_executor_test::assert_matches_transact;
+
+    /// A multicall's calls run on one EVM give the same results as a fresh
+    /// EVM per call.
+    #[test]
+    fn call_executor_matches_per_call_transact() {
+        let api = ApiImpl::<(), MainnetSpecId, NoneEvmCustomConfig>::new(
+            (),
+            CfgEnv::new_with_spec(SpecId::OSAKA),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            100,
+            None,
+            None,
+            None,
+        );
+        let block_env = BlockEnv {
+            basefee: 3,
+            beneficiary: alloy::primitives::Address::repeat_byte(0xbb),
+            ..Default::default()
+        };
+        assert_matches_transact(&api, &block_env, |tx| tx);
+    }
+}
