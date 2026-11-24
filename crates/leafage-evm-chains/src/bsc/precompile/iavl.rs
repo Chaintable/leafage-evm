@@ -27,6 +27,10 @@ eth_precompile_fn!(
     iavl_proof_validation_run_plato_precompile,
     iavl_proof_validation_run_plato
 );
+eth_precompile_fn!(
+    iavl_proof_validation_run_pasteur_precompile,
+    iavl_proof_validation_run_pasteur
+);
 
 /// Iavl proof validation precompile for BSC.
 pub(crate) const IAVL_PROOF_VALIDATION: Precompile = Precompile::new(
@@ -62,6 +66,25 @@ pub(crate) const IAVL_PROOF_VALIDATION_PLATO: Precompile = Precompile::new(
     u64_to_address(101),
     iavl_proof_validation_run_plato_precompile,
 );
+
+/// Iavl proof validation precompile for BSC after Pasteur hardfork
+/// (go-bsc `iavlMerkleProofValidateDeprecated`).
+pub(crate) const IAVL_PROOF_VALIDATION_PASTEUR: Precompile = Precompile::new(
+    PrecompileId::Custom(Cow::Borrowed("BSC_IAVL_PROOF_VALIDATION_PASTEUR")),
+    u64_to_address(101),
+    iavl_proof_validation_run_pasteur_precompile,
+);
+
+/// Run Iavl proof validation after Pasteur hardfork: the base gas is still charged, then the
+/// call fails.
+fn iavl_proof_validation_run_pasteur(_input: &[u8], gas_limit: u64) -> EthPrecompileResult {
+    const IAVL_PROOF_VALIDATION_BASE: u64 = 3_000;
+
+    if IAVL_PROOF_VALIDATION_BASE > gas_limit {
+        return Err(PrecompileHalt::OutOfGas);
+    }
+    Err(PrecompileHalt::other("deprecated"))
+}
 
 /// Run Iavl proof validation.
 fn iavl_proof_validation_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {

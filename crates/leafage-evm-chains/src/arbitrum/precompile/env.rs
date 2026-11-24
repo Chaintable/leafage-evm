@@ -13,6 +13,8 @@ pub struct ArbitrumPrecompileEnv {
     pub current_refund_to: Option<Address>,
     pub allow_debug_precompiles: bool,
     pub current_chain_config: Option<Bytes>,
+    /// ApeChain native yield; see `ArbitrumEvmConfig::ape_yield`.
+    pub ape_yield: bool,
 }
 
 impl Default for ArbitrumPrecompileEnv {
@@ -29,6 +31,7 @@ impl Default for ArbitrumPrecompileEnv {
             current_refund_to: None,
             allow_debug_precompiles: false,
             current_chain_config: None,
+            ape_yield: false,
         }
     }
 }

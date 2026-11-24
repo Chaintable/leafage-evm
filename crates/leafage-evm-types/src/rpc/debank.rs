@@ -42,6 +42,12 @@ pub struct DebankTrace {
     pub pos_in_parent_trace: usize,
     pub self_storage_change: bool,
     pub storage_change: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtraces: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_address: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 impl DebankID for DebankTrace {
@@ -64,6 +70,8 @@ pub struct DebankEvent {
     pub tx_id: H256,
     pub parent_trace_id: String,
     pub pos_in_parent_trace: usize,
+    #[serde(rename = "idx", default, skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u32>,
 }
 
 impl DebankID for DebankEvent {
@@ -179,7 +187,8 @@ where
                 code: DebankErrorCode::EvmRevert as i32,
                 err: decode_revert_reason(&output).unwrap_or("execution revert".to_string()),
                 from_cache: false,
-                result: Bytes::default(),
+                // Custom errors carry no reason string, and EIP-3668 clients need the raw data.
+                result: output,
                 gas_used: gas.tx_gas_used() as i64,
                 time_cost: 0.0,
             },
@@ -223,6 +232,10 @@ pub struct DebankSingleSimulateResult {
     pub code: i32,
     pub err: String,
     pub gas_used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_traces: Option<Vec<DebankTrace>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_events: Option<Vec<DebankEvent>>,
 }
 
 impl<T: Clone + Debug> From<ExecutionResult<T>> for DebankSingleSimulateResult
@@ -450,6 +463,7 @@ impl From<&CallLog> for DebankEvent {
 mod tests {
     use super::super::BlockNumberOrTag;
     use super::*;
+    use revm::context::result::ResultGas;
 
     #[test]
     fn test_block_context() {
@@ -476,5 +490,20 @@ mod tests {
             IDChecker {}.debank_id(),
             "6e24a85785fd5e2688f1a23aee9d88f3".to_string()
         );
+    }
+
+    #[test]
+    fn reverted_call_keeps_revert_data() {
+        // A custom error such as EIP-3668 OffchainLookup has no reason string;
+        // its revert data is all a client has to go on.
+        let output = Bytes::from_static(&[0x55, 0x6f, 0x18, 0x30, 0xde, 0xad]);
+        let res: DebankSingleCallResult = ExecutionResult::<HaltReason>::Revert {
+            gas: ResultGas::default().with_total_gas_spent(21_000),
+            logs: vec![],
+            output: output.clone(),
+        }
+        .into();
+        assert_eq!(res.code, DebankErrorCode::EvmRevert as i32);
+        assert_eq!(res.result, output);
     }
 }

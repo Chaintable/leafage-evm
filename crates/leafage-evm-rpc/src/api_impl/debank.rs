@@ -1,7 +1,8 @@
 use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
-    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    Api, ApiBase, ApiCore, CallExecutor, EvmExecutor, GetHaltReason, GetTransactionError,
+    ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
@@ -43,11 +44,28 @@ fn estimate_gas_limit_cap(
     consensus_cap.min(rpc_cap).min(block_gas_limit)
 }
 
+/// The estimate with the configured buffer applied (a percentage; it takes
+/// effect above 100), kept within `cap`: a transaction sent with more gas than
+/// the cap is rejected, however little of it it uses.
+fn buffered_gas_estimate(estimate: u64, buffer: u64, cap: u64) -> u64 {
+    if buffer <= 100 {
+        return estimate;
+    }
+    let buffered = (estimate as u128 * buffer as u128) / 100;
+    (buffered.min(u64::MAX as u128) as u64)
+        .min(cap)
+        .max(estimate)
+}
+
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 
 pub const CALL_STIPEND_GAS: u64 = 2_300;
 
 pub const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
+
+/// The request-scoped read cache every call of one multicall reads through.
+type MulticallDb<C> =
+    utils::RequestCacheDB<EvmStorageWrapper<<<C as ApiBase>::DB as EvmStorageRead>::StateDB>>;
 
 impl<C> Api<C> {
     pub fn new(core: C) -> Self {
@@ -189,6 +207,9 @@ where
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
         if block.is_none() {
+            if let Some(block) = self.inner.block_zero_at(number) {
+                return Ok(block.clone());
+            }
             if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
@@ -253,11 +274,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
@@ -285,11 +302,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<U256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
@@ -323,11 +336,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<H256> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
@@ -361,11 +370,7 @@ where
         block_ctx: Option<DebankBlockContext>,
     ) -> RpcResult<Bytes> {
         let state = self.debank_get_state_by_ctx_impl(block_ctx)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state.basic_ref(address.0.into()).map_err(|e| {
             rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
         })?;
@@ -398,10 +403,8 @@ where
 
     fn debank_eth_erc20_handle<StateDB>(
         block_header: &Header,
-        state: StateDB,
+        state: EvmStorageWrapper<StateDB>,
         request: CallRequest,
-        ovm_address: Option<H256>,
-        normalize_state_key: bool,
     ) -> DebankSingleCallResult
     where
         StateDB: leafage_evm_storage::StateDB,
@@ -436,11 +439,7 @@ where
                 let user_addr = Address::from(h160_bytes);
                 // get address's native balance
                 let res = Self::get_balance_from_state(
-                    EvmStorageWrapper {
-                        db: state,
-                        ovm_address,
-                        normalize_state_key,
-                    },
+                    state,
                     user_addr,
                 )
                 .unwrap_or_default();
@@ -523,7 +522,8 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &MulticallDb<C>,
+        exec: &mut CallExecutor<'_, C, &MulticallDb<C>>,
         request: CallRequest,
     ) -> RpcResult<DebankSingleCallResult> {
         let start = std::time::Instant::now();
@@ -540,10 +540,8 @@ where
                 if *address == *utils::NATIVE_TOKEN_SENTINEL {
                     let mut res = Self::debank_eth_erc20_handle(
                         &block.header,
-                        state.clone(),
+                        self.inner.wrap_storage(state.clone()),
                         request,
-                        self.inner.evm_cfg().ovm_address.clone(),
-                        self.inner.evm_cfg().normalize_state_key,
                     );
                     res.time_cost = start.elapsed().as_secs_f64();
                     return Ok(res);
@@ -557,7 +555,7 @@ where
             db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        let mut res: DebankSingleCallResult = match self.inner.transact(block_env, db, tx) {
+        let mut res: DebankSingleCallResult = match exec(tx) {
             Ok(result) => result.into(),
             Err(err) => {
                 // Classic capability failures abort this EVM execution, including
@@ -686,11 +684,7 @@ where
         // shared by every call in this multicall: overrides apply once,
         // and repeated keys across calls skip the layered-state walk.
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut cache_db = CacheDB::new(self.inner.wrap_storage(state.clone()));
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
@@ -702,13 +696,10 @@ where
         if let Some(state_override) = state_override {
             super::utils::apply_state_overrides(state_override, &mut cache_db)?;
         }
-        // Prefetch only where the batched reads are real: archive and
-        // MDBX backends fall back to scalar loops, and OVM chains force
-        // scalar account reads, so prefetching there just front-loads
-        // the same point reads — under fast_fail (the SDK default) an
-        // early failure would turn that into O(N) wasted reads. On
-        // MultiGet backends the fast_fail waste is bounded by two
-        // batched reads over the capped prefetch window.
+        // Prefetch only on backends that opt in: archive supports explicit
+        // batches but keeps eager prefetch off pending workload measurements;
+        // MDBX and OVM account reads are scalar. Under fast_fail an early
+        // failure can waste eager reads, so the prefetch window is capped.
         if cache_db.db.supports_batched_reads() {
             Self::prefetch_multi_call_accounts(&requests, &mut cache_db, &cancel_token);
         }
@@ -728,31 +719,28 @@ where
             return Ok(DebankMultiCallResp { stats, results });
         }
         let db = utils::RequestCacheDB::new(cache_db);
-        // run in sequence
-        let mut results: Vec<DebankSingleCallResult> = vec![];
-        for request in requests {
-            if cancel_token.is_cancelled() {
-                return Err(internal_rpc_err(
-                    "multicall cancelled by caller".to_string(),
-                ));
-            }
-            if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
-                let res = results.last().unwrap().clone();
+        // run in sequence, on one executor for the whole multicall
+        let results = self.inner.with_call_executor(&block_env, &db, |exec| {
+            let mut results: Vec<DebankSingleCallResult> = vec![];
+            for request in requests {
+                if cancel_token.is_cancelled() {
+                    return Err(internal_rpc_err(
+                        "multicall cancelled by caller".to_string(),
+                    ));
+                }
+                if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
+                    let res = results.last().unwrap().clone();
+                    results.push(res);
+                    continue;
+                }
+                let res = self.debank_single_call_from_state_impl_inner(
+                    &state, &block, &block_env, &db, exec, request,
+                )?;
                 results.push(res);
-                continue;
             }
-            let res = self.debank_single_call_from_state_impl_inner(
-                &state,
-                &block,
-                &block_env,
-                &db,
-                request,
-            )?;
-            if res.code != 0 {
-                stats.success = false;
-            }
-            results.push(res);
-        }
+            Ok(results)
+        })?;
+        stats.success = results.iter().all(|res| res.code == 0);
         Ok(DebankMultiCallResp { stats, results })
     }
 
@@ -768,7 +756,7 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &MulticallDb<C>,
         requests: &[CallRequest],
         slots: &[OnceLock<RpcResult<DebankSingleCallResult>>],
         next: &AtomicUsize,
@@ -776,7 +764,10 @@ where
         fast_fail: bool,
         cancel_token: &CancellationToken,
     ) {
-        loop {
+        // A caught panic stores an `Err` and lowers `stop_after` to its index,
+        // so this worker skips every later index and never calls `exec` again,
+        // as `with_call_executor` requires.
+        self.inner.with_call_executor(block_env, db, |exec| loop {
             let index = next.fetch_add(1, Ordering::SeqCst);
             if index >= requests.len() || cancel_token.is_cancelled() {
                 break;
@@ -789,6 +780,7 @@ where
                 block,
                 block_env,
                 db,
+                exec,
                 requests[index].clone(),
             );
             let stops = match &res {
@@ -799,7 +791,7 @@ where
             if stops {
                 stop_after.fetch_min(index, Ordering::SeqCst);
             }
-        }
+        })
     }
 
     /// Runs one call of a parallel multicall, turning a panic into the
@@ -814,11 +806,14 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &MulticallDb<C>,
+        exec: &mut CallExecutor<'_, C, &MulticallDb<C>>,
         request: CallRequest,
     ) -> RpcResult<DebankSingleCallResult> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.debank_single_call_from_state_impl_inner(state, block, block_env, db, request)
+            self.debank_single_call_from_state_impl_inner(
+                state, block, block_env, db, exec, request,
+            )
         })) {
             Ok(res) => res,
             Err(_) => {
@@ -976,13 +971,19 @@ where
                 Some(res) => res.clone(),
                 // Unreachable by the stop_after invariant above; serial
                 // catch-up keeps the scan total rather than trusting it.
-                None => self.multicall_run_call_catching_panic(
-                    state,
-                    block,
-                    block_env,
-                    &utils::RequestCacheDB::new(base_db.clone()),
-                    requests[index].clone(),
-                ),
+                None => {
+                    let db = utils::RequestCacheDB::new(base_db.clone());
+                    self.inner.with_call_executor(block_env, &db, |exec| {
+                        self.multicall_run_call_catching_panic(
+                            state,
+                            block,
+                            block_env,
+                            &db,
+                            exec,
+                            requests[index].clone(),
+                        )
+                    })
+                }
             };
             let res = res?;
             if fast_fail && res.code != 0 {
@@ -1074,11 +1075,7 @@ where
             block_hash: block.header.hash,
             success: true,
         };
-        let mut memory_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut memory_db = CacheDB::new(self.inner.wrap_storage(state));
         if let Some(overrides) = block_overrides {
             let header = super::utils::apply_block_overrides(
                 overrides,
@@ -1096,6 +1093,240 @@ where
         }
         let mut tx_index: u64 = 0;
         let mut results: Vec<DebankSingleSimulateResult> = Vec::new();
+
+        if self.inner.evm_cfg().zksync {
+            let sys_ctx = Address::from_slice(
+                super::zksync_era::bootloader::constants::SYSTEM_CONTEXT_ADDRESS.as_bytes(),
+            );
+            let s271: u64 = memory_db
+                .storage_ref(sys_ctx, alloy::primitives::U256::from(271))
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(0);
+            let gas_per_pubdata_byte = if s271 > 0 {
+                s271
+            } else {
+                super::zksync_era::bootloader::constants::DEFAULT_GAS_PER_PUBDATA
+            };
+
+            let s6: u64 = memory_db
+                .storage_ref(sys_ctx, alloy::primitives::U256::from(6))
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(0);
+            let base_fee = if s6 > 0 {
+                s6
+            } else {
+                super::zksync_era::bootloader::constants::DEFAULT_L2_BASE_FEE
+            };
+
+            let s273: u64 = memory_db
+                .storage_ref(sys_ctx, alloy::primitives::U256::from(273))
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(1);
+            let settlement_layer = if s273 > 0 { s273 } else { 1 };
+
+            // Determine previous block values for resetting 0x800b slots 9 and 10
+            let prev_block_state = if block.header.number > 0 {
+                self.inner
+                    .db()
+                    .state_at(BlockId::Number(BlockNumberOrTag::Number(
+                        block.header.number - 1,
+                    )))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            let (reset_slot9, reset_slot10, sim_block_num, sim_block_ts, prev_block_hash) =
+                if let Some(prev_state) = prev_block_state {
+                    let prev_wrap = self.inner.wrap_storage(prev_state);
+                    let p_slot9 = prev_wrap
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(9))
+                        .unwrap_or_default();
+                    let p_slot10 = prev_wrap
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(10))
+                        .unwrap_or_default();
+
+                    let p9_bytes = p_slot9.to_be_bytes::<32>();
+                    let p_num = u128::from_be_bytes(p9_bytes[0..16].try_into().unwrap());
+                    let p_ts = u128::from_be_bytes(p9_bytes[16..32].try_into().unwrap());
+
+                    let p_slot = 11 + (p_num.saturating_sub(1) % 257);
+                    let p_l2_hash = prev_wrap
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(p_slot))
+                        .unwrap_or_default();
+
+                    use tiny_keccak::{Hasher, Keccak};
+                    let mut digest = [0u8; 128];
+                    primitive_types::U256::from(p_num).to_big_endian(&mut digest[0..32]);
+                    primitive_types::U256::from(p_ts).to_big_endian(&mut digest[32..64]);
+                    digest[64..96].copy_from_slice(&p_l2_hash.to_be_bytes::<32>());
+                    digest[96..128].copy_from_slice(&p_slot10.to_be_bytes::<32>());
+
+                    let mut hasher = Keccak::v256();
+                    hasher.update(&digest);
+                    let mut expected_hash = [0u8; 32];
+                    hasher.finalize(&mut expected_hash);
+
+                    (
+                        p_slot9,
+                        p_slot10,
+                        block.header.number,
+                        block.header.timestamp,
+                        primitive_types::H256(expected_hash),
+                    )
+                } else {
+                    // Fallback if previous block state is not available
+                    let cur_slot9 = memory_db
+                        .storage_ref(sys_ctx, alloy::primitives::U256::from(9))
+                        .unwrap_or_default();
+                    let cur_s9_bytes = cur_slot9.to_be_bytes::<32>();
+                    let c_num = u128::from_be_bytes(cur_s9_bytes[0..16].try_into().unwrap());
+                    let c_ts = u128::from_be_bytes(cur_s9_bytes[16..32].try_into().unwrap());
+
+                    let (b_num, b_ts, p_hash) = if c_num > 0 {
+                        use tiny_keccak::{Hasher, Keccak};
+                        let rolling_hash = memory_db
+                            .storage_ref(sys_ctx, alloy::primitives::U256::from(10))
+                            .unwrap_or_default();
+                        let prev_slot = 11 + (c_num.saturating_sub(1) % 257);
+                        let prev_l2_hash = memory_db
+                            .storage_ref(sys_ctx, alloy::primitives::U256::from(prev_slot))
+                            .unwrap_or_default();
+
+                        let mut digest = [0u8; 128];
+                        primitive_types::U256::from(c_num).to_big_endian(&mut digest[0..32]);
+                        primitive_types::U256::from(c_ts).to_big_endian(&mut digest[32..64]);
+                        digest[64..96].copy_from_slice(&prev_l2_hash.to_be_bytes::<32>());
+                        digest[96..128].copy_from_slice(&rolling_hash.to_be_bytes::<32>());
+
+                        let mut hasher = Keccak::v256();
+                        hasher.update(&digest);
+                        let mut expected_hash = [0u8; 32];
+                        hasher.finalize(&mut expected_hash);
+
+                        (
+                            (c_num + 1) as u64,
+                            (c_ts + 1) as u64,
+                            primitive_types::H256(expected_hash),
+                        )
+                    } else {
+                        (
+                            block.header.number,
+                            block.header.timestamp,
+                            primitive_types::H256::zero(),
+                        )
+                    };
+                    (
+                        cur_slot9,
+                        memory_db
+                            .storage_ref(sys_ctx, alloy::primitives::U256::from(10))
+                            .unwrap_or_default(),
+                        b_num,
+                        b_ts,
+                        p_hash,
+                    )
+                };
+
+            for req in txs {
+                if cancel_token.is_cancelled() {
+                    return Err(internal_rpc_err(
+                        "simulate transactions cancelled by caller".to_string(),
+                    ));
+                }
+
+                if let Some(last_res) = results.last() {
+                    if last_res.code != 0 {
+                        results.push(last_res.clone());
+                        continue;
+                    }
+                }
+
+                // Reset SystemContext slots 9 and 10 in memory_db
+                let _ = memory_db.insert_account_storage(
+                    sys_ctx,
+                    alloy::primitives::U256::from(9),
+                    reset_slot9,
+                );
+                let _ = memory_db.insert_account_storage(
+                    sys_ctx,
+                    alloy::primitives::U256::from(10),
+                    reset_slot10,
+                );
+
+                let caller = req.from.unwrap_or_else(|| Address::repeat_byte(0x11));
+                let to = match req.to {
+                    Some(alloy::primitives::TxKind::Call(addr)) => Some(addr),
+                    _ => None,
+                };
+                let data = req.input.clone().into_input().unwrap_or_default();
+                let value = req.value.unwrap_or_default();
+                let gas_limit = req.gas;
+                let nonce = req.nonce;
+                let transaction_type = req.transaction_type;
+                let max_fee_per_gas = req.max_fee_per_gas;
+                let gas_price = req.gas_price;
+                let tx_hash = alloy::primitives::B256::random();
+
+                let sim_res = super::zksync_era::simulate_era_transaction(
+                    &memory_db,
+                    caller,
+                    to,
+                    &data,
+                    value,
+                    gas_limit,
+                    nonce,
+                    transaction_type,
+                    max_fee_per_gas,
+                    gas_price,
+                    sim_block_num,
+                    sim_block_ts,
+                    prev_block_hash,
+                    base_fee,
+                    gas_per_pubdata_byte,
+                    settlement_layer,
+                    tx_hash,
+                    cancel_token.clone(),
+                );
+
+                match sim_res {
+                    Ok(out) => {
+                        if out.single_result.code != 0 {
+                            stats.success = false;
+                        } else {
+                            // Apply storage changes to memory_db for subsequent transactions
+                            for ((contract, key), val) in out.storage_changes {
+                                let c_addr = Address::from_slice(contract.as_bytes());
+                                let mut k_b = [0u8; 32];
+                                key.to_big_endian(&mut k_b);
+                                let k_u256 = alloy::primitives::U256::from_be_bytes(k_b);
+                                let mut v_b = [0u8; 32];
+                                val.to_big_endian(&mut v_b);
+                                let v_u256 = alloy::primitives::U256::from_be_bytes(v_b);
+                                let _ = memory_db.insert_account_storage(c_addr, k_u256, v_u256);
+                            }
+                        }
+                        results.push(out.single_result);
+                    }
+                    Err(e) => {
+                        stats.success = false;
+                        results.push(DebankSingleSimulateResult {
+                            code: 1000,
+                            err: format!("Simulation error: {e}"),
+                            error_traces: Some(Vec::new()),
+                            error_events: Some(Vec::new()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+
+            return Ok(DebankSimulateResp { stats, results });
+        }
+
         for tx in txs {
             if cancel_token.is_cancelled() {
                 return Err(internal_rpc_err(
@@ -1168,11 +1399,7 @@ where
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.nonce = None;
         let mut block_env = block_env_from_block(&block);
-        let mut cache_db = CacheDB::new(EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut cache_db = CacheDB::new(self.inner.wrap_storage(state));
         if let Some(overrides) = block_overrides.clone() {
             utils::apply_block_overrides(
                 overrides,
@@ -1185,6 +1412,43 @@ where
         // the request-scoped cache lets every retry after the first read
         // its state from memory instead of re-walking the layered state.
         let memory_db = utils::RequestCacheDB::new(cache_db);
+
+        if self.inner.evm_cfg().zksync {
+            let caller = request.from.unwrap_or_else(|| Address::repeat_byte(0x11));
+            let to = match request.to {
+                Some(alloy::primitives::TxKind::Call(addr)) => Some(addr),
+                _ => None,
+            };
+            let data = request.input.clone().into_input().unwrap_or_default();
+            let value = request.value.unwrap_or_default();
+            let block_number = block_env.number.to();
+            let block_timestamp = block_env.timestamp.to();
+            let base_fee = u64::try_from(block_env.basefee).map_err(|_| {
+                crate::error::invalid_params_rpc_err("ZKsync Era baseFeePerGas exceeds u64")
+            })?;
+            let gas_per_pubdata_byte = 0;
+            let block_hash = block.header.hash;
+
+            let gas = crate::api_impl::zksync_era::estimate_era_gas(
+                &memory_db,
+                caller,
+                to,
+                &data,
+                value,
+                block_number,
+                block_timestamp,
+                Some(block_hash),
+                base_fee,
+                gas_per_pubdata_byte,
+                cancel_token,
+            )
+            .map_err(|e| {
+                rpc_error_with_code(DebankErrorCode::EvmFailed as i32, e)
+            })?;
+
+            return Ok(U256::from(gas));
+        }
+
         // Keep a copy of gas related request values
         let tx_request_gas_limit = request.gas;
         // the gas limit of the corresponding block
@@ -1357,13 +1621,11 @@ where
             mid_gas_limit = ((highest_gas_limit as u128 + lowest_gas_limit as u128) / 2) as u64;
         }
 
-        let buffer = self.inner.evm_cfg().estimate_gas_buffer;
-        let final_gas = if buffer > 100 {
-            let buffered = (highest_gas_limit as u128 * buffer as u128) / 100;
-            buffered.min(u64::MAX as u128) as u64
-        } else {
-            highest_gas_limit
-        };
+        let final_gas = buffered_gas_estimate(
+            highest_gas_limit,
+            self.inner.evm_cfg().estimate_gas_buffer,
+            max_gas_limit,
+        );
 
         tx.set_gas_limit(final_gas);
         let l1_overhead =
@@ -1434,7 +1696,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::estimate_gas_limit_cap;
+    use super::{buffered_gas_estimate, estimate_gas_limit_cap};
+
+    #[test]
+    fn the_estimate_buffer_stays_within_the_gas_cap() {
+        // No buffer at or below 100 percent.
+        assert_eq!(buffered_gas_estimate(100_000, 0, 16_777_216), 100_000);
+        assert_eq!(buffered_gas_estimate(100_000, 100, 16_777_216), 100_000);
+        assert_eq!(buffered_gas_estimate(100_000, 120, 16_777_216), 120_000);
+        // 16M with a 20% buffer is 19.2M, above the EIP-7825 cap.
+        assert_eq!(
+            buffered_gas_estimate(16_000_000, 120, 16_777_216),
+            16_777_216
+        );
+        assert_eq!(buffered_gas_estimate(u64::MAX, 200, u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn zero_rpc_gas_cap_is_unlimited_but_consensus_and_block_caps_still_apply() {
@@ -1533,6 +1809,21 @@ fn map_historical_error(
         None => rpc_error_with_code(
             DebankErrorCode::InternalError as i32,
             format!("Historical RPC error: {}", historical_err),
+        ),
+    }
+}
+
+#[inline]
+fn map_upstream_error(err: jsonrpsee::core::ClientError) -> jsonrpsee::types::ErrorObjectOwned {
+    if is_historical_rpc_overloaded(&err) {
+        return historical_rpc_overloaded_error();
+    }
+
+    match err {
+        jsonrpsee::core::ClientError::Call(err_obj) => err_obj,
+        other => rpc_error_with_code(
+            DebankErrorCode::InternalError as i32,
+            format!("Upstream RPC error: {}", other),
         ),
     }
 }
@@ -1702,6 +1993,14 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<DebankSimulateResp> {
+        if self.inner.forward_simulate() {
+            if let Some(upstream_client) = self.inner.upstream_client() {
+                return upstream_client
+                    .simulate_transactions(requests, block_ctx, block_overrides)
+                    .await
+                    .map_err(map_upstream_error);
+            }
+        }
         match self
             .debank_simulate_transactions_impl(
                 requests.clone(),
@@ -1749,7 +2048,18 @@ where
                 return historical_client
                     .get_block_by_height(height)
                     .await
-                    .map_err(|error| map_historical_error(None, error));
+                    .or_else(|error| {
+                        let placeholder = self.inner.block_zero_at(block_number);
+                        match (&error, placeholder) {
+                            (jsonrpsee::core::ClientError::Call(err), Some(block))
+                                if err.code() == DebankErrorCode::BlockNotFound as i32
+                                    || err.code() == DebankErrorCode::InvalidBlockID as i32 =>
+                            {
+                                Ok(block.clone())
+                            }
+                            _ => Err(map_historical_error(None, error)),
+                        }
+                    });
             }
         }
 
@@ -1794,6 +2104,14 @@ where
         block_ctx: Option<DebankBlockContext>,
         block_overrides: Option<BlockOverrides>,
     ) -> RpcResult<U256> {
+        if self.inner.forward_estimategas() {
+            if let Some(upstream_client) = self.inner.upstream_client() {
+                return upstream_client
+                    .estimate_gas(request, block_ctx, block_overrides)
+                    .await
+                    .map_err(map_upstream_error);
+            }
+        }
         match self
             .debank_estimate_gas_impl(request.clone(), block_ctx.clone(), block_overrides.clone())
             .await

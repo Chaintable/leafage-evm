@@ -1,6 +1,7 @@
-//! Celo L2 execution. L1 history and CIP-64 fee currencies are not handled here.
+//! Celo execution, selected through one evm-type and an explicit L1/L2 mode.
 
 pub mod evm;
+pub mod l1;
 
 use leafage_evm_types::{BlockEnv, CfgEnv, OpSpecId};
 use revm::primitives::{address, Address};
@@ -9,6 +10,36 @@ pub const CELO_CHAIN_ID: u64 = 42220;
 pub const CELO_TOKEN: Address = address!("471ece3750da237f93b8e339c536989b8978a438");
 pub const MAX_CODE_SIZE: usize = 65_536;
 pub const L2_MIGRATION_BLOCK: u64 = 31_056_500;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CeloExecutionMode {
+    L1,
+    #[default]
+    L2,
+}
+
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CeloEvmConfig {
+    #[serde(default)]
+    pub execution_mode: CeloExecutionMode,
+}
+
+#[derive(Clone, Debug)]
+pub enum CeloCfgEnv {
+    L1(CfgEnv<leafage_evm_types::MainnetSpecId>),
+    L2(CfgEnv<OpSpecId>),
+}
+
+impl CeloCfgEnv {
+    pub fn chain_id(&self) -> u64 {
+        match self {
+            Self::L1(cfg) => cfg.chain_id,
+            Self::L2(cfg) => cfg.chain_id,
+        }
+    }
+}
 
 // celo-org/celo-kona@9a608fbb, crates/celo-reth/res/genesis/mainnet.toml.
 const ISTHMUS_TIMESTAMP: u64 = 1_752_073_200;

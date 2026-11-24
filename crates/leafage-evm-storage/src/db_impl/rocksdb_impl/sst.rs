@@ -70,7 +70,29 @@ impl<'a> SstSink<'a> {
         }
     }
 
-    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    /// Append a version to a timestamped CF's file. Unlike [`Self::put`] it
+    /// never rolls by itself: the caller rolls between keys with
+    /// [`Self::roll_if_full`], so no two files share a key.
+    pub(crate) fn put_with_ts(&mut self, key: &[u8], ts: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.open_writer()?;
+        self.writer.as_mut().unwrap().put_with_ts(key, ts, value)?;
+        self.has_rows = true;
+        Ok(())
+    }
+
+    /// Finish the current file if it has reached the roll size.
+    pub(crate) fn roll_if_full(&mut self) -> Result<(), Error> {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.file_size() >= self.roll_bytes)
+        {
+            self.finish_file()?;
+        }
+        Ok(())
+    }
+
+    fn open_writer(&mut self) -> Result<(), Error> {
         if self.writer.is_none() {
             let p = self
                 .tmp_dir
@@ -82,6 +104,11 @@ impl<'a> SstSink<'a> {
             self.cur_path = p;
             self.has_rows = false;
         }
+        Ok(())
+    }
+
+    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+        self.open_writer()?;
         let w = self.writer.as_mut().unwrap();
         w.put(key, value)?;
         self.has_rows = true;

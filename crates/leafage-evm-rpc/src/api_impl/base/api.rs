@@ -1,6 +1,6 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::base::evm::{create_base_evm_from_state, create_base_txn_env};
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
+use crate::api_impl::core::{ApiCore, CallExecutor, EvmExecutor, GasFeeHandler};
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::base::BaseHardfork;
@@ -9,7 +9,6 @@ use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
 use revm::context::result::EVMError;
 use revm::context::{result::ExecutionResult, BlockEnv, TxEnv};
 use revm::inspector::NoOpInspector;
-use revm::ExecuteEvm;
 use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
@@ -62,7 +61,29 @@ where
             state,
             NoOpInspector {},
         );
-        evm.transact(tx).map(|res| res.result.into())
+        evm.transact_read_only(tx).map(Into::into)
+    }
+
+    /// Keeps one EVM for the whole run: the L1 block info it fetches for the
+    /// block on the first call is reused by the later ones, and its frame stack
+    /// and instruction table are built once instead of per call.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + std::fmt::Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let mut evm = create_base_evm_from_state(
+            block_env.clone(),
+            self.evm_cfg.cfg.clone(),
+            state,
+            NoOpInspector {},
+        );
+        f(&mut |tx| evm.transact_read_only(tx))
     }
 
     fn inspect_tx_commit<

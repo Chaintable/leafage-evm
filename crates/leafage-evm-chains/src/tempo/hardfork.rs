@@ -23,6 +23,7 @@ pub enum TempoHardfork {
     T10,
     T11,
     T12,
+    T13,
 }
 
 impl TempoHardfork {
@@ -51,6 +52,7 @@ impl TempoHardfork {
             Self::T10 => OfficialHardfork::T10,
             Self::T11 => OfficialHardfork::T11,
             Self::T12 => OfficialHardfork::T12,
+            Self::T13 => OfficialHardfork::T13,
         }
     }
 
@@ -102,6 +104,14 @@ impl TempoHardfork {
     pub const fn is_t12(&self) -> bool {
         self.as_official().is_t12()
     }
+    pub const fn is_t13(&self) -> bool {
+        self.as_official().is_t13()
+    }
+
+    /// TIP-1115 fallback fee tokens, in the order they are tried.
+    pub const fn fallback_fee_tokens(&self) -> &'static [alloy::primitives::Address] {
+        self.as_official().fallback_fee_tokens()
+    }
 
     pub const fn expiring_nonce_set_capacity(&self) -> u32 {
         self.as_official().expiring_nonce_set_capacity()
@@ -138,6 +148,7 @@ impl TryFrom<OfficialHardfork> for TempoHardfork {
             OfficialHardfork::T10 => Self::T10,
             OfficialHardfork::T11 => Self::T11,
             OfficialHardfork::T12 => Self::T12,
+            OfficialHardfork::T13 => Self::T13,
             _ => return Err(fork),
         })
     }
@@ -181,6 +192,8 @@ mod tests {
     const MAINNET_T11_TIME: u64 = 1_789_048_800;
     // T12 activates on mainnet: 2026-10-13 14:00 UTC (official v1.16.0).
     const MAINNET_T12_TIME: u64 = 1_791_900_000;
+    // T13 activates on mainnet: 2026-11-03 15:00 UTC (official tempo/v1.17.0).
+    const MAINNET_T13_TIME: u64 = 1_793_718_000;
 
     #[test]
     fn official_mapping_preserves_legacy_default_and_covers_every_scheduled_fork() {
@@ -194,12 +207,12 @@ mod tests {
             Ok(TempoHardfork::Genesis)
         );
         assert_eq!(
-            TempoHardfork::try_from(OfficialHardfork::T12),
-            Ok(TempoHardfork::T12)
+            TempoHardfork::try_from(OfficialHardfork::T13),
+            Ok(TempoHardfork::T13)
         );
         assert_eq!(
             OfficialHardfork::from_chain_and_timestamp(4217, u64::MAX),
-            Some(OfficialHardfork::T12)
+            Some(OfficialHardfork::T13)
         );
         assert_eq!(
             OfficialHardfork::from_chain_and_timestamp(999, u64::MAX),
@@ -215,9 +228,9 @@ mod tests {
                         *fork
                     }
                 ),
-                // Forks after T12 are not implemented and must stay unscheduled on mainnet.
+                // Forks after T13 are not implemented and must stay unscheduled on mainnet.
                 Err(unsupported) => {
-                    assert!(unsupported.is_t13(), "{unsupported:?}");
+                    assert!(unsupported.is_t14(), "{unsupported:?}");
                     assert_eq!(unsupported.mainnet_activation_timestamp(), None);
                 }
             }
@@ -321,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn from_timestamp_t5_through_t12_boundaries() {
+    fn from_timestamp_t5_through_t13_boundaries() {
         let boundaries = [
             (MAINNET_T5_TIME, TempoHardfork::T4, TempoHardfork::T5),
             (MAINNET_T6_TIME, TempoHardfork::T5, TempoHardfork::T6),
@@ -331,6 +344,7 @@ mod tests {
             (MAINNET_T10_TIME, TempoHardfork::T9, TempoHardfork::T10),
             (MAINNET_T11_TIME, TempoHardfork::T10, TempoHardfork::T11),
             (MAINNET_T12_TIME, TempoHardfork::T11, TempoHardfork::T12),
+            (MAINNET_T13_TIME, TempoHardfork::T12, TempoHardfork::T13),
         ];
 
         for (timestamp, before, active) in boundaries {
@@ -340,7 +354,7 @@ mod tests {
         }
 
         // Future timestamps select the latest scheduled fork, never an unscheduled one.
-        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T12);
+        assert_eq!(TempoHardfork::from_timestamp(u64::MAX), TempoHardfork::T13);
     }
 
     #[test]
@@ -456,6 +470,22 @@ mod tests {
     }
 
     #[test]
+    fn is_methods_on_t13() {
+        let hf = TempoHardfork::T13;
+        assert!(hf.is_t12());
+        assert!(hf.is_t13());
+        assert!(!TempoHardfork::T12.is_t13());
+    }
+
+    #[test]
+    fn fallback_fee_tokens_add_ousd_at_t13() {
+        let path_usd = alloy::primitives::address!("0x20C0000000000000000000000000000000000000");
+        let ousd = alloy::primitives::address!("0x20c0000000000000000000006a37da5c996874be");
+        assert_eq!(TempoHardfork::T12.fallback_fee_tokens(), [path_usd]);
+        assert_eq!(TempoHardfork::T13.fallback_fee_tokens(), [path_usd, ousd]);
+    }
+
+    #[test]
     fn default_is_latest_activated() {
         let hf = TempoHardfork::default();
         assert_eq!(hf, TempoHardfork::T10);
@@ -510,6 +540,7 @@ mod tests {
             TempoHardfork::T10,
             TempoHardfork::T11,
             TempoHardfork::T12,
+            TempoHardfork::T13,
         ] {
             assert_eq!(SpecId::from(hardfork), SpecId::OSAKA);
         }

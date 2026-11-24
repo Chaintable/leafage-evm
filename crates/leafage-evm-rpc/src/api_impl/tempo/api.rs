@@ -11,7 +11,7 @@ use leafage_evm_chains::tempo::tx::TempoTxEnv;
 use leafage_evm_chains::tempo::{TempoEvm, TempoInvalidTransaction};
 use leafage_evm_chains::tempo::hardfork::TempoHardfork;
 use leafage_evm_types::{
-    BlockEnv, BlockInfo, CallRequest, DebankErrorCode, TempoKeyAuthGasInfo,
+    BlockEnv, BlockInfo, CallRequest, DebankErrorCode, TempoCallExtension, TempoKeyAuthGasInfo,
     TempoPrimitiveSignatureInfo,
 };
 use revm::context::result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction};
@@ -370,13 +370,11 @@ fn parse_tempo_authorization(
 /// The caller fills a missing nonce from state first, as the official node does.
 fn resolve_fee_payer(
     request: &CallRequest,
+    te: &TempoCallExtension,
     auth_list: &[leafage_evm_chains::tempo::tx::TempoAuthGas],
     hardfork: TempoHardfork,
 ) -> RpcResult<Option<alloy::primitives::Address>> {
     use leafage_evm_chains::tempo::fee_payer::{self as fp, Call};
-    let Some(te) = &request.tempo else {
-        return Ok(None);
-    };
     let Some(signature) = &te.fee_payer_signature else {
         return Ok(te.fee_payer);
     };
@@ -477,11 +475,11 @@ where
         };
         use revm::primitives::TxKind;
 
-        // The shared CallRequest keeps malformed Tempo fields for other chains to
-        // ignore; Tempo rejects them instead of running an ordinary transaction.
-        if let Some(invalid) = request.tempo.as_ref().and_then(|te| te.invalid.as_ref()) {
-            return Err(invalid_params_rpc_err(invalid.error.clone()));
-        }
+        // Only the selected chain interprets the opaque request extensions.
+        let te: TempoCallExtension = request
+            .other
+            .deserialize_as()
+            .map_err(|error| invalid_params_rpc_err(error.to_string()))?;
 
         // Reject ambiguous signed bytes before recovering the payer or filling defaults.
         // Like the official Call deserializer, inner calls take input over data unchecked.
@@ -493,29 +491,17 @@ where
 
         // Extract Tempo-specific fields before consuming the request.
         let hardfork = TempoHardfork::from_timestamp(block_env.timestamp.saturating_to());
-        let auth_list = request
-            .tempo
-            .as_ref()
-            .and_then(|te| te.tempo_authorization_list.as_deref())
+        let auth_list = te
+            .tempo_authorization_list
+            .as_deref()
             .unwrap_or_default()
             .iter()
             .map(parse_tempo_authorization)
             .collect::<RpcResult<Vec<_>>>()?;
-        let te = request.tempo.clone().unwrap_or_default();
-        let tempo_calls = te.tempo_calls;
-        let nonce_key = te.nonce_key;
-        let key_type = te.key_type;
-        let key_data = te.key_data;
-        let key_id = te.key_id;
-        let key_authorization = te.key_authorization;
-        let tempo_authorization_list = te.tempo_authorization_list;
-        let fee_token = te.fee_token;
-        let valid_after = te.valid_after;
-        let valid_before = te.valid_before;
 
         // Signed authorizations are checked by the handler, in the official order.
         // The Leafage-only signature-less gas shape never reaches that check.
-        if key_authorization.as_ref().is_some_and(|authorization| {
+        if te.key_authorization.as_ref().is_some_and(|authorization| {
             authorization.witness.is_some() && authorization.signature.is_none()
         }) && !hardfork.is_t5()
         {
@@ -529,7 +515,7 @@ where
         // A sponsor signature binds the original nonce; preserve that signed path.
         // A missing nonce is filled from state before the sponsor is recovered, as
         // the official create_txn_env does (2D/expiring nonce, else account nonce).
-        if let Some(nk) = nonce_key.filter(|nk| !nk.is_zero()) {
+        if let Some(nk) = te.nonce_key.filter(|nk| !nk.is_zero()) {
             if te.fee_payer_signature.is_none() || request.inner.nonce.is_none() {
                 use leafage_evm_chains::tempo::precompile::storage_types::StorageKey;
                 use leafage_evm_chains::tempo::precompile::NONCE_PRECOMPILE_ADDRESS;
@@ -553,7 +539,18 @@ where
                 .unwrap_or_default();
             request.inner.nonce = Some(nonce);
         }
-        let fee_payer = resolve_fee_payer(&request, &auth_list, hardfork)?;
+        let fee_payer = resolve_fee_payer(&request, &te, &auth_list, hardfork)?;
+
+        let tempo_calls = te.tempo_calls;
+        let nonce_key = te.nonce_key;
+        let key_type = te.key_type;
+        let key_data = te.key_data;
+        let key_id = te.key_id;
+        let key_authorization = te.key_authorization;
+        let tempo_authorization_list = te.tempo_authorization_list;
+        let fee_token = te.fee_token;
+        let valid_after = te.valid_after;
+        let valid_before = te.valid_before;
 
         // For 2D-nonce AA (nonceKey > 0) the request/auto-filled nonce — not the
         // account's protocol nonce — drives TIP-1000 gas: a nonce of 0 adds the

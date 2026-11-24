@@ -211,7 +211,7 @@ async fn run_differential(serial_addr: &'static str, parallel_addr: &'static str
 
     let call = |to: Address| CallRequest {
         inner: TransactionRequest::default().from(alice).to(to),
-        tempo: None,
+        other: Default::default(),
     };
     let ok_requests: Vec<CallRequest> = (0..CALLS)
         .filter(|n| *n != REVERT_AT)

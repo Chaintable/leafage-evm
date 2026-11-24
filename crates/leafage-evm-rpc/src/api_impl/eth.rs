@@ -5,9 +5,9 @@ use crate::error::{block_lookup_err, database_rpc_err, internal_rpc_err, rpc_err
 use alloy::rpc::types::state::StateOverride;
 use alloy::sol_types::{decode_revert_reason, SolValue};
 use jsonrpsee::core::RpcResult;
-use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead, EvmStorageWrapper};
+use leafage_evm_storage::{BlockContext, BlockIndex, EvmStorageRead};
 use leafage_evm_types::{
-    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, BlockId,
+    block_env_from_block, calc_next_block_base_fee, Address, BaseFeeParams, Block, BlockId, BlockInfo,
     BlockNumberOrTag, BlockOverrides, Bytes, CallRequest, DebankErrorCode, Header, JsonStorageKey,
     MultiCallErrorCode, MultiCallResp, MultiCallStats, SingleCallResult, H256, KECCAK256_EMPTY,
     U256,
@@ -16,8 +16,16 @@ use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
 use serde_json::Value;
 use std::error::Error;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+
+/// The account an ERC-20 `balanceOf(address)` call asks about: the low 20
+/// bytes of the word after the selector. `None` when the calldata is shorter
+/// than that; it may be longer.
+fn balance_of_account(data: &[u8]) -> Option<Address> {
+    data.get(16..36).map(Address::from_slice)
+}
 
 impl<C> Api<C>
 where
@@ -67,11 +75,7 @@ where
             .block_info_arc()
             .map_err(|e| database_rpc_err(e.to_string()))?;
         let mut block_env = block_env_from_block(&block);
-        let mut db = CacheDB::new(EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        });
+        let mut db = CacheDB::new(self.inner.wrap_storage(state.clone()));
         if let Some(overrides) = block_overrides {
             super::utils::apply_block_overrides(
                 overrides,
@@ -149,8 +153,7 @@ where
             }
             // balanceOf
             if data[0..4] == [0x70, 0xa0, 0x82, 0x31] {
-                // 4(selector) + 32(user addr)
-                if data.len() < 36 {
+                let Some(user_addr) = balance_of_account(data) else {
                     return SingleCallResult {
                         code: MultiCallErrorCode::CodeTxArgs as i32, // tx arg error
                         err: "".to_string(),
@@ -159,11 +162,7 @@ where
                         gas_used: 0,
                         time_cost: 0.0,
                     };
-                }
-
-                let mut h160_bytes = [0u8; 20];
-                h160_bytes.copy_from_slice(&data[16..]);
-                let user_addr = Address::from(h160_bytes);
+                };
 
                 // get address's native balance
                 let res = Self::get_balance_from_state(state, user_addr)
@@ -273,11 +272,7 @@ where
         let block = state
             .block_info_arc()
             .map_err(|e| database_rpc_err(e.to_string()))?;
-        let state = EvmStorageWrapper {
-            db: state.clone(),
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state.clone());
         let block_env = block_env_from_block(&block);
         let mut stats = MultiCallStats {
             block_num: block.header.number,
@@ -368,11 +363,7 @@ where
     fn get_balance_inner(&self, address: Address, block_id: BlockId) -> RpcResult<U256> {
         let state = self.resolve_state(block_id)?;
         Self::get_balance_from_state(
-            EvmStorageWrapper {
-                db: state,
-                ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-                normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-            },
+            self.inner.wrap_storage(state),
             address,
         )
     }
@@ -392,12 +383,31 @@ where
         .map_err(|e| internal_rpc_err(e.to_string()))?
     }
 
+    fn block_zero_fallback(&self, block_id: BlockId) -> Option<Arc<BlockInfo>> {
+        let BlockId::Number(BlockNumberOrTag::Number(height)) = block_id else {
+            return None;
+        };
+        let metadata = self.inner.block_zero_at(height)?;
+        let mut block = BlockInfo::new(Block::empty(Default::default()));
+        let header = &mut block.inner.header;
+        header.hash = metadata.id;
+        header.inner.number = metadata.height;
+        header.inner.parent_hash = metadata.parent_id;
+        header.inner.timestamp = metadata.timestamp;
+        header.inner.beneficiary = metadata.miner;
+        header.inner.base_fee_per_gas = Some(metadata.base_fee_per_gas);
+        header.inner.gas_limit = metadata.gas_limit;
+        header.inner.gas_used = metadata.gas_used;
+        Some(Arc::new(block))
+    }
+
     fn get_block_by_id_inner(&self, block_id: BlockId, _full: bool) -> RpcResult<Option<Value>> {
         let block = self
             .inner
             .db()
             .get_block_by_id_arc(block_id)
             .map_err(|e| block_lookup_err(block_id, e))?
+            .or_else(|| self.block_zero_fallback(block_id))
             .ok_or_else(|| self.block_unavailable_err(block_id))?;
         let value = serde_json::to_value(block).map_err(|e| internal_rpc_err(e.to_string()))?;
         Ok(Some(value))
@@ -416,11 +426,7 @@ where
 
     fn get_code_inner(&self, address: Address, block_number: BlockId) -> RpcResult<Bytes> {
         let state = self.resolve_state(block_number)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| database_rpc_err(e.to_string()))?;
@@ -455,11 +461,7 @@ where
         block_number: BlockId,
     ) -> RpcResult<H256> {
         let state = self.resolve_state(block_number)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let storage = state
             .storage_ref(address.0.into(), U256::from_be_bytes(index.into()))
             .map_err(|e| {
@@ -493,11 +495,7 @@ where
         block_number: BlockId,
     ) -> RpcResult<U256> {
         let state = self.resolve_state(block_number)?;
-        let state = EvmStorageWrapper {
-            db: state,
-            ovm_address: self.inner.evm_cfg().ovm_address.clone(),
-            normalize_state_key: self.inner.evm_cfg().normalize_state_key,
-        };
+        let state = self.inner.wrap_storage(state);
         let account = state
             .basic_ref(address.0.into())
             .map_err(|e| database_rpc_err(e.to_string()))?;
@@ -607,5 +605,26 @@ where
     async fn base_fee(&self, block_number: Option<BlockId>) -> RpcResult<u128> {
         self.base_fee_impl(block_number.unwrap_or(BlockId::Number(BlockNumberOrTag::Latest)))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balance_of_account_reads_the_argument_word() {
+        let account = Address::repeat_byte(0xab);
+        let mut data = vec![0x70, 0xa0, 0x82, 0x31];
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(account.as_slice());
+        assert_eq!(balance_of_account(&data), Some(account));
+
+        // Calldata past the argument word used to panic.
+        data.extend_from_slice(&[0xff; 32]);
+        assert_eq!(balance_of_account(&data), Some(account));
+
+        assert_eq!(balance_of_account(&data[..35]), None);
+        assert_eq!(balance_of_account(&data[..4]), None);
     }
 }

@@ -162,9 +162,14 @@ impl ArbitrumPrecompile {
         arbos_version >= self.min_arbos_version()
     }
 
-    pub(super) fn purity(self, data: &[u8]) -> Option<ArbitrumPrecompilePurity> {
+    pub(super) fn purity(self, data: &[u8], ape_yield: bool) -> Option<ArbitrumPrecompilePurity> {
         use ArbitrumPrecompilePurity::{Payable, Pure, View, Write};
 
+        if ape_yield {
+            if let Some(purity) = super::ape::purity(self, data) {
+                return Some(purity);
+            }
+        }
         match self {
             Self::ArbSys => IArbSys::IArbSysCalls::abi_decode(data)
                 .ok()

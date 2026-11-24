@@ -224,7 +224,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
             .input(TransactionInput::new(Bytes::from(calldata.clone()))),
-        tempo: None,
+        other: Default::default(),
     };
     let ticket_id = EthApiClient::call(
         &client,
@@ -239,7 +239,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
 
     let read_request = CallRequest {
         inner: TransactionRequest::default().from(sender).to(target),
-        tempo: None,
+        other: Default::default(),
     };
     let simulation = DebankApiClient::simulate_transactions(
         &client,
@@ -305,7 +305,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             &client,
             CallRequest {
                 inner: tx,
-                tempo: None,
+                other: Default::default(),
             },
             None,
             None,
@@ -325,7 +325,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             .to(NODE_INTERFACE_ADDRESS)
             .gas_limit(21_000)
             .input(TransactionInput::new(Bytes::from(calldata.clone()))),
-        tempo: None,
+        other: Default::default(),
     };
     assert!(EthApiClient::call(
         &client,
@@ -352,7 +352,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             .from(sender)
             .to(NODE_INTERFACE_ADDRESS)
             .input(TransactionInput::new(Bytes::from(reverting_calldata))),
-        tempo: None,
+        other: Default::default(),
     };
     assert!(EthApiClient::call(
         &client,
@@ -387,7 +387,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             // A real Nitro transaction with this declared gas limit was included
             // successfully and also replays successfully at its parent block.
             .gas_limit(20_000_000),
-        tempo: None,
+        other: Default::default(),
     };
     EthApiClient::call(
         &client,
@@ -460,7 +460,10 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             ),
             TransactionRequest::default().from(sender).to(target),
         ])
-        .map(|inner| CallRequest { inner, tempo: None })
+        .map(|inner| CallRequest {
+            inner,
+            ..Default::default()
+        })
         .collect();
     for parallel in [false, true] {
         let response = DebankApiClient::contract_multi_call(
@@ -521,7 +524,10 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
                 default_call.clone(),
             ]
             .into_iter()
-            .map(|inner| CallRequest { inner, tempo: None })
+            .map(|inner| CallRequest {
+                inner,
+                ..Default::default()
+            })
             .collect(),
             None,
             None,
@@ -581,7 +587,7 @@ async fn arbitrum_rpc_estimation_matches_nitro_gas_semantics() {
             inner: TransactionRequest::default()
                 .from(sender)
                 .to(high_gas_target),
-            tempo: None,
+            other: Default::default(),
         },
         None,
         None,

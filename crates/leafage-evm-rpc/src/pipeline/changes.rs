@@ -71,11 +71,7 @@ impl<DB: EvmStorageRead> StorageSlots for LazyState<DB> {
                     .ok_or_else(|| {
                         anyhow::anyhow!("the state of block {hash} is not in the archive")
                     })?;
-                self.state.get_or_init(|| EvmStorageWrapper {
-                    db: state,
-                    ovm_address: None,
-                    normalize_state_key: false,
-                })
+                self.state.get_or_init(|| EvmStorageWrapper::new(state))
             }
         };
         state.storage_slots(address)

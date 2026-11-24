@@ -10,19 +10,22 @@ use crate::utils::{
 use crate::warm::Warmup;
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use leafage_evm_chains::arbitrum::ArbitrumHardfork;
+use leafage_evm_chains::arbitrum::{ArbitrumEvmConfig, ArbitrumHardfork};
 use leafage_evm_chains::arc::{ArcChainConfig, ARC_MAINNET_CHAIN_ID};
 use leafage_evm_chains::base::BaseHardfork;
-use leafage_evm_chains::celo::{CELO_CHAIN_ID, MAX_CODE_SIZE};
+use leafage_evm_chains::celo::{
+    CeloCfgEnv, CeloEvmConfig, CeloExecutionMode, CELO_CHAIN_ID, MAX_CODE_SIZE,
+};
 use leafage_evm_chains::citrea::CitreaHardfork;
 use leafage_evm_chains::hemi::HemiHardfork;
 #[cfg(target_os = "linux")]
 use leafage_evm_rpc::InterceptorConfig;
 use leafage_evm_rpc::{build_op_custom_config, ApiBuilder, MultiChainCfgEnv, TokenCollector};
 use leafage_evm_storage::{
-    MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig, StorageKind,
+    ArchiveSchema, MultiStorage, StateDBProvider, StateDBWrapper, StateTree, StateTreeConfig,
+    StorageKind,
 };
-use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, MainnetSpecId, OpSpecId};
+use leafage_evm_types::{Address, BlockId, BlockNumberOrTag, CfgEnv, DebankBlock, MainnetSpecId, OpSpecId};
 use metrics::gauge;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -46,8 +49,11 @@ pub struct Command {
         long,
         value_parser = [
             "mainnet",
+            "hyper",
+            "zksync",
             "arc",
             "arbitrum",
+            "ape",
             "op",
             "base",
             "bsc",
@@ -68,8 +74,12 @@ pub struct Command {
     )]
     evm_type: String,
 
-    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode.
-    /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules)),
+    /// Chain-specific EVM parameters as JSON, including Arbitrum execution_mode
+    /// and Celo execution_mode ("l1" for historical mainnet, "l2" by default).
+    /// OP supports op_spec_id (an OP fork name such as "Jovian"; omitted keeps Karst (Osaka rules);
+    /// chains with a built-in fork schedule, OP Mainnet 10, Soneium 1868, Unichain 130,
+    /// Cyber 7560, Fraxtal 252, Mode 34443, BOB 60808, World Chain 480, Manta Pacific 169
+    /// and Katana 747474, follow it per block instead),
     /// plus limit_contract_code_size and limit_contract_initcode_size overrides in bytes;
     /// initcode also accepts "unlimited" and otherwise defaults to 2 * code size.
     ///
@@ -288,6 +298,11 @@ pub struct Command {
     #[arg(long, default_value = "0")]
     genesis_number: u64,
 
+    /// JSON block metadata for missing height zero in getBlockByHeight and eth_getBlockByNumber.
+    /// Requires a nonzero genesis number.
+    #[arg(long, value_parser = parse_rpc_block_zero, value_name = "JSON")]
+    rpc_block_zero: Option<DebankBlock>,
+
     /// The size of the task queue for the s3 updater.
     /// Default: 256
     ///
@@ -310,8 +325,31 @@ pub struct Command {
     #[arg(long)]
     historical_height: Option<u64>,
 
+    /// Upstream RPC URL for forwarding requests
+    #[arg(long, value_name = "URL")]
+    upstream_url: Option<String>,
+
+    /// Whether to forward simulateTransactions requests to the upstream RPC
+    #[arg(long, default_value_t = false)]
+    forward_simulate: bool,
+
+    /// Whether to forward estimateGas requests to the upstream RPC
+    #[arg(long, default_value_t = false)]
+    forward_estimategas: bool,
+
+    /// Resolve HyperEVM's HyperCore read precompiles (0x800..=0x814) through --upstream-url
+    /// during simulateTransactions instead of treating them as empty accounts.
+    ///
+    /// The state behind those precompiles lives in HyperCore and never reaches the EVM
+    /// archive, so a simulated call that reads it can only be answered by a node that
+    /// holds it, typically a local hl-node (for example http://localhost:3001/evm).
+    /// Unlike --forward-simulate this keeps execution, tracing and state overrides local;
+    /// only the read-precompile calls themselves are forwarded.
+    #[arg(long, default_value_t = false)]
+    forward_read_precompiles: bool,
+
     /// Upstream RPC of the chain serving full block bodies. Enables
-    /// `trace_debankBlock` on BSC and Ethereum mainnet archive nodes, which
+    /// `trace_debankBlock` on BSC, Ethereum and Arc mainnet archive nodes, which
     /// replays a block on the archive state to regenerate its pipeline traces
     /// and events.
     #[arg(long, value_name = "URL")]
@@ -378,6 +416,17 @@ pub struct Command {
     #[arg(long, default_value = "")]
     pprof_addr: String,
 
+    /// Keep jemalloc heap-profile sampling on from startup.
+    /// Default: false
+    ///
+    /// When `MALLOC_CONF` enables `prof`, every sampled allocation records a
+    /// stack trace, which costs CPU on a busy node. Sampling is therefore
+    /// switched off at startup unless this flag is set; it can be switched at
+    /// runtime on the pprof server with `POST /debug/pprof/allocs/activate`
+    /// and `POST /debug/pprof/allocs/deactivate`.
+    #[arg(long)]
+    heap_profiling: bool,
+
     /// Disables db automatic compactions.
     /// Default: false
     /// This value is used when `db_type` is Rocksdb.
@@ -393,7 +442,8 @@ pub struct Command {
     /// ~3× cold-read decompression latency on deep-level reads. RocksDB
     /// records compression type per SST, so existing data remains readable
     /// regardless of this flag — toggling only affects newly written SSTs.
-    /// Archive-only (RocksDB archive mode).
+    /// Archive-only (RocksDB archive mode). Schema v3 archives always use
+    /// ZSTD, whatever this flag says.
     #[arg(long, default_value = "false")]
     archive_zstd_compression: bool,
 
@@ -446,6 +496,13 @@ pub struct Command {
     /// returns wrong values. Has no effect in state-node (non-archive) mode.
     #[arg(long, default_value_t = false)]
     inverted_block_encoding: bool,
+
+    /// Schema of a new RocksDB archive (`--archive` on an empty `--db-path`):
+    /// v1 (ascending block tail), v2 (inverted tail), v3 (RocksDB
+    /// user-defined timestamps) or v4 (page files outside RocksDB, see
+    /// docs/ArchiveSchemaV4.md). An existing archive keeps its own schema.
+    #[arg(long, default_value = "v3")]
+    archive_schema: ArchiveSchema,
 }
 
 fn parse_duration(arg: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
@@ -506,6 +563,14 @@ fn parse_interceptor_config(arg: &str) -> Result<InterceptorConfig> {
         interceptor_config = serde_json::from_str(arg)?;
     }
     Ok(interceptor_config)
+}
+
+fn parse_rpc_block_zero(arg: &str) -> Result<DebankBlock> {
+    let block: DebankBlock = serde_json::from_str(arg)?;
+    if block.height != 0 {
+        bail!("--rpc-block-zero requires block height 0");
+    }
+    Ok(block)
 }
 
 fn parse_ovm_address(arg: &str) -> Result<Address> {
@@ -587,6 +652,9 @@ impl Command {
         let evm_type = self.evm_type.clone();
         let custom_evm_cfg = self.evm_custom_config.clone();
         let gas_cap = self.rpc_gas_cap;
+        if self.forward_read_precompiles && evm_type != "hyper" {
+            bail!("--forward-read-precompiles is only supported with --evm-type=hyper");
+        }
         match evm_type.as_str() {
             "mainnet" => {
                 let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "mainnet")?;
@@ -598,6 +666,30 @@ impl Command {
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Mainnet(chain_cfg))
+            }
+            "hyper" => {
+                // HyperEVM executes mainnet rules; its chain-specific read precompiles are
+                // layered on by the hyper API implementation.
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "hyper")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Hyper(chain_cfg))
+            }
+            "zksync" => {
+                let spec = resolve_mainnet_spec(self.spec_id, MainnetSpecId::OSAKA, "zksync")?;
+                let mut chain_cfg = CfgEnv::new_with_spec(spec);
+                chain_cfg.disable_balance_check = true;
+                chain_cfg.disable_eip3607 = true;
+                chain_cfg.disable_block_gas_limit = true;
+                chain_cfg.disable_base_fee = true;
+                chain_cfg.chain_id = chain_id;
+                chain_cfg.tx_gas_limit_cap = Some(gas_cap);
+                Ok(MultiChainCfgEnv::Zksync(chain_cfg))
             }
             "arc" => {
                 let arc_config = ArcChainConfig::mainnet();
@@ -620,7 +712,7 @@ impl Command {
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
                 Ok(MultiChainCfgEnv::Arc((chain_cfg, arc_config)))
             }
-            "arbitrum" => {
+            "arbitrum" | "ape" => {
                 // RPC execution replaces this fallback with the target block's
                 // ArbOS-derived hardfork whenever Nitro header metadata is available.
                 let spec =
@@ -632,22 +724,35 @@ impl Command {
                 chain_cfg.disable_base_fee = true;
                 chain_cfg.chain_id = chain_id;
                 chain_cfg.tx_gas_limit_cap = Some(gas_cap);
-                let custom_evm_cfg = custom_evm_cfg
+                let mut custom_evm_cfg: Option<ArbitrumEvmConfig> = custom_evm_cfg
                     .map(|str| {
                         serde_json::from_str(&str).map_err(|err| {
                             anyhow!("cannot parse arbitrum custom evm config: {}", err)
                         })
                     })
                     .transpose()?;
+                if evm_type == "ape" {
+                    // ApeChain is an Arbitrum Orbit chain with native yield.
+                    if self.normalize_state_key || self.ovm_address.is_some() {
+                        bail!(
+                            "ape evm-type supports neither --normalize-state-key nor --ovm-address"
+                        );
+                    }
+                    custom_evm_cfg
+                        .get_or_insert_with(Default::default)
+                        .ape_yield = true;
+                }
                 Ok(MultiChainCfgEnv::Arbitrum((chain_cfg, custom_evm_cfg)))
             }
             "celo" => {
                 if chain_id != CELO_CHAIN_ID {
                     bail!("celo evm-type only supports --chain-cfg {CELO_CHAIN_ID}");
                 }
-                if self.spec_id != u8::MAX || custom_evm_cfg.is_some() {
-                    bail!("celo evm-type follows its mainnet L2 fork schedule; --spec-id and --evm-custom-config are not supported");
+                if self.spec_id != u8::MAX {
+                    bail!("celo evm-type follows its mainnet fork schedule; --spec-id is not supported");
                 }
+                let custom: CeloEvmConfig =
+                    serde_json::from_str(custom_evm_cfg.as_deref().unwrap_or("{}"))?;
                 let mut cfg = CfgEnv::new_with_spec(OpSpecId::JOVIAN);
                 cfg.chain_id = chain_id;
                 cfg.disable_balance_check = true;
@@ -656,7 +761,12 @@ impl Command {
                 cfg.disable_base_fee = true;
                 cfg.tx_gas_limit_cap = Some(gas_cap);
                 cfg.limit_contract_code_size = Some(MAX_CODE_SIZE);
-                Ok(MultiChainCfgEnv::Celo(cfg))
+                Ok(MultiChainCfgEnv::Celo(match custom.execution_mode {
+                    CeloExecutionMode::L1 => {
+                        CeloCfgEnv::L1(cfg.with_spec_and_mainnet_gas_params(MainnetSpecId::LONDON))
+                    }
+                    CeloExecutionMode::L2 => CeloCfgEnv::L2(cfg),
+                }))
             }
             "op" => {
                 if self.spec_id != u8::MAX {
@@ -913,6 +1023,15 @@ impl Command {
             });
         }
 
+        match crate::pprof::set_heap_profiling(self.heap_profiling).await {
+            Ok(Some(on)) => info!("jemalloc heap profiling {}", if on { "on" } else { "off" }),
+            Ok(None) if self.heap_profiling => {
+                error!("--heap-profiling needs prof:true in MALLOC_CONF; heap profiling stays off")
+            }
+            Ok(None) => {}
+            Err(err) => error!("could not switch jemalloc heap profiling: {err:#}"),
+        }
+
         if !self.pprof_addr.is_empty() {
             let pprof_server = PProf::new(self.pprof_addr.parse()?);
             tokio::spawn(async move {
@@ -929,14 +1048,23 @@ impl Command {
         }
 
         let state_diff_key = self.resolved_state_diff_key();
-        // set default offset dir if not set
-        if let Some(kafka_s3_config) = &mut self.kafka_s3_config {
-            if kafka_s3_config.offset_dir.is_empty() {
-                kafka_s3_config.offset_dir =
-                    format!("{}/offset", self.db_path.to_str().unwrap_or_default());
-            }
+        if let Some(kafka_s3_config) = &self.kafka_s3_config {
             info!(target: "updater", %state_diff_key, "resolved S3 StateDiff addressing");
             info!(target:"updater", "kafka s3 config: {:?}", kafka_s3_config);
+            // The updater keeps no Kafka offset between runs. Remove the one
+            // an earlier version saved, so that a downgrade does not resume
+            // from it.
+            let offset_dir = if kafka_s3_config.offset_dir.is_empty() {
+                format!("{}/offset", self.db_path.to_str().unwrap_or_default())
+            } else {
+                kafka_s3_config.offset_dir.clone()
+            };
+            let offset_file = format!("{offset_dir}/offset");
+            match std::fs::remove_file(&offset_file) {
+                Ok(()) => info!(target: "updater", "removed the offset file {offset_file} of an earlier version"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         } else {
             info!(target:"updater", "no kafka s3 config");
         }
@@ -953,6 +1081,13 @@ impl Command {
             );
         }
 
+        let new_archive = self.archive
+            && matches!(self.db_type, StorageKind::Rocksdb)
+            && crate::archive_udt::prepare_archive_schema(
+                &self.db_path,
+                self.archive_schema,
+                self.inverted_block_encoding,
+            )?;
         let db = MultiStorage::open(
             self.db_path.as_path(),
             self.db_cache,
@@ -970,17 +1105,19 @@ impl Command {
         //
         // The marker records what --inverted-block-encoding asserts, so passing
         // the flag against an unmarked *legacy* DB makes that mistake sticky.
-        if self.inverted_block_encoding {
+        // A new archive records its --archive-schema.
+        if self.inverted_block_encoding || new_archive {
             if let MultiStorage::RocksDBArchive(rdb) = &db {
                 let marker = rdb
                     .read_encoding_marker()
                     .map_err(|e| anyhow!("failed to read block encoding marker: {e}"))?;
                 if marker.is_none() {
-                    rdb.write_encoding_marker(true)
+                    let inverted = leafage_evm_storage::inverted_block_encoding();
+                    rdb.write_encoding_marker(inverted)
                         .map_err(|e| anyhow!("failed to write block encoding marker: {e}"))?;
                     info!(
-                        "archive db carried no block encoding marker; recorded inverted \
-                         encoding from --inverted-block-encoding"
+                        inverted,
+                        "archive db carried no block encoding marker; recorded it"
                     );
                 }
             }
@@ -1013,9 +1150,22 @@ impl Command {
             ),
         )?);
 
+        if (self.forward_simulate || self.forward_estimategas || self.forward_read_precompiles)
+            && self.upstream_url.is_none()
+        {
+            bail!("--upstream-url must be provided when --forward-simulate, --forward-estimategas or --forward-read-precompiles is enabled");
+        }
+
         let mut rpc_builder = ApiBuilder::new(tree.clone(), chain_cfg.clone())
             .with_ovm_address(self.ovm_address)
+            .with_rpc_block_zero(self.rpc_block_zero.clone())
             .with_historical_config(self.historical_rpc.clone(), self.historical_height)
+            .with_upstream_config(
+                self.upstream_url.clone(),
+                self.forward_simulate,
+                self.forward_estimategas,
+                self.forward_read_precompiles,
+            )
             .with_trace_block_rpc(
                 self.trace_block_rpc.clone(),
                 !self.trace_block_skip_state_check,
@@ -1135,6 +1285,10 @@ impl Command {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        if self.rpc_block_zero.is_some() && self.genesis_number == 0 {
+            bail!("--rpc-block-zero requires --genesis-number greater than 0");
+        }
+
         // Fix the versioned-key encoding mode before any archive DB access.
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         let (updater_handle, rpc_handle, resgitry_handle) =
@@ -1143,9 +1297,11 @@ impl Command {
             info!("stopping leafage server...");
             let _ = updater_handle.send(());
             let _ = resgitry_handle.send(());
-            // wait for lease to unregist
+            // The registration has no lease: the key is deleted. Keep serving
+            // while that happens and the callers that still know this node
+            // finish.
             info!(
-                "waiting for etcd lease to expire in {} seconds...",
+                "unregistering from etcd, stopping the rpc server in {} seconds...",
                 self.stop_wait_timeout
             );
             time::sleep(std::time::Duration::from_secs(
@@ -1191,13 +1347,14 @@ mod chain_config_tests {
             .unwrap()
             .build_chain_cfg_env()
         };
-        let MultiChainCfgEnv::Celo(cfg) = parse(&["--chain-cfg=42220"]).unwrap() else {
+        let MultiChainCfgEnv::Celo(CeloCfgEnv::L2(cfg)) = parse(&["--chain-cfg=42220"]).unwrap()
+        else {
             panic!("expected Celo configuration");
         };
         assert_eq!(cfg.limit_contract_code_size, Some(MAX_CODE_SIZE));
         assert!(parse(&[]).is_err());
         assert!(parse(&["--chain-cfg=42220", "--spec-id=18"]).is_err());
-        assert!(parse(&["--chain-cfg=42220", "--evm-custom-config={}"]).is_err());
+        assert!(parse(&["--chain-cfg=42220", "--evm-custom-config={}"]).is_ok());
     }
 
     #[test]
@@ -1237,6 +1394,35 @@ mod tests {
         ];
         argv.extend_from_slice(args);
         Command::try_parse_from(argv).expect("command should parse")
+    }
+
+    #[tokio::test]
+    async fn rpc_block_zero_requires_nonzero_genesis_and_zero_height() {
+        let mut block = serde_json::to_value(DebankBlock {
+            timestamp: 1_636_333_200,
+            base_fee_per_gas: 1_000_000_000_000_000_000_001,
+            ..Default::default()
+        })
+        .unwrap();
+        block["process_start_timestamp"] = 0.into();
+        let json = block.to_string();
+
+        let command = parse_command(&["--genesis-number", "1", "--rpc-block-zero", &json]);
+        let placeholder = command.rpc_block_zero.unwrap();
+        assert_eq!(placeholder.timestamp, 1_636_333_200);
+        assert_eq!(placeholder.base_fee_per_gas, 1_000_000_000_000_000_000_001);
+
+        let error = parse_command(&["--rpc-block-zero", &json])
+            .run()
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("--genesis-number greater than 0"));
+
+        block["height"] = 1.into();
+        assert!(parse_rpc_block_zero(&block.to_string()).is_err());
+        assert!(parse_rpc_block_zero("{}").is_err());
     }
 
     #[test]
@@ -1291,6 +1477,84 @@ mod tests {
             .await
             .expect_err("invalid metrics address should stop startup");
         assert!(error.downcast_ref::<std::net::AddrParseError>().is_some());
+    }
+
+    #[test]
+    fn zksync_evm_type_builds_zksync_config() {
+        let command = parse_command(&["--evm-type", "zksync", "--chain-cfg", "324"]);
+        let chain_cfg = command
+            .build_chain_cfg_env()
+            .expect("ZKsync config should build");
+
+        let MultiChainCfgEnv::Zksync(cfg) = chain_cfg else {
+            panic!("expected Zksync chain config");
+        };
+        assert_eq!(cfg.chain_id, 324);
+        assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+        assert!(cfg.disable_balance_check);
+        assert!(cfg.disable_eip3607);
+        assert!(cfg.disable_block_gas_limit);
+        assert!(cfg.disable_base_fee);
+    }
+
+    #[test]
+    fn hyper_evm_type_builds_hyper_config() {
+        let command = parse_command(&["--evm-type", "hyper", "--chain-cfg", "999"]);
+        let chain_cfg = command
+            .build_chain_cfg_env()
+            .expect("HyperEVM config should build");
+
+        let MultiChainCfgEnv::Hyper(cfg) = chain_cfg else {
+            panic!("expected Hyper chain config");
+        };
+        assert_eq!(cfg.chain_id, 999);
+        assert_eq!(cfg.spec, MainnetSpecId::OSAKA);
+        assert!(cfg.disable_balance_check);
+        assert!(cfg.disable_eip3607);
+        assert!(cfg.disable_block_gas_limit);
+        assert!(cfg.disable_base_fee);
+    }
+
+    #[test]
+    fn forward_read_precompiles_requires_hyper_evm_type() {
+        let command = parse_command(&[
+            "--evm-type",
+            "mainnet",
+            "--chain-cfg",
+            "999",
+            "--forward-read-precompiles",
+        ]);
+        let error = command
+            .build_chain_cfg_env()
+            .expect_err("forwarding read precompiles on mainnet must be rejected");
+        assert!(error.to_string().contains("--evm-type=hyper"), "{error}");
+
+        let command = parse_command(&[
+            "--evm-type",
+            "hyper",
+            "--chain-cfg",
+            "999",
+            "--forward-read-precompiles",
+        ]);
+        assert!(matches!(
+            command.build_chain_cfg_env().unwrap(),
+            MultiChainCfgEnv::Hyper(_)
+        ));
+    }
+
+    #[test]
+    fn upstream_url_and_forwarding_options() {
+        let command = parse_command(&[
+            "--upstream-url",
+            "http://127.0.0.1:8545",
+            "--forward-simulate",
+            "--forward-estimategas",
+            "--forward-read-precompiles",
+        ]);
+        assert_eq!(command.upstream_url.as_deref(), Some("http://127.0.0.1:8545"));
+        assert!(command.forward_simulate);
+        assert!(command.forward_estimategas);
+        assert!(command.forward_read_precompiles);
     }
 
     #[test]

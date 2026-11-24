@@ -14,6 +14,8 @@
 //! The `AddressToAccount` column family stores the (address,BlockNumber) to account maps.
 //! The `AddressToStorage` column family stores the (address,index,BlockNumber) to storage maps.
 //! The `HashToCode` column family stores the code hash to code maps.
+//! The optional `BlockNumToBlockInfo` column family stores the block number to
+//! block hash and header maps, see [`block_index`].
 //! All [`U256`] are big-endian encoded.
 
 //! ArchiveRocksDB is a RocksDB database implementation for the archive storage.
@@ -31,17 +33,18 @@ use crate::db_impl::rocksdb_impl::sst::{
     ingest_external_file_options, sst_writer_options, SstSink,
 };
 use crate::metrics::STORAGE_METRICS;
-use alloy::primitives::B64;
+use alloy::primitives::{keccak256, B64};
 use alloy_rlp::{Decodable, Encodable};
 use leafage_evm_types::{
     Block, BlockId, BlockInfo, BlockNumberOrTag, Bytes, Header, NewAccount, RawHeader, SlimAccount,
     H256, KECCAK256_EMPTY, U256,
 };
-use moka::sync::Cache as MokaCache;
+use quick_cache::sync::Cache as QuickCache;
+use quick_cache::Weighter;
 use rocksdb::{
-    BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily, ColumnFamilyDescriptor,
-    CompactOptions, Direction, IteratorMode, Options, ReadOptions, SliceTransform, SstFileWriter,
-    WriteBatch, WriteOptions, DB,
+    AsRawPtr, BlockBasedOptions, BottommostLevelCompaction, Cache, ColumnFamily,
+    ColumnFamilyDescriptor, CompactOptions, Direction, IteratorMode, Options, ReadOptions,
+    SliceTransform, SstFileWriter, WriteBatch, WriteOptions, DB,
 };
 use std::env;
 use std::fmt::{Debug, Display, Formatter};
@@ -50,13 +53,18 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+mod block_index;
 mod iterator_tracker;
 mod rewind;
 mod state_cache;
+mod stats;
+pub(crate) mod udt;
+pub(crate) mod v4;
+use block_index::BlockIndex;
 use iterator_tracker::{
     next_statedb_id, IteratorTracker, SharedIterators, TimeoutFlag, DEFAULT_ITERATOR_TIMEOUT_SECS,
 };
-use state_cache::{CachedAccount, Lookup, Span, StateCache};
+use state_cache::{CachedAccount, Entry, Lookup, MissReason, Probe, Span, StateCache, Table};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -99,6 +107,12 @@ enum StorageTypeColumn {
     AddressToStorage = 5,
     // code hash -> code
     HashToCode = 6,
+    // block num -> block hash || block header (optional, see `block_index`)
+    BlockNumToBlockInfo = 7,
+    // A log of the blocks still only in the schema v4 memtable, in the
+    // RocksDB that the first builds of schema v4 kept. Named here so that
+    // such a RocksDB can be opened to move its block infos and code out.
+    ArchiveV4Log = 8,
 }
 
 #[inline]
@@ -126,12 +140,12 @@ fn disable_perf_counters() {
 }
 
 /// Default entry count of the block-info cache (block hash -> header).
-const DEFAULT_BLOCK_INFO_CACHE_ENTRIES: u64 = 16384;
+const DEFAULT_BLOCK_INFO_CACHE_ENTRIES: u64 = 65536;
 
 /// Build the block-info cache honoring `ARCHIVE_BLOCK_INFO_CACHE` (entries;
 /// `0` disables). Keyed by block hash, so an entry never goes stale. Every
 /// request resolves its block through it.
-fn build_block_info_cache() -> Option<MokaCache<H256, BlockInfo>> {
+fn build_block_info_cache() -> Option<QuickCache<H256, Arc<BlockInfo>>> {
     let entries = env::var("ARCHIVE_BLOCK_INFO_CACHE")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -144,17 +158,32 @@ fn build_block_info_cache() -> Option<MokaCache<H256, BlockInfo>> {
         target = "rocksdb",
         "archive block info cache enabled: {} entries", entries
     );
-    Some(MokaCache::new(entries))
+    Some(QuickCache::new(entries.try_into().unwrap_or(usize::MAX)))
 }
 
 /// Default weighted capacity (MB) of the content-addressed code cache.
 const DEFAULT_CODE_CACHE_MB: u64 = 256;
 
+/// Weighs a cached code by its payload: key and code bytes.
+#[derive(Clone, Copy)]
+struct CodeWeighter;
+
+impl Weighter<H256, Bytes> for CodeWeighter {
+    fn weight(&self, _: &H256, code: &Bytes) -> u64 {
+        (code.len() + std::mem::size_of::<H256>()) as u64
+    }
+}
+
+type CodeCache = QuickCache<H256, Bytes, CodeWeighter>;
+
+/// Typical size of a cached contract, to size the code cache's table.
+const TYPICAL_CODE_BYTES: u64 = 8 * 1024;
+
 /// Build the code cache honoring `ARCHIVE_CODE_CACHE_MB` (`0` disables;
 /// unset/unparsable falls back to [`DEFAULT_CODE_CACHE_MB`]). Weighted by
 /// payload size (key + code bytes), so the capacity is a payload budget —
-/// per-entry allocator and moka bookkeeping overhead sits on top of it.
-fn build_code_cache() -> Option<MokaCache<H256, Bytes>> {
+/// per-entry allocator and cache bookkeeping overhead sits on top of it.
+fn build_code_cache() -> Option<CodeCache> {
     let mb = env::var("ARCHIVE_CODE_CACHE_MB")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -167,16 +196,11 @@ fn build_code_cache() -> Option<MokaCache<H256, Bytes>> {
         return None;
     }
     info!(target = "rocksdb", "archive code cache enabled: {}MB", mb);
-    Some(
-        MokaCache::builder()
-            .max_capacity(mb.saturating_mul(1024 * 1024))
-            .weigher(|_k: &H256, v: &Bytes| {
-                (v.len() + std::mem::size_of::<H256>())
-                    .try_into()
-                    .unwrap_or(u32::MAX)
-            })
-            .build(),
-    )
+    Some(crate::db::byte_weighted_cache(
+        mb.saturating_mul(1024 * 1024),
+        TYPICAL_CODE_BYTES,
+        CodeWeighter,
+    ))
 }
 
 /// Reserved key (stored in the `LatestBlockHash` CF) recording whether this
@@ -259,6 +283,8 @@ impl StorageTypeColumn {
             StorageTypeColumn::AddressToAccount => "4",
             StorageTypeColumn::AddressToStorage => "5",
             StorageTypeColumn::HashToCode => "6",
+            StorageTypeColumn::BlockNumToBlockInfo => "7",
+            StorageTypeColumn::ArchiveV4Log => "8",
         }
     }
 
@@ -270,6 +296,8 @@ impl StorageTypeColumn {
             StorageTypeColumn::AddressToAccount => "AddressToAccount",
             StorageTypeColumn::AddressToStorage => "AddressToStorage",
             StorageTypeColumn::HashToCode => "HashToCode",
+            StorageTypeColumn::BlockNumToBlockInfo => "BlockNumToBlockInfo",
+            StorageTypeColumn::ArchiveV4Log => "ArchiveV4Log",
         }
     }
 }
@@ -286,25 +314,54 @@ struct DataBaseInner {
     db: DB,
 }
 
+/// The archive's RocksDB. A schema v4 archive has none: every path that
+/// reaches for it there is a bug, and panics.
+#[derive(Clone, Copy, Debug)]
+struct Rocks(Option<&'static DB>);
+
+impl Rocks {
+    /// The database, for what outlives the borrow of its holder.
+    fn get(self) -> &'static DB {
+        self.0.expect("a schema v4 archive has no RocksDB")
+    }
+}
+
+impl std::ops::Deref for Rocks {
+    type Target = DB;
+
+    fn deref(&self) -> &DB {
+        self.0.expect("a schema v4 archive has no RocksDB")
+    }
+}
+
 #[derive(Debug)]
 pub struct DataBaseRef {
-    db: &'static DB,
+    db: Rocks,
     /// Content-addressed code cache (code_hash → code), shared by every state
     /// handle regardless of block height. `code_hash` is keccak256(code), so
     /// an entry can never go stale and needs no invalidation — unlike
     /// accounts/storage, whose height-versioned reads cannot be cached this
-    /// way. Historical reads bypass the `StateTree` moka caches entirely, so
+    /// way. Historical reads bypass the `StateTree` caches entirely, so
     /// without this every `getAddressCode`/multicall at an old height pays a
     /// HashToCode disk get + zstd decode even for hot contracts. `None` =
     /// disabled via `ARCHIVE_CODE_CACHE_MB=0`.
-    code_cache: Option<MokaCache<H256, Bytes>>,
+    code_cache: Option<CodeCache>,
     /// Block hash -> block info. A hash names one block, so entries never go
     /// stale; rewound blocks stay cached to serve requests for fork blocks.
     /// `None` = disabled via `ARCHIVE_BLOCK_INFO_CACHE=0`.
-    block_info_cache: Option<MokaCache<H256, BlockInfo>>,
+    block_info_cache: Option<QuickCache<H256, Arc<BlockInfo>>>,
+    /// Hash -> number of the canonical blocks, when block infos are in
+    /// `BlockNumToBlockInfo` (see [`block_index`]).
+    block_index: Option<Arc<BlockIndex>>,
     /// Cross-request account/storage read cache, see [`StateCache`]. Only
     /// built for a serving node (not bulk load or maintenance).
     state_cache: Option<StateCache>,
+    /// Schema v3: account/storage versions keyed by a user-defined timestamp
+    /// (see [`udt`]), read with timestamped point lookups.
+    udt: bool,
+    /// Schema v4: everything is in the files of this store (see [`v4`]),
+    /// and there is no RocksDB.
+    v4: Option<v4::Store>,
 }
 
 pub struct ArchiveRocksDBWriteBatch {
@@ -319,6 +376,14 @@ pub struct ArchiveRocksDBWriteBatch {
     /// Highest block this batch writes a version or block hash at; the
     /// state cache's head moves to it once the batch is committed.
     max_block: Option<u64>,
+    /// The blocks whose infos are written to `BlockNumToBlockInfo`.
+    block_infos: Vec<(H256, u32)>,
+    /// Schema v4, which has no RocksDB to put them in: the block hashes,
+    /// block infos, codes and head pointer of the batch.
+    v4_hashes: Vec<(u64, H256)>,
+    v4_infos: Vec<(u64, H256, Vec<u8>)>,
+    v4_codes: Vec<(H256, Bytes)>,
+    v4_head: Option<H256>,
 }
 
 impl ArchiveRocksDBWriteBatch {
@@ -329,6 +394,11 @@ impl ArchiveRocksDBWriteBatch {
             storage_writes: Vec::new(),
             sync: false,
             max_block: None,
+            block_infos: Vec::new(),
+            v4_hashes: Vec::new(),
+            v4_infos: Vec::new(),
+            v4_codes: Vec::new(),
+            v4_head: None,
         }
     }
 
@@ -368,6 +438,15 @@ impl ArchiveRocksDBWriteBatch {
 
 impl Drop for DataBaseRef {
     fn drop(&mut self) {
+        // The database lock also covers the block index file.
+        if let Some(index) = &self.block_index {
+            index.wait_saved();
+        }
+        // Schema v4: what the memtable holds is not written out; the next
+        // open is at the last flushed block.
+        if self.v4.take().is_some() {
+            return;
+        }
         // Flush every named CF. See `DataBaseRef::flush` for why `db.flush()`
         // alone is insufficient.
         self.flush().unwrap();
@@ -391,16 +470,45 @@ enum CfCompression {
     Zstd,
 }
 
+/// `ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS=1|true`: point lookups skip the filter
+/// of the last level, which holds most keys and most filter bytes. Lookups of
+/// keys present there save a filter block read; lookups of absent keys read
+/// an index and a data block instead. It applies to existing files at once,
+/// but files compacted into the last level while it is on get no filter, and
+/// keep none if it is turned off until they are rewritten.
+static OPTIMIZE_FILTERS_FOR_HITS: LazyLock<bool> = LazyLock::new(|| {
+    let on = matches!(
+        env::var("ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS").as_deref(),
+        Ok("1" | "true" | "TRUE")
+    );
+    if on {
+        info!(
+            target = "rocksdb",
+            "archive optimize_filters_for_hits enabled"
+        );
+    }
+    on
+});
+
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn rocksdb_column_options(
     shared_cache: &Cache,
+    block_size: usize,
     fixed_prefix_size: usize,
     disable_auto_compactions: bool,
     compression: CfCompression,
     bulk_load: bool,
     archive_zstd_compression: bool,
+    udt: bool,
 ) -> Options {
-    let mut cf_opts = Options::default();
+    // A schema v3 versioned CF keys versions by a u64 user-defined timestamp
+    // (the block); the comparator is fixed when the CF is created.
+    let mut cf_opts = if udt {
+        udt::base_cf_options()
+    } else {
+        Options::default()
+    };
     cf_opts.set_max_total_wal_size(1 << 28); // e.g., 256MB
     cf_opts.set_keep_log_file_num(2);
     cf_opts.set_level_compaction_dynamic_level_bytes(true);
@@ -408,10 +516,16 @@ fn rocksdb_column_options(
         cf_opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(fixed_prefix_size));
         cf_opts.set_memtable_prefix_bloom_ratio(0.1);
     }
+    if udt {
+        // Point Get on the key without its timestamp: whole-key filters.
+        cf_opts.set_memtable_whole_key_filtering(true);
+        cf_opts.set_memtable_prefix_bloom_ratio(0.1);
+    }
     let mut block_opts = BlockBasedOptions::default();
 
     // Use the shared cache for this column family
     block_opts.set_block_cache(shared_cache);
+    block_opts.set_block_size(block_size);
     block_opts.set_cache_index_and_filter_blocks(true);
     block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
     block_opts.set_pin_top_level_index_and_filter(true);
@@ -446,8 +560,11 @@ fn rocksdb_column_options(
     // Larger SST files = fewer files at every level = less metadata,
     // smaller index/bloom overhead, fewer files for compaction to track.
     // Default is 64MB; bump to 128MB.
-    cf_opts.set_target_file_size_base(128 << 20);
+    cf_opts.set_target_file_size_base(TARGET_FILE_SIZE_BASE);
     cf_opts.set_disable_auto_compactions(disable_auto_compactions);
+    if *OPTIMIZE_FILTERS_FOR_HITS {
+        cf_opts.set_optimize_filters_for_hits(true);
+    }
     // Disable TTL-based compaction. Archive data is immutable — recompacting
     // old SST files just because they exceed 30 days (the default set by
     // optimize_level_style_compaction) provides no benefit and causes massive
@@ -549,11 +666,30 @@ fn rocksdb_column_options(
             ]);
             cf_opts.set_zstd_max_train_bytes(1024 * 1024);
             cf_opts.set_compression_options(-14, 3, 0, 16 * 1024);
+            // A table built with a dictionary buffers its data blocks to
+            // sample them, up to the smaller of its target file size and
+            // `max_dict_buffer_bytes` (0: no limit). An SstFileWriter has no
+            // target file size, so without this limit it holds the whole
+            // file in memory and reports a size of 0 until it finishes, and
+            // `SstSink` never rolls it: on `archive-udt convert` each worker
+            // held its whole shard (36 GB within two minutes on OP). The
+            // target file size keeps compactions as they were.
+            // SAFETY: `cf_opts` owns the options pointer for the call.
+            unsafe {
+                librocksdb_sys::rocksdb_options_set_compression_options_max_dict_buffer_bytes(
+                    cf_opts.as_raw_ptr(),
+                    TARGET_FILE_SIZE_BASE,
+                );
+            }
         }
     }
 
     cf_opts
 }
+
+/// Target SST size of the archive CFs, and the cap on the data a table built
+/// with a ZSTD dictionary buffers before training it.
+const TARGET_FILE_SIZE_BASE: u64 = 128 << 20;
 
 #[inline]
 fn rocksdb_options(disable_auto_compactions: bool) -> Options {
@@ -603,96 +739,127 @@ fn rocksdb_options(disable_auto_compactions: bool) -> Options {
     opts
 }
 
-/// Build the six archive column-family descriptors with the standard archive
-/// options. Shared by [`DataBaseRef::open_inner`] and the offline re-encode
-/// path so a re-encoded DB is option-compatible with a normally-opened one.
-fn archive_cf_descriptors(
+/// The column families of an archive without `BlockNumToBlockInfo`, in
+/// creation order. With it, `BlockHashToBlockInfo` is dropped once replaced.
+const ARCHIVE_COLUMNS: [StorageTypeColumn; 6] = [
+    StorageTypeColumn::LatestBlockHash,
+    StorageTypeColumn::BlockHashToBlockInfo,
+    StorageTypeColumn::BlockNumToBlockHash,
+    StorageTypeColumn::AddressToAccount,
+    StorageTypeColumn::AddressToStorage,
+    StorageTypeColumn::HashToCode,
+];
+
+/// The archive column families of the database at `path`, or `None` if
+/// there is no database.
+fn existing_columns(path: &Path) -> Option<Vec<StorageTypeColumn>> {
+    let names = DB::list_cf(&Options::default(), path).ok()?;
+    Some(
+        ARCHIVE_COLUMNS
+            .into_iter()
+            .chain([
+                StorageTypeColumn::BlockNumToBlockInfo,
+                StorageTypeColumn::ArchiveV4Log,
+            ])
+            .filter(|col| names.iter().any(|name| name == col.to_str()))
+            .collect(),
+    )
+}
+
+/// The standard options of one archive column family. `udt` selects schema
+/// v3 for the versioned CFs (`AddressToAccount`, `AddressToStorage`): keys
+/// without the version tail, the block as a u64 user-defined timestamp, and
+/// whole-key filters instead of the prefix bloom.
+fn archive_cf_options(
+    col: StorageTypeColumn,
     shared_cache: &Cache,
     disable_auto_compactions: bool,
     bulk_load: bool,
     archive_zstd_compression: bool,
-) -> Vec<ColumnFamilyDescriptor> {
+    udt: bool,
+) -> Options {
     // The three large CFs (BlockHashToBlockInfo, AddressToAccount,
     // AddressToStorage) use Lz4 by default. Opt into Zstd-with-dict at deep
     // levels via `archive_zstd_compression` for ~15-20% extra ratio at the cost
     // of ~2× compaction CPU and ~3× cold-read decode latency. HashToCode is
     // always Zstd: code blobs benefit from dict compression regardless.
+    // v3 archives always use Zstd: on bsc it cut the database by 17% and disk
+    // reads per request by 6%, for 2% more CPU with digested dictionaries.
+    let archive_zstd_compression = archive_zstd_compression || udt;
     let big_cf_compression = if archive_zstd_compression {
         CfCompression::Zstd
     } else {
         CfCompression::Lz4
     };
-    vec![
-        // LatestBlockHash: single record, no compression needed
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::LatestBlockHash.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        // BlockNumToBlockHash: 32 bytes value, no compression needed
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::None,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToAccount.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                32,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::AddressToStorage.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                64,
-                disable_auto_compactions,
-                big_cf_compression,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-        // HashToCode: large code blobs (KB~tens of KB), ZSTD for high compression
-        ColumnFamilyDescriptor::new(
-            StorageTypeColumn::HashToCode.to_str(),
-            rocksdb_column_options(
-                shared_cache,
-                0,
-                disable_auto_compactions,
-                CfCompression::Zstd,
-                bulk_load,
-                archive_zstd_compression,
-            ),
-        ),
-    ]
+    let (prefix, compression, udt) = match col {
+        // Single record / 32-byte values: no compression needed.
+        StorageTypeColumn::LatestBlockHash | StorageTypeColumn::BlockNumToBlockHash => {
+            (0, CfCompression::None, false)
+        }
+        StorageTypeColumn::BlockHashToBlockInfo => (0, big_cf_compression, false),
+        StorageTypeColumn::AddressToAccount => (if udt { 0 } else { 32 }, big_cf_compression, udt),
+        StorageTypeColumn::AddressToStorage => (if udt { 0 } else { 64 }, big_cf_compression, udt),
+        // Large code blobs (KB~tens of KB): ZSTD for high compression.
+        StorageTypeColumn::HashToCode => (0, CfCompression::Zstd, false),
+        StorageTypeColumn::BlockNumToBlockInfo => (0, CfCompression::Zstd, false),
+        // Only opened to be dropped.
+        StorageTypeColumn::ArchiveV4Log => (0, CfCompression::Lz4, false),
+    };
+    // Block infos are read for ranges of consecutive numbers: larger blocks
+    // put more of a range in one read.
+    let block_size = if col == StorageTypeColumn::BlockNumToBlockInfo {
+        16 * 1024
+    } else {
+        4 * 1024
+    };
+    let mut opts = rocksdb_column_options(
+        shared_cache,
+        block_size,
+        prefix,
+        disable_auto_compactions,
+        compression,
+        bulk_load,
+        archive_zstd_compression,
+        udt,
+    );
+    if col == StorageTypeColumn::BlockNumToBlockInfo {
+        // Its one-time copy ingests many overlapping files at once. A write
+        // stall here would stop every write of the database.
+        opts.set_level_zero_slowdown_writes_trigger(i32::MAX);
+        opts.set_level_zero_stop_writes_trigger(i32::MAX);
+        opts.set_soft_pending_compaction_bytes_limit(0);
+        opts.set_hard_pending_compaction_bytes_limit(0);
+    }
+    opts
+}
+
+/// Build the descriptors of the archive column families `cols` with the
+/// standard archive options. Shared by [`DataBaseRef::open_inner`] and the
+/// offline re-encode path so a re-encoded DB is option-compatible with a
+/// normally-opened one.
+fn archive_cf_descriptors(
+    shared_cache: &Cache,
+    disable_auto_compactions: bool,
+    bulk_load: bool,
+    archive_zstd_compression: bool,
+    udt: bool,
+    cols: &[StorageTypeColumn],
+) -> Vec<ColumnFamilyDescriptor> {
+    cols.iter()
+        .map(|&col| {
+            ColumnFamilyDescriptor::new(
+                col.to_str(),
+                archive_cf_options(
+                    col,
+                    shared_cache,
+                    disable_auto_compactions,
+                    bulk_load,
+                    archive_zstd_compression,
+                    udt,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Split the leading-byte keyspace `0..=255` into `jobs` contiguous shards,
@@ -905,6 +1072,28 @@ fn reencode_versioned_cf(
     ))
 }
 
+/// Decode a stored block info: the RLP header, then the JSON `OtherFields`
+/// if any.
+fn decode_block_info(hash: H256, mut buf: &[u8]) -> Result<BlockInfo, Error> {
+    let header = decode_archive_header(&mut buf)?;
+    let other = if buf.is_empty() {
+        Default::default()
+    } else {
+        serde_json::from_slice(buf).unwrap_or_default()
+    };
+    Ok(BlockInfo {
+        inner: Block {
+            header: Header {
+                hash,
+                inner: header,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        other,
+    })
+}
+
 pub(crate) fn decode_archive_header(buf: &mut &[u8]) -> Result<RawHeader, Error> {
     let original = *buf;
     Ok(match RawHeader::decode(buf) {
@@ -1017,6 +1206,58 @@ impl DataBaseRef {
         Self::open_inner(path, cache_size, false, false, false, true)
     }
 
+    /// Open a schema v4 archive: the files of its store, and the index from
+    /// block hash to number built over them. `cache_size` (MiB) is the
+    /// store's whole budget. There is no RocksDB.
+    fn open_v4(
+        path: &Path,
+        cache_size: usize,
+        bulk_load: bool,
+        maintenance: bool,
+    ) -> Result<Self, Error> {
+        let store_dir = path.join(v4::STORE_DIR);
+        if path.join("CURRENT").exists() {
+            // Development builds kept block infos and code in a RocksDB
+            // next to the store; no released one did.
+            return Err(Error::UnSupported(format!(
+                "{} is a schema v4 archive with a RocksDB, as a development build laid it \
+                 out: convert its v3 source again",
+                path.display()
+            )));
+        }
+        let budget = (cache_size as u64) << 20;
+        let options = if maintenance {
+            v4::Options::maintenance(budget)
+        } else if bulk_load {
+            v4::Options::bulk_load(budget)
+        } else {
+            v4::Options::serving(budget)
+        };
+        let store = v4::Store::open(&store_dir, options)?;
+        // Requests name blocks by hash; the files hold them by number.
+        let block_index = Arc::new(BlockIndex::open(&store, path)?);
+        let serving = !bulk_load && !maintenance;
+        let db_ref = Self {
+            db: Rocks(None),
+            code_cache: build_code_cache(),
+            block_info_cache: build_block_info_cache(),
+            block_index: Some(block_index),
+            state_cache: if serving {
+                StateCache::from_env()
+            } else {
+                None
+            },
+            udt: false,
+            v4: Some(store),
+        };
+        // The write path encodes keys as schema v2 does.
+        set_inverted_block_encoding(true);
+        if let Some(cache) = &db_ref.state_cache {
+            cache.advance_head(db_ref.read_latest_block_num()?.unwrap_or(0));
+        }
+        Ok(db_ref)
+    }
+
     fn open_inner<P: AsRef<Path>>(
         path: P,
         cache_size: usize,
@@ -1025,11 +1266,17 @@ impl DataBaseRef {
         archive_zstd_compression: bool,
         maintenance: bool,
     ) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let schema = udt::schema_file(path)?;
+        if schema == Some(4) {
+            return Self::open_v4(path, cache_size, bulk_load, maintenance);
+        }
+        let udt = schema == Some(3);
         let total_cache_size = cache_size;
-        let shared_cache = Cache::new_hyper_clock_cache(
-            1024 * 1024 * total_cache_size,
-            8192, // 8KB typical block size
-        );
+        // Estimated entry charge 0: the table grows with the entries. A fixed
+        // estimate sizes the table for that many entries; the cache holds ~4KB
+        // blocks, so an 8KB estimate ran out of slots before using its bytes.
+        let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * total_cache_size, 0);
         info!(
             target = "rocksdb",
             "Created shared Clock Cache with size: {}MB for archive (bulk_load={}, archive_zstd_compression={})",
@@ -1038,79 +1285,102 @@ impl DataBaseRef {
             archive_zstd_compression,
         );
 
+        let serving = !bulk_load && !maintenance;
+        let by_number = !maintenance && block_index::enabled();
+        let existing = existing_columns(path);
+        let has = |col| existing.as_ref().is_some_and(|cols| cols.contains(&col));
+        // Block infos are by hash (CF 2) or by number (CF 7); both are open
+        // only while they move to CF 7.
+        let mut headers_cf = has(StorageTypeColumn::BlockHashToBlockInfo)
+            || !(by_number || has(StorageTypeColumn::BlockNumToBlockInfo));
+        let mut index_cf = by_number || has(StorageTypeColumn::BlockNumToBlockInfo);
+        let mut cols: Vec<StorageTypeColumn> = ARCHIVE_COLUMNS
+            .into_iter()
+            .filter(|&col| col != StorageTypeColumn::BlockHashToBlockInfo || headers_cf)
+            .collect();
+        if index_cf {
+            cols.push(StorageTypeColumn::BlockNumToBlockInfo);
+        }
         let cfs = archive_cf_descriptors(
             &shared_cache,
             disable_auto_compactions,
             bulk_load,
             archive_zstd_compression,
+            udt,
+            &cols,
         );
         let mut db_opt = rocksdb_options(disable_auto_compactions);
         if maintenance {
             db_opt.create_if_missing(false);
             db_opt.create_missing_column_families(false);
         }
-        let db = DB::open_cf_descriptors(&db_opt, path, cfs)?;
-        let cols = vec![
-            (
-                StorageTypeColumn::LatestBlockHash,
-                NonNull::new(
-                    db.cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
-                        .unwrap() as *const _ as *mut _,
-                )
-                .unwrap(),
-            ),
-            (
-                StorageTypeColumn::BlockHashToBlockInfo,
-                NonNull::new(
-                    db.cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
-                        .unwrap() as *const _ as *mut _,
-                )
-                .unwrap(),
-            ),
-            (
-                StorageTypeColumn::BlockNumToBlockHash,
-                NonNull::new(
-                    db.cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
-                        .unwrap() as *const _ as *mut _,
-                )
-                .unwrap(),
-            ),
-            (
-                StorageTypeColumn::AddressToAccount,
-                NonNull::new(
-                    db.cf_handle(StorageTypeColumn::AddressToAccount.to_str())
-                        .unwrap() as *const _ as *mut _,
-                )
-                .unwrap(),
-            ),
-            (
-                StorageTypeColumn::AddressToStorage,
-                NonNull::new(
-                    db.cf_handle(StorageTypeColumn::AddressToStorage.to_str())
-                        .unwrap() as *const _ as *mut _,
-                )
-                .unwrap(),
-            ),
-            (
-                StorageTypeColumn::HashToCode,
-                NonNull::new(
-                    db.cf_handle(StorageTypeColumn::HashToCode.to_str())
-                        .unwrap() as *const _ as *mut _,
-                )
-                .unwrap(),
-            ),
-        ];
+        if serving {
+            stats::enable(&mut db_opt);
+        }
+        let mut db = DB::open_cf_descriptors(&db_opt, path, cfs)?;
+        let mut block_index = None;
+        if headers_cf && index_cf {
+            let info_cf = StorageTypeColumn::BlockNumToBlockInfo;
+            if has(info_cf) {
+                // Left by an interrupted move.
+                db.drop_cf(info_cf.to_str())?;
+            }
+            if by_number {
+                if has(info_cf) {
+                    db.create_cf(
+                        info_cf.to_str(),
+                        &archive_cf_options(
+                            info_cf,
+                            &shared_cache,
+                            disable_auto_compactions,
+                            bulk_load,
+                            archive_zstd_compression,
+                            udt,
+                        ),
+                    )?;
+                }
+                warn!(target: "rocksdb", "moving block infos to BlockNumToBlockInfo");
+                let index = BlockIndex::rebuild(&db, path)?;
+                block_index::copy_block_infos(&db, &db, &path.join(".block_index_tmp"), &index)?;
+                warn!(target: "rocksdb", "moving block infos: dropping BlockHashToBlockInfo");
+                db.drop_cf(StorageTypeColumn::BlockHashToBlockInfo.to_str())?;
+                headers_cf = false;
+                block_index = Some(Arc::new(index));
+            } else {
+                index_cf = false;
+            }
+        } else if index_cf {
+            block_index = Some(Arc::new(BlockIndex::open(&db, path)?));
+        }
+        cols.retain(|&col| match col {
+            StorageTypeColumn::BlockHashToBlockInfo => headers_cf,
+            StorageTypeColumn::BlockNumToBlockInfo => index_cf,
+            _ => true,
+        });
+        if serving {
+            stats::spawn_exporter(db_opt, shared_cache.clone(), 1024 * 1024 * total_cache_size);
+        }
+        let cols = cols
+            .into_iter()
+            .map(|col| {
+                let cf = db.cf_handle(col.to_str()).unwrap();
+                (col, NonNull::new(cf as *const _ as *mut _).unwrap())
+            })
+            .collect();
         unsafe { DATA_BASE = Some(DataBaseInner { _cols: cols, db }) }
-        let serving = !bulk_load && !maintenance;
+        let db: &'static DB = unsafe { &DATA_BASE.as_ref().unwrap().db };
         let db_ref = Self {
-            db: unsafe { &DATA_BASE.as_ref().unwrap().db },
+            db: Rocks(Some(db)),
             code_cache: build_code_cache(),
             block_info_cache: build_block_info_cache(),
+            block_index,
             state_cache: if serving {
                 StateCache::from_env()
             } else {
                 None
             },
+            udt,
+            v4: None,
         };
         // Self-describing encoding: if the DB records its block-height key
         // encoding, honor it (a legacy DB has no marker and is left untouched),
@@ -1129,6 +1399,10 @@ impl DataBaseRef {
     /// Read the stored block-height encoding marker: `Some(true)` = inverted,
     /// `Some(false)` = legacy, `None` = unmarked (legacy / pre-marker).
     pub fn read_encoding_marker(&self) -> Result<Option<bool>, Error> {
+        // Schema v4 takes its writes in the inverted encoding only.
+        if self.v4.is_some() {
+            return Ok(Some(true));
+        }
         let cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -1142,6 +1416,15 @@ impl DataBaseRef {
 
     /// Record this DB's block-height encoding so future opens are self-describing.
     pub fn write_encoding_marker(&self, inverted: bool) -> Result<(), Error> {
+        if self.v4.is_some() {
+            return if inverted {
+                Ok(())
+            } else {
+                Err(Error::UnSupported(
+                    "a schema v4 archive needs --inverted-block-encoding".into(),
+                ))
+            };
+        }
         let cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -1220,14 +1503,10 @@ impl DataBaseRef {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(512),
         );
-        let cf_names = [
-            StorageTypeColumn::LatestBlockHash.to_str(),
-            StorageTypeColumn::BlockHashToBlockInfo.to_str(),
-            StorageTypeColumn::BlockNumToBlockHash.to_str(),
-            StorageTypeColumn::AddressToAccount.to_str(),
-            StorageTypeColumn::AddressToStorage.to_str(),
-            StorageTypeColumn::HashToCode.to_str(),
-        ];
+        // The destination keeps the source's block infos, by hash or by
+        // number.
+        let cols = existing_columns(src_path.as_ref()).unwrap_or_default();
+        let cf_names = cols.iter().map(|col| col.to_str());
         let src = DB::open_cf_for_read_only(&src_opts, &src_path, cf_names, false)
             .map_err(Error::RocksDB)?;
 
@@ -1251,7 +1530,7 @@ impl DataBaseRef {
 
         // Destination: fresh DB with the standard archive CF options.
         let shared_cache = Cache::new_hyper_clock_cache(1024 * 1024 * cache_size, 8192);
-        let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false);
+        let dst_cfs = archive_cf_descriptors(&shared_cache, false, false, false, false, &cols);
         let dst = DB::open_cf_descriptors(&rocksdb_options(false), &dst_path, dst_cfs)
             .map_err(Error::RocksDB)?;
 
@@ -1278,12 +1557,12 @@ impl DataBaseRef {
         const ROLL_BYTES: u64 = 512 * 1024 * 1024;
 
         // 1) Non-versioned CFs: copy verbatim (src is already key-ascending).
-        for col in [
-            StorageTypeColumn::LatestBlockHash,
-            StorageTypeColumn::BlockHashToBlockInfo,
-            StorageTypeColumn::BlockNumToBlockHash,
-            StorageTypeColumn::HashToCode,
-        ] {
+        for &col in cols.iter().filter(|col| {
+            !matches!(
+                col,
+                StorageTypeColumn::AddressToAccount | StorageTypeColumn::AddressToStorage
+            )
+        }) {
             let src_cf = src.cf_handle(col.to_str()).unwrap();
             let mut sink = SstSink::new(
                 &sst_opts,
@@ -1378,6 +1657,13 @@ impl DataBaseRef {
 
     pub fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         let start = std::time::Instant::now();
+        if let Some(store) = &self.v4 {
+            let hash = store.block_hash(block_num)?;
+            STORAGE_METRICS
+                .read_block_hash_latency
+                .record(start.elapsed().as_secs_f64());
+            return Ok(hash.map_or(H256::ZERO, H256::from));
+        }
         let block_num_to_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
@@ -1399,7 +1685,7 @@ impl DataBaseRef {
         Ok(block_hash)
     }
 
-    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+    pub fn read_block_info_arc(&self, block_hash: H256) -> Result<Option<Arc<BlockInfo>>, Error> {
         if let Some(info) = self
             .block_info_cache
             .as_ref()
@@ -1408,11 +1694,21 @@ impl DataBaseRef {
             STORAGE_METRICS.block_info_cache_hits.increment(1);
             return Ok(Some(info));
         }
-        let info = self.read_block_info_from_db(block_hash)?;
+        let info = match &self.block_index {
+            Some(index) => self.read_block_info_by_number(index, block_hash)?,
+            None => self.read_block_info_from_db(block_hash)?,
+        }
+        .map(Arc::new);
         if let (Some(cache), Some(info)) = (&self.block_info_cache, &info) {
-            cache.insert(block_hash, info.clone());
+            cache.insert(block_hash, Arc::clone(info));
         }
         Ok(info)
+    }
+
+    pub fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+        Ok(self
+            .read_block_info_arc(block_hash)?
+            .map(|info| info.as_ref().clone()))
     }
 
     fn read_block_info_from_db(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
@@ -1430,34 +1726,24 @@ impl DataBaseRef {
         STORAGE_METRICS
             .read_block_latency
             .record(start.elapsed().as_secs_f64());
-        if block_info_bytes.is_none() {
-            return Ok(None);
-        }
-        let block_info_bytes = block_info_bytes.unwrap();
-        let buf = &mut block_info_bytes.as_ref();
-        let block_header = decode_archive_header(buf)?;
-        // After RLP decode, remaining bytes (if any) are JSON-encoded OtherFields
-        let other = if buf.is_empty() {
-            Default::default()
-        } else {
-            serde_json::from_slice(buf).unwrap_or_default()
-        };
-        let block = Block {
-            header: Header {
-                hash: block_hash,
-                inner: block_header,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Ok(Some(BlockInfo {
-            inner: block,
-            other,
-        }))
+        block_info_bytes
+            .map(|bytes| decode_block_info(block_hash, &bytes))
+            .transpose()
     }
 
     pub fn read_latest_block_hash(&self) -> Result<H256, Error> {
         let start = std::time::Instant::now();
+        if let Some(store) = &self.v4 {
+            // The head is the last block written, in memory or in the files.
+            let hash = match store.head() {
+                Some(head) => store.block_hash(head)?,
+                None => None,
+            };
+            STORAGE_METRICS
+                .read_latest_block_hash_latency
+                .record(start.elapsed().as_secs_f64());
+            return Ok(hash.map_or(H256::ZERO, H256::from));
+        }
         let latest_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -1488,14 +1774,18 @@ impl DataBaseRef {
             STORAGE_METRICS.code_cache_misses.increment(1);
         }
         let start = std::time::Instant::now();
-        let hash_to_code_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::HashToCode.to_str())
-            .unwrap();
         let code_hash_bytes: [u8; 32] = code_hash.into();
-        let code = self
-            .db
-            .get_cf_opt(hash_to_code_cf, code_hash_bytes, &rocksdb_read_options())?;
+        let code = match &self.v4 {
+            Some(store) => store.code(&code_hash_bytes)?,
+            None => {
+                let hash_to_code_cf = self
+                    .db
+                    .cf_handle(StorageTypeColumn::HashToCode.to_str())
+                    .unwrap();
+                self.db
+                    .get_cf_opt(hash_to_code_cf, code_hash_bytes, &rocksdb_read_options())?
+            }
+        };
         STORAGE_METRICS
             .read_code_latency
             .record(start.elapsed().as_secs_f64());
@@ -1509,12 +1799,62 @@ impl DataBaseRef {
         Ok(Some(code))
     }
 
+    fn read_code_many(&self, hashes: &[H256]) -> Result<Vec<Option<Bytes>>, Error> {
+        let mut out: Vec<_> = hashes
+            .iter()
+            .map(|hash| {
+                let hit = self.code_cache.as_ref().and_then(|cache| cache.get(hash));
+                if hit.is_some() {
+                    STORAGE_METRICS.code_cache_hits.increment(1);
+                }
+                hit
+            })
+            .collect();
+        let pending: Vec<_> = out
+            .iter()
+            .enumerate()
+            .filter_map(|(i, hit)| hit.is_none().then_some(i))
+            .collect();
+        if pending.len() < udt::MIN_MULTIGET_KEYS || self.v4.is_some() {
+            for i in pending {
+                out[i] = self.read_code(hashes[i])?;
+            }
+            return Ok(out);
+        }
+        if self.code_cache.is_some() {
+            STORAGE_METRICS
+                .code_cache_misses
+                .increment(pending.len() as u64);
+        }
+        let cf = self
+            .db
+            .cf_handle(StorageTypeColumn::HashToCode.to_str())
+            .unwrap();
+        let start = std::time::Instant::now();
+        let found = self.db.batched_multi_get_cf_opt(
+            cf,
+            pending.iter().map(|i| hashes[*i].as_slice()),
+            false,
+            &rocksdb_read_options(),
+        );
+        STORAGE_METRICS
+            .read_code_many_latency
+            .record(start.elapsed().as_secs_f64());
+        for (i, code) in pending.into_iter().zip(found) {
+            out[i] = code?.map(|code| Bytes::copy_from_slice(&code));
+            if let (Some(cache), Some(code)) = (&self.code_cache, &out[i]) {
+                cache.insert(hashes[i], code.clone());
+            }
+        }
+        Ok(out)
+    }
+
     pub fn read_latest_block_num(&self) -> Result<Option<u64>, Error> {
         let latest_hash = self.read_latest_block_hash()?;
         if latest_hash == H256::ZERO {
             return Ok(None);
         }
-        let block_info = self.read_block_info(latest_hash)?;
+        let block_info = self.read_block_info_arc(latest_hash)?;
         match block_info {
             Some(block) => Ok(Some(block.header.number)),
             None => Ok(None),
@@ -1559,6 +1899,51 @@ impl DataBaseRef {
         Ok(())
     }
 
+    /// Whether this is a schema v3 archive. Its versions cannot be
+    /// bulk-loaded as SST files ([`Self::write_account_sst`]): RocksDB only
+    /// ingests a file into a timestamped CF if its keys do not overlap the
+    /// CF's, and a key's versions must be written in block order (a read
+    /// stops at the first level holding a version at or below its height).
+    pub fn is_schema_v3(&self) -> bool {
+        self.udt
+    }
+
+    /// Whether this is a schema v4 archive (`docs/ArchiveSchemaV4.md`).
+    pub fn is_schema_v4(&self) -> bool {
+        self.v4.is_some()
+    }
+
+    /// Whether account and storage versions can be bulk-loaded as SST files
+    /// ([`Self::write_account_sst`]): only schemas v1 and v2. The others
+    /// take them through write batches committed in block order.
+    pub fn takes_version_ssts(&self) -> bool {
+        !self.udt && self.v4.is_none()
+    }
+
+    /// Schema v4: write the memtable to segment files now (nothing of it
+    /// is in a file before, and a store that closes drops it) and fold
+    /// every segment into the base, at the pace of the store's options.
+    pub fn v4_compact(&self) -> Result<(), Error> {
+        let Some(store) = &self.v4 else {
+            return Err(Error::UnSupported("not a schema v4 archive".into()));
+        };
+        store.flush()?;
+        store.rewrite_base()
+    }
+
+    /// Schema v4, for tests: hold back the store's file set changes while
+    /// the guard lives.
+    #[cfg(test)]
+    pub(crate) fn v4_crash_point(&self) -> impl Drop + '_ {
+        self.v4.as_ref().unwrap().hold_publication()
+    }
+
+    /// Schema v4: (base files, base bytes, segments, delta bytes, index
+    /// bytes in memory, filter bytes in memory).
+    pub fn v4_sizes(&self) -> Option<(usize, u64, usize, u64, u64, u64)> {
+        self.v4.as_ref().map(|s| s.sizes())
+    }
+
     /// Ingest a list of pre-built SST files into the `AddressToAccount` CF.
     /// Files in `paths` must have non-overlapping key ranges among themselves
     /// (otherwise they all land in L0 anyway). Across calls the key ranges may
@@ -1586,6 +1971,11 @@ impl DataBaseRef {
     }
 
     pub fn flush(&self) -> Result<(), Error> {
+        // Schema v4: the memtable becomes segments, with the infos of its
+        // blocks.
+        if let Some(store) = &self.v4 {
+            return store.flush();
+        }
         // Flush every named column family. `DB::flush()` from rocksdb-rs only
         // flushes the default CF (which we don't use), so it is unsafe to rely
         // on for durability — especially under bulk-load (WAL disabled), where
@@ -1601,18 +1991,25 @@ impl DataBaseRef {
         for cf_type in [
             StorageTypeColumn::BlockHashToBlockInfo,
             StorageTypeColumn::BlockNumToBlockHash,
+            StorageTypeColumn::BlockNumToBlockInfo,
             StorageTypeColumn::AddressToAccount,
             StorageTypeColumn::AddressToStorage,
             StorageTypeColumn::HashToCode,
             StorageTypeColumn::LatestBlockHash,
         ] {
-            let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
-            self.db.flush_cf(cf)?;
+            // `BlockNumToBlockInfo` is optional; schema v4 has no versioned
+            // CFs.
+            if let Some(cf) = self.db.cf_handle(cf_type.to_str()) {
+                self.db.flush_cf(cf)?;
+            }
         }
         Ok(())
     }
 
     pub fn compact(&self) -> Result<(), Error> {
+        if self.v4.is_some() {
+            return self.v4_compact();
+        }
         // Compact each column family separately to reduce memory usage
         let column_families = [
             StorageTypeColumn::LatestBlockHash,
@@ -1621,6 +2018,7 @@ impl DataBaseRef {
             StorageTypeColumn::AddressToAccount,
             StorageTypeColumn::AddressToStorage,
             StorageTypeColumn::HashToCode,
+            StorageTypeColumn::BlockNumToBlockInfo,
         ];
 
         // Force bottommost-level compaction. The archive bulk-load path
@@ -1641,26 +2039,21 @@ impl DataBaseRef {
         // partitioned index the read path is tuned for (and resizing the files
         // to `target_file_size_base`). This makes the final compact O(DB size)
         // once, which is the intended one-time cost of a bulk-load finalize.
+        // Not `kForceOptimized`: in RocksDB 10.7 it can leave old bottommost
+        // files that follow one this compaction has just written unrewritten
+        // while reporting the range done.
         let compact_opts = Self::force_bottommost_compact_options();
 
         for cf_type in column_families {
-            let cf = self.db.cf_handle(cf_type.to_str()).unwrap();
+            // `BlockNumToBlockInfo` is optional.
+            let Some(cf) = self.db.cf_handle(cf_type.to_str()) else {
+                continue;
+            };
             info!(target: "archive_compact", "Compacting column family: {}", cf_type);
 
-            // For large column families, compact by key range (first byte prefix)
-            // to further reduce memory usage
             match cf_type {
-                StorageTypeColumn::AddressToAccount => {
-                    // Key structure: address (32) || block_num (32) = 64 bytes.
-                    // KEY_LEN must equal the full encoded key width so the
-                    // per-range `end` bound (`nibble || 0xFF..`) covers every
-                    // reachable key in the range and leaves no gap between
-                    // consecutive ranges.
-                    self.compact_cf_by_prefix::<64>(cf, &compact_opts);
-                }
-                StorageTypeColumn::AddressToStorage => {
-                    // Key structure: address (32) || slot (32) || block_num (32) = 96 bytes.
-                    self.compact_cf_by_prefix::<96>(cf, &compact_opts);
+                StorageTypeColumn::AddressToAccount | StorageTypeColumn::AddressToStorage => {
+                    self.compact_cf_in_ranges(cf_type)?;
                 }
                 _ => {
                     // Small column families can be compacted in one go
@@ -1685,21 +2078,69 @@ impl DataBaseRef {
     fn force_bottommost_compact_options() -> CompactOptions {
         let mut opts = CompactOptions::default();
         opts.set_bottommost_level_compaction(BottommostLevelCompaction::Force);
+        // Lets the range compactions of `compact_cf_in_ranges` run at once.
+        opts.set_exclusive_manual_compaction(false);
         opts
     }
 
-    /// Compact a column family in 16 ranges based on first byte's high nibble.
-    /// This reduces memory usage by processing smaller chunks at a time.
-    fn compact_cf_by_prefix<const KEY_LEN: usize>(&self, cf: &ColumnFamily, opts: &CompactOptions) {
-        for i in 0u8..16 {
-            let start = [i << 4];
-            let mut end = [0xFFu8; KEY_LEN];
-            end[0] = (i << 4) | 0x0F;
-            info!(target: "archive_compact", "  Range {}/16: 0x{:02X}-0x{:02X}",
-                i + 1, i << 4, (i << 4) | 0x0F);
-            self.db
-                .compact_range_cf_opt(cf, Some(&start), Some(&end), opts);
-        }
+    /// Compacts a column family in `COMPACT_RANGES` ranges of about equal size,
+    /// `COMPACT_WORKERS` at a time. Each range is a smaller compaction than the
+    /// whole column family, which bounds memory.
+    ///
+    /// The split keys come from the bottommost files, which hold nearly all the
+    /// data. Splitting on a fixed key prefix instead leaves one range far
+    /// bigger than the rest, since a storage key starts with its contract's
+    /// address hash and one big contract sits in one range; on BSC that range
+    /// ran alone for over an hour after the others had finished.
+    fn compact_cf_in_ranges(&self, cf_type: StorageTypeColumn) -> Result<(), Error> {
+        const COMPACT_RANGES: usize = 64;
+        const COMPACT_WORKERS: usize = 16;
+
+        let name = cf_type.to_str();
+        let files: Vec<_> = self
+            .db
+            .live_files()?
+            .into_iter()
+            .filter(|f| f.column_family_name == name)
+            .collect();
+        let bottom = files.iter().map(|f| f.level).max();
+        // A v3 file's start key carries the 8-byte timestamp; compaction bounds don't.
+        let ts_len = if self.udt { 8 } else { 0 };
+        let bottom_files = files
+            .into_iter()
+            .filter(|f| Some(f.level) == bottom)
+            .filter_map(|f| {
+                let key = f.start_key?;
+                Some((key[..key.len() - ts_len].to_vec(), f.size))
+            })
+            .collect();
+        let splits = balanced_split_keys(bottom_files, COMPACT_RANGES);
+
+        let bounds: Vec<Option<&[u8]>> = std::iter::once(None)
+            .chain(splits.iter().map(|k| Some(k.as_slice())))
+            .chain(std::iter::once(None))
+            .collect();
+        let ranges = bounds.len() - 1;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..COMPACT_WORKERS.min(ranges) {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= ranges {
+                        break;
+                    }
+                    let cf = self.db.cf_handle(name).unwrap();
+                    self.db.compact_range_cf_opt(
+                        cf,
+                        bounds[i],
+                        bounds[i + 1],
+                        &Self::force_bottommost_compact_options(),
+                    );
+                    info!(target: "archive_compact", "  Range {}/{} done", i + 1, ranges);
+                });
+            }
+        });
+        Ok(())
     }
 
     /// Post-compaction sanity check for the versioned archive CFs.
@@ -1723,6 +2164,9 @@ impl DataBaseRef {
     /// Also logs a per-CF summary (file count / max size / total) so operators
     /// can see the LSM shape before/after.
     pub fn verify_archive_compacted(&self) -> Result<(), Error> {
+        if self.v4.is_some() {
+            return Ok(());
+        }
         // 2x target_file_size_base (128 MiB). RocksDB may slightly exceed the
         // target for a single oversized key, but nothing legitimate approaches
         // 256 MiB under target_file_size_multiplier = 1; a ~512 MiB file is an
@@ -1767,6 +2211,49 @@ impl DataBaseRef {
         }
         Ok(())
     }
+}
+
+fn v4_no_latest_scan() -> Error {
+    Error::UnSupported("latest-state scans of a schema v4 archive are not implemented".into())
+}
+
+/// The span a schema v4 read proves: from the version read (0 if none) up
+/// to the block before the key's next version, as far as the reader's view
+/// reaches. Also whether that next version is what ended it.
+fn v4_span<V>(
+    read: &v4::Read,
+    version: Option<u64>,
+    value: V,
+    view: &state_cache::ReadView,
+) -> (Span<V>, bool) {
+    (
+        Span {
+            lo: version.unwrap_or(0),
+            hi: (read.next - 1).min(view.head()),
+            found: version.is_some(),
+            value,
+        },
+        read.next <= view.head(),
+    )
+}
+
+/// Picks keys from `(start key, size)` file entries that cut the files into
+/// about `ranges` runs of at most `total / ranges` each, or one file where a
+/// file alone is bigger.
+fn balanced_split_keys(mut files: Vec<(Vec<u8>, usize)>, ranges: usize) -> Vec<Vec<u8>> {
+    files.sort();
+    let total: usize = files.iter().map(|(_, size)| size).sum();
+    let step = total.div_ceil(ranges).max(1);
+    let mut splits: Vec<Vec<u8>> = Vec::new();
+    let mut run = 0;
+    for (key, size) in files {
+        if run > 0 && run + size > step && splits.last() != Some(&key) {
+            splits.push(key);
+            run = 0;
+        }
+        run += size;
+    }
+    splits
 }
 
 /// Read options for the latest-state scans in [`LatestStateDBIterator`].
@@ -1821,14 +2308,14 @@ impl DataBaseRef {
     /// account address -> raw account
     /// Returns the latest state for each address (the record with highest block_num)
     fn account_iter_walking(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
+        let rocks = self.db.get();
         // Records for the same address are consecutive. The newest version is
         // the FIRST record of the prefix under inverted (newest-first) encoding,
         // and the LAST record under legacy ascending encoding.
         let inverted = inverted_block_encoding();
-        let mut iter = self
-            .db
+        let mut iter = rocks
             .iterator_cf_opt(
-                self.db
+                rocks
                     .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
                     .unwrap(),
                 latest_state_scan_read_options(true),
@@ -1942,7 +2429,7 @@ impl DataBaseRef {
         column: StorageTypeColumn,
     ) -> impl Iterator<Item = Result<([u8; PREFIX_LEN], Box<[u8]>), Error>> {
         // `db` is `&'static`, so the returned iterator borrows nothing of `self`.
-        let db = self.db;
+        let db = self.db.get();
         let mut iter = db.iterator_cf_opt(
             db.cf_handle(column.to_str()).unwrap(),
             latest_state_scan_read_options(false),
@@ -2040,14 +2527,14 @@ impl DataBaseRef {
     /// account address | storage index -> storage value
     /// Returns the latest state for each (address, index) pair (the record with highest block_num)
     fn storage_iter_walking(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
+        let rocks = self.db.get();
         // Records for the same (address, index) are consecutive. The newest is
         // the FIRST record of the prefix under inverted encoding, the LAST under
         // legacy ascending encoding.
         let inverted = inverted_block_encoding();
-        let mut iter = self
-            .db
+        let mut iter = rocks
             .iterator_cf_opt(
-                self.db
+                rocks
                     .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
                     .unwrap(),
                 latest_state_scan_read_options(true),
@@ -2165,7 +2652,9 @@ impl LatestStateDBIterator for DataBaseRef {
     /// Returns the latest state for each address (the record with highest block_num)
     fn account_iter(&self) -> impl Iterator<Item = Result<(H256, NewAccount), Error>> {
         let iter: Box<dyn Iterator<Item = Result<(H256, NewAccount), Error>> + '_> =
-            if skip_version_tails() {
+            if self.v4.is_some() {
+                Box::new(std::iter::once(Err(v4_no_latest_scan())))
+            } else if skip_version_tails() {
                 Box::new(self.account_iter_skipping_tails())
             } else {
                 Box::new(self.account_iter_walking())
@@ -2175,29 +2664,38 @@ impl LatestStateDBIterator for DataBaseRef {
 
     /// code hash -> code
     fn code_iter(&self) -> impl Iterator<Item = Result<(H256, Bytes), Error>> {
-        self.db
-            .iterator_cf_opt(
-                self.db
-                    .cf_handle(StorageTypeColumn::HashToCode.to_str())
-                    .unwrap(),
-                rocksdb_read_options(),
-                IteratorMode::Start,
-            )
-            .map(|item| {
-                if item.is_err() {
-                    return Err(Error::RocksDB(item.unwrap_err()));
-                }
-                let (key, value) = item.unwrap();
-                let code_hash = H256::from_slice(key.as_ref());
-                Ok((code_hash, Bytes::from(value)))
-            })
+        if self.v4.is_some() {
+            let none: Box<dyn Iterator<Item = Result<(H256, Bytes), Error>> + '_> =
+                Box::new(std::iter::once(Err(v4_no_latest_scan())));
+            return none;
+        }
+        Box::new(
+            self.db
+                .iterator_cf_opt(
+                    self.db
+                        .cf_handle(StorageTypeColumn::HashToCode.to_str())
+                        .unwrap(),
+                    rocksdb_read_options(),
+                    IteratorMode::Start,
+                )
+                .map(|item| {
+                    if item.is_err() {
+                        return Err(Error::RocksDB(item.unwrap_err()));
+                    }
+                    let (key, value) = item.unwrap();
+                    let code_hash = H256::from_slice(key.as_ref());
+                    Ok((code_hash, Bytes::from(value)))
+                }),
+        )
     }
 
     /// account address | storage index -> storage value
     /// Returns the latest state for each (address, index) pair (the record with highest block_num)
     fn storage_iter(&self) -> impl Iterator<Item = Result<(H256, H256, U256), Error>> {
         let iter: Box<dyn Iterator<Item = Result<(H256, H256, U256), Error>> + '_> =
-            if skip_version_tails() {
+            if self.v4.is_some() {
+                Box::new(std::iter::once(Err(v4_no_latest_scan())))
+            } else if skip_version_tails() {
                 Box::new(self.storage_iter_skipping_tails())
             } else {
                 Box::new(self.storage_iter_walking())
@@ -2208,45 +2706,88 @@ impl LatestStateDBIterator for DataBaseRef {
 
 impl BlockIterator for DataBaseRef {
     fn block_info_iter(&self) -> impl Iterator<Item = Result<BlockInfo, Error>> {
-        self.db
-            .iterator_cf_opt(
-                self.db
-                    .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
-                    .unwrap(),
-                rocksdb_read_options(),
-                IteratorMode::Start,
-            )
-            .map(|item| {
-                if item.is_err() {
-                    return Err(Error::RocksDB(item.unwrap_err()));
-                }
-                let (key, value) = item.unwrap();
-                let block_hash = H256::from_slice(key.as_ref());
-                let buf = &mut value.as_ref();
-                let block_header: RawHeader = RawHeader::decode(buf).map_err(|e| {
-                    Error::UnSupported(format!("Failed to decode block header: {}", e))
-                })?;
-                let other = if buf.is_empty() {
-                    Default::default()
-                } else {
-                    serde_json::from_slice(buf).unwrap_or_default()
-                };
-                let block = Block {
-                    header: Header {
-                        hash: block_hash,
-                        inner: block_header,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                Ok(BlockInfo {
-                    inner: block,
-                    other,
-                })
-            })
+        if let Some(store) = &self.v4 {
+            let infos: Box<dyn Iterator<Item = Result<BlockInfo, Error>> + '_> =
+                Box::new(v4_block_hashes(store).map(move |block| {
+                    let (number, hash) = block?;
+                    let (_, info) = store.block(number)?.ok_or_else(|| {
+                        Error::ArchiveV4(format!("block {number} is gone while it is read"))
+                    })?;
+                    decode_block_info(hash, &info)
+                }));
+            return infos;
+        }
+        Box::new(self.block_info_iter_rocks())
     }
 
     fn block_hash_iter(&self) -> impl Iterator<Item = Result<(u64, H256), Error>> {
+        if let Some(store) = &self.v4 {
+            let hashes: Box<dyn Iterator<Item = Result<(u64, H256), Error>> + '_> =
+                Box::new(v4_block_hashes(store));
+            return hashes;
+        }
+        Box::new(self.block_hash_iter_rocks())
+    }
+}
+
+/// The number and hash of every block of a schema v4 archive, in order.
+fn v4_block_hashes(store: &v4::Store) -> impl Iterator<Item = Result<(u64, H256), Error>> + '_ {
+    let mut buffered = std::collections::VecDeque::new();
+    let (mut from, mut done) = (0u64, false);
+    std::iter::from_fn(move || loop {
+        if let Some(block) = buffered.pop_front() {
+            return Some(Ok(block));
+        }
+        if done {
+            return None;
+        }
+        let head = store.head()?;
+        let to = from.saturating_add(1 << 16);
+        if let Err(e) = store.scan_block_prefixes(from, to, &mut |number, _| {
+            match store.block_hash(number)? {
+                Some(hash) => buffered.push_back((number, H256::from(hash))),
+                None => {}
+            }
+            Ok(())
+        }) {
+            done = true;
+            return Some(Err(e));
+        }
+        done = to > head;
+        from = to;
+    })
+}
+
+impl DataBaseRef {
+    fn block_info_iter_rocks(&self) -> impl Iterator<Item = Result<BlockInfo, Error>> + '_ {
+        // Without `BlockHashToBlockInfo`, its records lead the values of
+        // `BlockNumToBlockInfo`.
+        let (cf, hash_in_value) = match self
+            .db
+            .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+        {
+            Some(cf) => (cf, false),
+            None => (
+                self.db
+                    .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
+                    .unwrap(),
+                true,
+            ),
+        };
+        self.db
+            .iterator_cf_opt(cf, rocksdb_read_options(), IteratorMode::Start)
+            .map(move |item| {
+                let (key, value) = item?;
+                let (hash, info) = if hash_in_value {
+                    value.split_at(32)
+                } else {
+                    (&key[..], &value[..])
+                };
+                decode_block_info(H256::from_slice(hash), info)
+            })
+    }
+
+    fn block_hash_iter_rocks(&self) -> impl Iterator<Item = Result<(u64, H256), Error>> + '_ {
         self.db
             .iterator_cf_opt(
                 self.db
@@ -2271,10 +2812,10 @@ impl StateDBProvider for Arc<DataBaseRef> {
     type StateDBReadWrite = StateDB;
     fn db_at(&self, block_id: BlockId) -> Result<Option<Self::StateDBReadWrite>, Error> {
         let block_num: u64;
-        let cached_block_info: Option<BlockInfo>;
+        let cached_block_info: Option<Arc<BlockInfo>>;
         match block_id {
             BlockId::Hash(hash) => {
-                let info = self.read_block_info(hash.block_hash)?;
+                let info = self.read_block_info_arc(hash.block_hash)?;
                 if info.is_none() {
                     return Ok(None);
                 }
@@ -2296,7 +2837,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                     let info = if latest_hash == H256::ZERO {
                         None
                     } else {
-                        self.read_block_info(latest_hash)?
+                        self.read_block_info_arc(latest_hash)?
                     };
                     match info {
                         Some(info) => {
@@ -2315,7 +2856,7 @@ impl StateDBProvider for Arc<DataBaseRef> {
                     if block_hash == H256::ZERO {
                         return Ok(None);
                     }
-                    let info = self.read_block_info(block_hash)?;
+                    let info = self.read_block_info_arc(block_hash)?;
                     if info.is_none() {
                         return Ok(None);
                     }
@@ -2328,7 +2869,8 @@ impl StateDBProvider for Arc<DataBaseRef> {
         let (iterators, cache_view) = new_state_iterators(self, block_num);
 
         // Register with iterator tracker if enabled
-        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
+        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() && self.takes_version_ssts()
+        {
             let id = next_statedb_id();
             let flag = ITERATOR_TRACKER.register(id, block_num, iterators.clone());
             (Some(id), Some(flag))
@@ -2344,6 +2886,8 @@ impl StateDBProvider for Arc<DataBaseRef> {
             cache_view,
             tracker_id,
             timed_out,
+            udt: self.udt.then(|| udt::UdtReader::new(block_num)),
+            udt_head: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -2379,13 +2923,23 @@ fn seek_account(
         return Ok((None, None));
     }
     let version = Some(decode_version_tail(&raw_key_bytes[32..64]));
-    let mut raw_val_bytes = account_iter.value().unwrap();
-    if raw_val_bytes.is_empty() {
-        return Ok((None, version));
+    Ok((
+        decode_account(address, account_iter.value().unwrap()),
+        version,
+    ))
+}
+
+/// Decode an `AddressToAccount` value: slim RLP, empty when deleted.
+fn decode_account(address: H256, raw: &[u8]) -> Option<NewAccount> {
+    decode_cached_account(raw).map(|account| account.with_address(address))
+}
+
+fn decode_cached_account(mut raw: &[u8]) -> Option<CachedAccount> {
+    if raw.is_empty() {
+        return None;
     }
-    let account = SlimAccount::decode(&mut raw_val_bytes).unwrap();
-    let account = NewAccount {
-        address,
+    let account = SlimAccount::decode(&mut raw).unwrap();
+    Some(CachedAccount {
         balance: account.balance,
         nonce: account.nonce,
         code_hash: if account.code_hash.is_zero() {
@@ -2393,8 +2947,18 @@ fn seek_account(
         } else {
             account.code_hash
         },
-    };
-    Ok((Some(account), version))
+    })
+}
+
+/// Decode an `AddressToStorage` value: big-endian, possibly without leading
+/// zeros; empty is zero.
+#[inline]
+fn decode_storage(raw: &[u8]) -> U256 {
+    if raw.is_empty() {
+        U256::ZERO
+    } else {
+        U256::from_be_slice(raw)
+    }
 }
 
 /// After a seek landed on the version of `prefix` read at `block`, step the
@@ -2441,19 +3005,21 @@ fn new_state_iterators(
         .state_cache
         .as_ref()
         .and_then(|cache| cache.view(block_num));
-    let address_to_account_cf = db
-        .db
+    if !db.takes_version_ssts() {
+        // Reads are point lookups (timestamped on v3, in the v4 store); no
+        // iterator to hold or time out.
+        return (SharedIterators::empty(), cache_view);
+    }
+    let rocks = db.db.get();
+    let address_to_account_cf = rocks
         .cf_handle(StorageTypeColumn::AddressToAccount.to_str())
         .unwrap();
-    let account_iterator = db
-        .db
+    let account_iterator = rocks
         .raw_iterator_cf_opt(address_to_account_cf, rocksdb_read_options());
-    let address_to_storage_cf = db
-        .db
+    let address_to_storage_cf = rocks
         .cf_handle(StorageTypeColumn::AddressToStorage.to_str())
         .unwrap();
-    let storage_iterator = db
-        .db
+    let storage_iterator = rocks
         .raw_iterator_cf_opt(address_to_storage_cf, rocksdb_read_options());
     (
         SharedIterators::new(account_iterator, storage_iterator),
@@ -2462,11 +3028,10 @@ fn new_state_iterators(
 }
 
 pub struct StateDB {
-    db: Arc<DataBaseRef>,
     block_num: u64,
     /// `None` when the database is empty (no blocks committed yet).
     /// Stores full BlockInfo to preserve `other` fields (e.g. l1FeeRate).
-    block_info: Option<BlockInfo>,
+    block_info: Option<Arc<BlockInfo>>,
     /// Shared iterators
     iterators: Arc<SharedIterators>,
     /// The state cache view the iterators read under; `None` reads bypass
@@ -2476,6 +3041,14 @@ pub struct StateDB {
     tracker_id: Option<u64>,
     /// Shared timeout flag with IteratorTracker
     timed_out: Option<TimeoutFlag>,
+    /// Schema v3: read options at `block_num` for timestamped lookups.
+    udt: Option<udt::UdtReader>,
+    /// Schema v3: read options at the cache view's head, for state cache
+    /// probes; created on the first probe.
+    udt_head: std::sync::OnceLock<udt::UdtReader>,
+    /// Declared last, so dropped last: dropping the last reference closes
+    /// the database, and the iterators above must be gone by then.
+    db: Arc<DataBaseRef>,
 }
 
 impl Clone for StateDB {
@@ -2483,13 +3056,14 @@ impl Clone for StateDB {
         let (iterators, cache_view) = new_state_iterators(&self.db, self.block_num);
 
         // Register cloned StateDB with iterator tracker if enabled
-        let (tracker_id, timed_out) = if ITERATOR_TRACKER.is_enabled() {
-            let id = next_statedb_id();
-            let flag = ITERATOR_TRACKER.register(id, self.block_num, iterators.clone());
-            (Some(id), Some(flag))
-        } else {
-            (None, None)
-        };
+        let (tracker_id, timed_out) =
+            if ITERATOR_TRACKER.is_enabled() && self.db.takes_version_ssts() {
+                let id = next_statedb_id();
+                let flag = ITERATOR_TRACKER.register(id, self.block_num, iterators.clone());
+                (Some(id), Some(flag))
+            } else {
+                (None, None)
+            };
 
         Self {
             db: self.db.clone(),
@@ -2499,6 +3073,8 @@ impl Clone for StateDB {
             cache_view,
             tracker_id,
             timed_out,
+            udt: self.db.udt.then(|| udt::UdtReader::new(self.block_num)),
+            udt_head: std::sync::OnceLock::new(),
         }
     }
 }
@@ -2535,6 +3111,181 @@ impl StateDB {
         }
         Ok(())
     }
+
+    /// Schema v3: cache `span`, which a miss on `key` just read (it ends at
+    /// the read block), after probing at the head if that can extend it.
+    fn udt_record<const N: usize, V>(
+        &self,
+        view: &state_cache::ReadView,
+        table: &Table<N, V>,
+        cached: &Option<Arc<Entry<V>>>,
+        col: StorageTypeColumn,
+        key: [u8; N],
+        mut span: Span<V>,
+    ) -> Result<(), Error>
+    where
+        V: Copy + PartialEq + std::fmt::Debug + Send + Sync + 'static,
+    {
+        let mut newer = None;
+        if counted_probe(StateCache::probe(cached, view, self.block_num, &span)) {
+            let reader = self
+                .udt_head
+                .get_or_init(|| udt::UdtReader::new(view.head()));
+            match reader.get(self.db.db.get(), col, &key)?.map(|f| f.block) {
+                // The newest version at the head is above the read one, or
+                // the key was written after the read block.
+                Some(newest) if !span.found || newest > span.lo => {
+                    STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                    newer = Some(newest);
+                }
+                _ => span.hi = view.head(),
+            }
+        }
+        table.record_udt(key, span, newer);
+        Ok(())
+    }
+
+    /// Read only cache misses in a batch, retaining the scalar path's span
+    /// learning and head-probe policy. Account and storage reads share this.
+    fn read_udt_many<const N: usize, V>(
+        &self,
+        reader: &udt::UdtReader,
+        col: StorageTypeColumn,
+        keys: &[[u8; N]],
+        table: Option<&Table<N, V>>,
+        decode: impl Fn(&[u8]) -> V,
+    ) -> Result<Vec<V>, Error>
+    where
+        V: Copy + PartialEq + Debug + Send + Sync + 'static,
+    {
+        disable_perf_counters();
+        self.check_timeout()?;
+        let (hits, misses, latency) = match col {
+            StorageTypeColumn::AddressToAccount => (
+                &STORAGE_METRICS.account_cache_hits,
+                &STORAGE_METRICS.account_cache_misses,
+                &STORAGE_METRICS.read_account_many_latency,
+            ),
+            StorageTypeColumn::AddressToStorage => (
+                &STORAGE_METRICS.storage_cache_hits,
+                &STORAGE_METRICS.storage_cache_misses,
+                &STORAGE_METRICS.read_storage_many_latency,
+            ),
+            _ => unreachable!("only account and storage CFs are timestamped"),
+        };
+        let cache = self.cache_view.as_ref().zip(table);
+        let mut out = vec![decode(&[]); keys.len()];
+        let mut pending = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            let mut cached = None;
+            if let Some((_, table)) = cache {
+                match table.lookup(key, self.block_num) {
+                    Lookup::Hit(span) => {
+                        hits.increment(1);
+                        out[i] = span.value;
+                        continue;
+                    }
+                    Lookup::Miss(entry) => {
+                        misses.increment(1);
+                        record_state_cache_miss(&entry, self.block_num);
+                        cached = entry;
+                    }
+                }
+            }
+            if is_op_system_address(key[..32].try_into().unwrap()) {
+                match col {
+                    StorageTypeColumn::AddressToAccount => {
+                        STORAGE_METRICS.archive_op_system_account_gets.increment(1);
+                    }
+                    StorageTypeColumn::AddressToStorage => {
+                        STORAGE_METRICS.archive_op_system_storage_gets.increment(1);
+                    }
+                    _ => {}
+                }
+            }
+            pending.push((i, cached));
+        }
+        if !pending.is_empty() {
+            let raw_keys: Vec<&[u8]> = pending.iter().map(|(i, _)| keys[*i].as_slice()).collect();
+            let start = std::time::Instant::now();
+            let found = reader.get_many(self.db.db.get(), col, &raw_keys)?;
+            latency.record(start.elapsed().as_secs_f64());
+            for ((i, cached), found) in pending.into_iter().zip(found) {
+                out[i] = decode(found.as_ref().map_or(&[], |f| f.value()));
+                if let Some((view, table)) = cache {
+                    let span = Span {
+                        lo: found.as_ref().map_or(0, |f| f.block),
+                        hi: self.block_num,
+                        found: found.is_some(),
+                        value: out[i],
+                    };
+                    self.udt_record(view, table, &cached, col, keys[i], span)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Record whether a state-cache miss was cold or warm (above/below/gap and volatile).
+fn record_state_cache_miss<V>(entry: &Option<Arc<Entry<V>>>, block: u64) {
+    match entry {
+        None => STORAGE_METRICS.state_cache_cold_misses.increment(1),
+        Some(entry) => {
+            match entry.miss_reason(block) {
+                MissReason::Above => STORAGE_METRICS.state_cache_warm_misses_above.increment(1),
+                MissReason::Below => STORAGE_METRICS.state_cache_warm_misses_below.increment(1),
+                MissReason::Gap => STORAGE_METRICS.state_cache_warm_misses_gap.increment(1),
+            }
+            if entry.is_volatile() {
+                STORAGE_METRICS.state_cache_warm_misses_volatile.increment(1);
+            }
+        }
+    }
+}
+
+/// Keccak256 hashes of fixed OP-stack system addresses whose archive reads are
+/// counted for observability:
+/// - `0x4200000000000000000000000000000000000015` (L1Block)
+/// - `0x4200000000000000000000000000000000000019` (BaseFeeVault)
+/// - `0x420000000000000000000000000000000000001A` (L1FeeVault)
+/// - `0x420000000000000000000000000000000000001B` (OperatorFeeVault)
+static OP_SYSTEM_ADDR_HASHES: LazyLock<[[u8; 32]; 4]> = LazyLock::new(|| {
+    const ADDRS: [[u8; 20]; 4] = [
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15],
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x19],
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1a],
+        [0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1b],
+    ];
+    ADDRS.map(|a| keccak256(a).0)
+});
+
+#[inline]
+fn is_op_system_address(addr_hash: &[u8; 32]) -> bool {
+    OP_SYSTEM_ADDR_HASHES.iter().any(|h| h == addr_hash)
+}
+
+/// Count a miss's probe decision; whether it probes.
+fn counted_probe(probe: Probe) -> bool {
+    match probe {
+        Probe::Yes => {
+            STORAGE_METRICS.state_cache_probes.increment(1);
+            true
+        }
+        Probe::AtHead => {
+            STORAGE_METRICS
+                .state_cache_probes_skipped_at_head
+                .increment(1);
+            false
+        }
+        Probe::Capped => {
+            STORAGE_METRICS
+                .state_cache_probes_skipped_capped
+                .increment(1);
+            false
+        }
+        Probe::No => false,
+    }
 }
 
 impl StateDB {
@@ -2561,9 +3312,65 @@ impl StateDB {
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.storage_cache_misses.increment(1);
+                    record_state_cache_miss(&entry, self.block_num);
                     cached = entry;
                 }
             }
+        }
+        if is_op_system_address(&address.0) {
+            STORAGE_METRICS.archive_op_system_storage_gets.increment(1);
+        }
+
+        if let Some(store) = &self.db.v4 {
+            let start = std::time::Instant::now();
+            let read = store.get(true, &slot_key, self.block_num)?;
+            STORAGE_METRICS
+                .read_storage_latency
+                .record(start.elapsed().as_secs_f64());
+            let (value, version) = match read.found {
+                Some((block, v4::Val::Storage(value))) => {
+                    STORAGE_METRICS.archive_storage_gets_found.increment(1);
+                    (U256::from_be_bytes(value), Some(block))
+                }
+                None => {
+                    STORAGE_METRICS.archive_storage_gets_missing.increment(1);
+                    (U256::ZERO, None)
+                }
+                Some(_) => return Err(Error::ArchiveV4("account value under a slot".into())),
+            };
+            if let Some((view, cache)) = cache {
+                let (span, ended) = v4_span(&read, version, value, view);
+                cache.storage.record(slot_key, span, ended);
+            }
+            return Ok((value, version));
+        }
+
+        if let Some(reader) = &self.udt {
+            let start = std::time::Instant::now();
+            let found = reader.get(self.db.db.get(), StorageTypeColumn::AddressToStorage, &slot_key)?;
+            STORAGE_METRICS
+                .read_storage_latency
+                .record(start.elapsed().as_secs_f64());
+            let (value, version) = found.map_or((U256::ZERO, None), |f| {
+                (decode_storage(f.value()), Some(f.block))
+            });
+            if let Some((view, cache)) = cache {
+                let span = Span {
+                    lo: version.unwrap_or(0),
+                    hi: self.block_num,
+                    found: version.is_some(),
+                    value,
+                };
+                self.udt_record(
+                    view,
+                    &cache.storage,
+                    &cached,
+                    StorageTypeColumn::AddressToStorage,
+                    slot_key,
+                    span,
+                )?;
+            }
+            return Ok((value, version));
         }
 
         let start = std::time::Instant::now();
@@ -2584,13 +3391,7 @@ impl StateDB {
         let (value, version) = match storage_iter.key() {
             Some(raw_key_bytes) if raw_key_bytes[..64] == slot_key => {
                 let version = decode_version_tail(&raw_key_bytes[64..96]);
-                let raw_val_bytes = storage_iter.value().unwrap();
-                let value = if raw_val_bytes.is_empty() {
-                    U256::ZERO
-                } else {
-                    U256::from_be_slice(raw_val_bytes)
-                };
-                (value, Some(version))
+                (decode_storage(storage_iter.value().unwrap()), Some(version))
             }
             Some(_) => (U256::ZERO, None),
             // An invalid iterator means no key at or after the target, unless
@@ -2602,24 +3403,25 @@ impl StateDB {
         };
 
         if let Some((view, cache)) = cache {
-            let probe =
-                version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
-            let (hi, next_version_found) = if probe {
-                STORAGE_METRICS.state_cache_probes.increment(1);
-                newer_version_bound(storage_iter, &slot_key, self.block_num, view.head())
-            } else {
-                (self.block_num, false)
-            };
-            drop(storage_iter_guard);
-            let span = Span {
+            let mut span = Span {
                 lo: version.unwrap_or(0),
-                hi,
+                hi: self.block_num,
                 found: version.is_some(),
                 value,
             };
-            cache
-                .storage
-                .record(slot_key, cached, span, next_version_found);
+            let mut next_version_found = false;
+            if version.is_some()
+                && inverted_block_encoding()
+                && counted_probe(StateCache::probe(&cached, view, self.block_num, &span))
+            {
+                (span.hi, next_version_found) =
+                    newer_version_bound(storage_iter, &slot_key, self.block_num, view.head());
+                if next_version_found {
+                    STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                }
+            }
+            drop(storage_iter_guard);
+            cache.storage.record(slot_key, span, next_version_found);
         }
         Ok((value, version))
     }
@@ -2627,6 +3429,16 @@ impl StateDB {
     /// The slots of `address` holding a non-zero value, with the value.
     fn storage_slots(&self, address: H256) -> Result<Vec<(H256, U256)>, Error> {
         let address_bytes: [u8; 32] = address.into();
+        if self.udt.is_some() {
+            return udt::storage_slots(self.db.db.get(), address_bytes, self.block_num);
+        }
+        if let Some(store) = &self.db.v4 {
+            return Ok(store
+                .storage_slots(&address_bytes, self.block_num)?
+                .into_iter()
+                .map(|(slot, value)| (H256::from(slot), U256::from_be_bytes(value)))
+                .collect());
+        }
         // Seeking to slots that may not exist: past the prefix bloom.
         let address_to_storage_cf = self
             .db
@@ -2675,18 +3487,84 @@ impl StateDBRead for StateDB {
             match cache.accounts.lookup(&address.0, self.block_num) {
                 Lookup::Hit(span) => {
                     STORAGE_METRICS.account_cache_hits.increment(1);
-                    return Ok(span.value.map(|account| NewAccount {
-                        address,
-                        balance: account.balance,
-                        nonce: account.nonce,
-                        code_hash: account.code_hash,
-                    }));
+                    return Ok(span.value.map(|account| account.with_address(address)));
                 }
                 Lookup::Miss(entry) => {
                     STORAGE_METRICS.account_cache_misses.increment(1);
+                    record_state_cache_miss(&entry, self.block_num);
                     cached = entry;
                 }
             }
+        }
+        if is_op_system_address(&address.0) {
+            STORAGE_METRICS.archive_op_system_account_gets.increment(1);
+        }
+        if let Some(store) = &self.db.v4 {
+            let start = std::time::Instant::now();
+            let read = store.get(false, address.as_slice(), self.block_num)?;
+            STORAGE_METRICS
+                .read_account_latency
+                .record(start.elapsed().as_secs_f64());
+            let (account, version) = match read.found {
+                Some((
+                    block,
+                    v4::Val::Account {
+                        nonce,
+                        balance,
+                        code_hash,
+                    },
+                )) => (
+                    Some(CachedAccount {
+                        balance: U256::from_be_bytes(balance),
+                        nonce,
+                        code_hash: H256::from(code_hash),
+                    }),
+                    Some(block),
+                ),
+                Some((block, v4::Val::Deleted)) => (None, Some(block)),
+                None => (None, None),
+                Some(_) => return Err(Error::ArchiveV4("slot value under an account".into())),
+            };
+            if version.is_some() {
+                STORAGE_METRICS.archive_account_gets_found.increment(1);
+            } else {
+                STORAGE_METRICS.archive_account_gets_missing.increment(1);
+            }
+            if let Some((view, cache)) = cache {
+                let (span, ended) = v4_span(&read, version, account, view);
+                cache.accounts.record(address.0, span, ended);
+            }
+            return Ok(account.map(|account| account.with_address(address)));
+        }
+        if let Some(reader) = &self.udt {
+            let start = std::time::Instant::now();
+            let found = reader.get(
+                self.db.db.get(),
+                StorageTypeColumn::AddressToAccount,
+                address.as_slice(),
+            )?;
+            STORAGE_METRICS
+                .read_account_latency
+                .record(start.elapsed().as_secs_f64());
+            let version = found.as_ref().map(|f| f.block);
+            let account = found.and_then(|f| decode_account(address, f.value()));
+            if let Some((view, cache)) = cache {
+                let span = Span {
+                    lo: version.unwrap_or(0),
+                    hi: self.block_num,
+                    found: version.is_some(),
+                    value: account.as_ref().map(CachedAccount::from),
+                };
+                self.udt_record(
+                    view,
+                    &cache.accounts,
+                    &cached,
+                    StorageTypeColumn::AddressToAccount,
+                    address.0,
+                    span,
+                )?;
+            }
+            return Ok(account);
         }
         let mut account_iter_guard = self.iterators.account_iterator.lock().unwrap();
         let account_iter = account_iter_guard
@@ -2694,35 +3572,31 @@ impl StateDBRead for StateDB {
             .ok_or(Error::IteratorTimedOut(self.block_num))?;
         let (account, version) = seek_account(account_iter, address, self.block_num)?;
         if let Some((view, cache)) = cache {
-            let probe =
-                version.is_some() && inverted_block_encoding() && StateCache::should_probe(&cached);
+            let mut span = Span {
+                lo: version.unwrap_or(0),
+                hi: self.block_num,
+                found: version.is_some(),
+                value: account.as_ref().map(CachedAccount::from),
+            };
+            let mut next_version_found = false;
             // Probe under the same lock: another reader of this handle may
             // move the iterator once it is released.
-            let (hi, next_version_found) = if probe {
-                STORAGE_METRICS.state_cache_probes.increment(1);
-                newer_version_bound(
+            if version.is_some()
+                && inverted_block_encoding()
+                && counted_probe(StateCache::probe(&cached, view, self.block_num, &span))
+            {
+                (span.hi, next_version_found) = newer_version_bound(
                     account_iter,
                     address.as_slice(),
                     self.block_num,
                     view.head(),
-                )
-            } else {
-                (self.block_num, false)
-            };
+                );
+                if next_version_found {
+                    STORAGE_METRICS.state_cache_probes_newer.increment(1);
+                }
+            }
             drop(account_iter_guard);
-            let span = Span {
-                lo: version.unwrap_or(0),
-                hi,
-                found: version.is_some(),
-                value: account.as_ref().map(|account| CachedAccount {
-                    balance: account.balance,
-                    nonce: account.nonce,
-                    code_hash: account.code_hash,
-                }),
-            };
-            cache
-                .accounts
-                .record(address.0, cached, span, next_version_found);
+            cache.accounts.record(address.0, span, next_version_found);
         }
         Ok(account)
     }
@@ -2735,6 +3609,60 @@ impl StateDBRead for StateDB {
         self.db.read_code(code_hash)
     }
 
+    fn read_code_many(&self, code_hashes: &[H256]) -> Result<Vec<Option<Bytes>>, Error> {
+        self.db.read_code_many(code_hashes)
+    }
+
+    fn read_account_many(&self, addresses: &[H256]) -> Result<Vec<Option<NewAccount>>, Error> {
+        let Some(reader) = &self.udt else {
+            return addresses
+                .iter()
+                .map(|address| self.read_account(*address))
+                .collect();
+        };
+        let keys: Vec<_> = addresses.iter().map(|address| address.0).collect();
+        let accounts = self.read_udt_many(
+            reader,
+            StorageTypeColumn::AddressToAccount,
+            &keys,
+            self.db.state_cache.as_ref().map(|cache| &cache.accounts),
+            decode_cached_account,
+        )?;
+        Ok(addresses
+            .iter()
+            .zip(accounts)
+            .map(|(address, account)| account.map(|account| account.with_address(*address)))
+            .collect())
+    }
+
+    fn read_storage_many(&self, keys: &[(H256, H256)]) -> Result<Vec<U256>, Error> {
+        let Some(reader) = &self.udt else {
+            return keys
+                .iter()
+                .map(|(address, key)| self.read_storage(*address, *key))
+                .collect();
+        };
+        let keys: Vec<[u8; 64]> = keys
+            .iter()
+            .map(|(address, slot)| {
+                let mut key = [0; 64];
+                key[..32].copy_from_slice(address.as_slice());
+                key[32..].copy_from_slice(slot.as_slice());
+                key
+            })
+            .collect();
+        self.read_udt_many(
+            reader,
+            StorageTypeColumn::AddressToStorage,
+            &keys,
+            self.db.state_cache.as_ref().map(|cache| &cache.storage),
+            decode_storage,
+        )
+    }
+
+    // Leave supports_batched_reads at its conservative default: explicit
+    // batches benefit, without enabling speculative multicall prefetch.
+
     fn read_block_hash(&self, block_num: u64) -> Result<H256, Error> {
         if let Some(info) = &self.block_info {
             if block_num == self.block_num {
@@ -2745,12 +3673,18 @@ impl StateDBRead for StateDB {
     }
 
     fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, Error> {
+        Ok(self
+            .read_block_info_arc(block_hash)?
+            .map(|info| info.as_ref().clone()))
+    }
+
+    fn read_block_info_arc(&self, block_hash: H256) -> Result<Option<Arc<BlockInfo>>, Error> {
         if let Some(info) = &self.block_info {
             if block_hash == info.header.hash {
-                return Ok(Some(info.clone()));
+                return Ok(Some(Arc::clone(info)));
             }
         }
-        self.db.read_block_info(block_hash)
+        self.db.read_block_info_arc(block_hash)
     }
     fn read_latest_block_hash(&self) -> Result<H256, Error> {
         match &self.block_info {
@@ -2862,6 +3796,11 @@ impl StateDBWrite for Arc<DataBaseRef> {
         block_num: u64,
         block_hash: H256,
     ) -> Result<(), Error> {
+        if self.v4.is_some() {
+            batch.note_block(block_num);
+            batch.v4_hashes.push((block_num, block_hash));
+            return Ok(());
+        }
         let block_num_to_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::BlockNumToBlockHash.to_str())
@@ -2882,10 +3821,6 @@ impl StateDBWrite for Arc<DataBaseRef> {
         batch: &mut Self::DBWriteBatch,
         block_info: BlockInfo,
     ) -> Result<(), Error> {
-        let block_hash_to_block_info_cf = self
-            .db
-            .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
-            .unwrap();
         let block_hash_bytes: [u8; 32] = block_info.header.hash.into();
         let mut block_info_bytes = Vec::new();
         let block_header: RawHeader = block_info.header.inner.clone();
@@ -2896,11 +3831,31 @@ impl StateDBWrite for Arc<DataBaseRef> {
             })?;
             block_info_bytes.extend_from_slice(&other_bytes);
         }
-        batch.inner.put_cf(
-            block_hash_to_block_info_cf,
-            block_hash_bytes,
-            block_info_bytes,
-        );
+        let hash = block_info.header.hash;
+        let number = block_info.header.number;
+        if self.v4.is_some() {
+            batch.block_infos.push(block_index::entry(&hash, number)?);
+            batch.v4_infos.push((number, hash, block_info_bytes));
+            return Ok(());
+        }
+        if self.block_index.is_some() {
+            let cf = self
+                .db
+                .cf_handle(StorageTypeColumn::BlockNumToBlockInfo.to_str())
+                .unwrap();
+            batch.block_infos.push(block_index::entry(&hash, number)?);
+            batch.inner.put_cf(
+                cf,
+                block_index::key(number),
+                block_index::record(hash, &block_info_bytes),
+            );
+        } else {
+            let cf = self
+                .db
+                .cf_handle(StorageTypeColumn::BlockHashToBlockInfo.to_str())
+                .unwrap();
+            batch.inner.put_cf(cf, block_hash_bytes, block_info_bytes);
+        }
         Ok(())
     }
 
@@ -2940,6 +3895,10 @@ impl StateDBWrite for Arc<DataBaseRef> {
         code_hash: H256,
         code: Bytes,
     ) -> Result<(), Error> {
+        if self.v4.is_some() {
+            batch.v4_codes.push((code_hash, code));
+            return Ok(());
+        }
         let address_to_code_cf = self
             .db
             .cf_handle(StorageTypeColumn::HashToCode.to_str())
@@ -2956,6 +3915,10 @@ impl StateDBWrite for Arc<DataBaseRef> {
         batch: &mut Self::DBWriteBatch,
         block_hash: H256,
     ) -> Result<(), Error> {
+        if self.v4.is_some() {
+            batch.v4_head = Some(block_hash);
+            return Ok(());
+        }
         let latest_block_hash_cf = self
             .db
             .cf_handle(StorageTypeColumn::LatestBlockHash.to_str())
@@ -2967,6 +3930,9 @@ impl StateDBWrite for Arc<DataBaseRef> {
     }
 
     fn commit(&self, mut batch: Self::DBWriteBatch) -> Result<(), Error> {
+        if let Some(store) = &self.v4 {
+            return self.v4_commit(store, batch);
+        }
         if !batch.account_writes.is_empty() {
             let address_to_account_cf = self
                 .db
@@ -2980,15 +3946,25 @@ impl StateDBWrite for Arc<DataBaseRef> {
             for (key, value) in batch.account_writes {
                 if let Some((prev_key, prev_value)) = last_write.take() {
                     if prev_key != key {
-                        batch
-                            .inner
-                            .put_cf(address_to_account_cf, prev_key, prev_value);
+                        put_account_version(
+                            &mut batch.inner,
+                            address_to_account_cf,
+                            &prev_key,
+                            &prev_value,
+                            self.udt,
+                        );
                     }
                 }
                 last_write = Some((key, value));
             }
             if let Some((key, value)) = last_write {
-                batch.inner.put_cf(address_to_account_cf, key, value);
+                put_account_version(
+                    &mut batch.inner,
+                    address_to_account_cf,
+                    &key,
+                    &value,
+                    self.udt,
+                );
             }
         }
 
@@ -3005,25 +3981,186 @@ impl StateDBWrite for Arc<DataBaseRef> {
             for (key, value) in batch.storage_writes {
                 if let Some((prev_key, prev_value)) = last_write.take() {
                     if prev_key != key {
-                        batch
-                            .inner
-                            .put_cf(address_to_storage_cf, prev_key, prev_value);
+                        put_storage_version(
+                            &mut batch.inner,
+                            address_to_storage_cf,
+                            &prev_key,
+                            &prev_value,
+                            self.udt,
+                        );
                     }
                 }
                 last_write = Some((key, value));
             }
             if let Some((key, value)) = last_write {
-                batch.inner.put_cf(address_to_storage_cf, key, value);
+                put_storage_version(
+                    &mut batch.inner,
+                    address_to_storage_cf,
+                    &key,
+                    &value,
+                    self.udt,
+                );
             }
         }
 
+        // Indexed before the write: a reader that sees the block must find it.
+        if let Some(index) = &self.block_index {
+            index.note(&batch.block_infos)?;
+        }
         let mut wo = WriteOptions::default();
         wo.set_sync(batch.sync);
         self.db.write_opt(batch.inner, &wo)?;
+        if let Some(index) = &self.block_index {
+            index.committed();
+        }
         if let (Some(cache), Some(max)) = (&self.state_cache, batch.max_block) {
             cache.advance_head(max);
         }
         Ok(())
+    }
+}
+
+impl DataBaseRef {
+    /// Schema v4: put the batch into the store's memtable: the account and
+    /// storage versions, the block infos and the new code. Nothing of it is
+    /// in a file until the memtable is flushed; a process that stops before
+    /// that opens at the last flushed block, and the node fetches the later
+    /// ones again.
+    fn v4_commit(
+        &self,
+        store: &v4::Store,
+        mut batch: ArchiveRocksDBWriteBatch,
+    ) -> Result<(), Error> {
+        type Versions = (Vec<([u8; 32], v4::Val)>, Vec<([u8; 64], [u8; 32])>);
+        let mut blocks: std::collections::BTreeMap<u64, Versions> = Default::default();
+        // Stable sorts: among equal keys the last write stays last and wins.
+        let mut accounts = std::mem::take(&mut batch.account_writes);
+        accounts.sort_by(|a, b| a.0.cmp(&b.0));
+        for (i, (key, value)) in accounts.iter().enumerate() {
+            if accounts.get(i + 1).is_some_and(|next| next.0 == *key) {
+                continue;
+            }
+            let val = match decode_cached_account(value) {
+                Some(account) => v4::Val::Account {
+                    nonce: account.nonce,
+                    balance: account.balance.to_be_bytes(),
+                    code_hash: account.code_hash.0,
+                },
+                None => v4::Val::Deleted,
+            };
+            let address: [u8; 32] = key[..32].try_into().unwrap();
+            let block = decode_version_tail(&key[32..]);
+            blocks.entry(block).or_default().0.push((address, val));
+        }
+        let mut slots = std::mem::take(&mut batch.storage_writes);
+        slots.sort_by(|a, b| a.0.cmp(&b.0));
+        for (i, (key, value)) in slots.iter().enumerate() {
+            if slots.get(i + 1).is_some_and(|next| next.0 == *key) {
+                continue;
+            }
+            let slot: [u8; 64] = key[..64].try_into().unwrap();
+            let block = decode_version_tail(&key[64..]);
+            blocks.entry(block).or_default().1.push((slot, *value));
+        }
+        // A block the batch only names moves the head.
+        if let Some(max) = batch.max_block {
+            blocks.entry(max).or_default();
+        }
+        // A block's hash and its info are written apart; one without an
+        // info keeps its hash.
+        let mut infos: std::collections::BTreeMap<u64, (H256, Vec<u8>)> = batch
+            .v4_hashes
+            .iter()
+            .map(|(number, hash)| (*number, (*hash, Vec::new())))
+            .collect();
+        for (number, hash, info) in std::mem::take(&mut batch.v4_infos) {
+            if infos.get(&number).is_some_and(|held| held.0 != hash) {
+                return Err(Error::UnSupported(format!(
+                    "block {number} is written with two hashes"
+                )));
+            }
+            infos.insert(number, (hash, info));
+        }
+        // The head is the last block written and cannot be anything else.
+        if let Some(head) = batch.v4_head {
+            let top = infos
+                .keys()
+                .next_back()
+                .copied()
+                .max(blocks.keys().next_back().copied())
+                .max(store.head());
+            let hash = match top {
+                Some(top) => match infos.get(&top) {
+                    Some(info) => Some(info.0),
+                    None => store.block_hash(top)?.map(H256::from),
+                },
+                None => None,
+            };
+            if hash != Some(head) {
+                return Err(Error::UnSupported(format!(
+                    "the head of a schema v4 archive is the last block written ({top:?}): \
+                     it cannot be moved to {head}"
+                )));
+            }
+        }
+        let versions: Vec<v4::BlockVersions> = blocks
+            .iter()
+            .map(|(block, (accounts, slots))| (*block, accounts.as_slice(), slots.as_slice()))
+            .collect();
+        let infos: Vec<(u64, v4::BlockRec)> = infos
+            .into_iter()
+            .map(|(number, (hash, info))| (number, (hash.0, Arc::from(info))))
+            .collect();
+        let codes: Vec<([u8; 32], Arc<[u8]>)> = batch
+            .v4_codes
+            .iter()
+            .map(|(hash, code)| (hash.0, Arc::from(&code[..])))
+            .collect();
+        // Indexed before the write: a reader that sees the block must find it.
+        if let Some(index) = &self.block_index {
+            index.note(&batch.block_infos)?;
+        }
+        store.commit(&versions, &infos, &codes)?;
+        if let Some(index) = &self.block_index {
+            index.committed();
+        }
+        if let (Some(cache), Some(max)) = (&self.state_cache, batch.max_block) {
+            cache.advance_head(max);
+        }
+        store.flush_if_due()
+    }
+}
+
+fn put_account_version(
+    batch: &mut WriteBatch,
+    cf: &ColumnFamily,
+    key: &[u8; 64],
+    value: &[u8],
+    udt: bool,
+) {
+    if udt {
+        let ts = udt::encode_ts(decode_version_tail(&key[32..]));
+        batch.put_cf_with_ts(cf, &key[..32], ts, value);
+    } else {
+        batch.put_cf(cf, key, value);
+    }
+}
+
+/// Write one storage version; see [`put_account_version`]. Schema v3 also
+/// strips the value's leading zeros.
+#[inline]
+fn put_storage_version(
+    batch: &mut WriteBatch,
+    cf: &ColumnFamily,
+    key: &[u8; 96],
+    value: &[u8; 32],
+    udt: bool,
+) {
+    if udt {
+        let ts = udt::encode_ts(decode_version_tail(&key[64..]));
+        batch.put_cf_with_ts(cf, &key[..64], ts, udt::strip_leading_zeros(value));
+    } else {
+        batch.put_cf(cf, key, value);
     }
 }
 
@@ -3040,6 +4177,31 @@ mod tests {
     use alloy::serde::OtherFields;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_balanced_split_keys() {
+        let file = |k: u8, size| (vec![k], size);
+        // One big file between small ones gets a range of its own.
+        let files = vec![
+            file(5, 10),
+            file(1, 10),
+            file(3, 100),
+            file(7, 10),
+            file(9, 10),
+        ];
+        assert_eq!(balanced_split_keys(files, 4), vec![vec![3], vec![5]]);
+        // Even sizes split evenly; one range means no split.
+        let even: Vec<_> = (0..8).map(|k| file(k, 10)).collect();
+        assert_eq!(
+            balanced_split_keys(even.clone(), 4),
+            vec![vec![2], vec![4], vec![6]]
+        );
+        assert!(balanced_split_keys(even, 1).is_empty());
+        // Files that start on the same key (a v3 key's versions) give one split.
+        let same = vec![file(1, 10), file(2, 10), file(2, 10), file(3, 10)];
+        assert_eq!(balanced_split_keys(same, 4), vec![vec![2], vec![3]]);
+        assert!(balanced_split_keys(Vec::new(), 4).is_empty());
+    }
 
     #[test]
     fn oversized_base_fee_does_not_fall_back_to_legacy_header() {
@@ -3748,8 +4910,22 @@ mod inverted_encoding_tests {
                     .read_storage_and_height(addr, slot)
                     .unwrap()
             };
-            // Second read probes: the next version (30) is above the head.
+            // Second read probes (below the head, which would not): the next
+            // version (30) is above the head, so the span stops at the head.
             assert_eq!(read(15), (U256::from(10), Some(10)));
+            assert_eq!(read(19), (U256::from(10), Some(10)));
+            let mut slot_key = [0u8; 64];
+            slot_key[..32].copy_from_slice(addr.as_slice());
+            slot_key[32..].copy_from_slice(slot.as_slice());
+            let cache = db.state_cache.as_ref().unwrap();
+            assert!(matches!(
+                cache.storage.lookup(&slot_key, 20),
+                Lookup::Hit(Span { lo: 10, hi: 20, .. })
+            ));
+            assert!(matches!(
+                cache.storage.lookup(&slot_key, 21),
+                Lookup::Miss(_)
+            ));
             assert_eq!(read(20), (U256::from(10), Some(10)));
             assert_eq!(read(25), (U256::from(10), Some(10)));
             // Append block 21 on the head: reads from 21 on see its version.

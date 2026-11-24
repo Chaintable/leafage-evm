@@ -41,11 +41,14 @@ use alloy::primitives::{address, Address, Bytes, B256, U256};
 use alloy::rpc::types::{Block as RpcBlock, BlockTransactions};
 use alloy_evm::{EvmEnv, FromRecoveredTx};
 use anyhow::{anyhow, bail, Context as _, Result};
+use leafage_evm_chains::bsc::cas20::{ACTIVATION_REGISTRY, MARKER_CODE, POLICY_REGISTRY};
 use leafage_evm_chains::bsc::mainnet::{
     bsc_mainnet_fork_transition, bsc_mainnet_spec_at, BscMainnetHardforks, BSC_MAINNET_CHAIN_ID,
     BSC_MAINNET_UPGRADABLE_CONTRACTS,
 };
-use leafage_evm_chains::bsc::{BscEvm, BscHardfork, BscHardforks, BscTxEnv};
+use leafage_evm_chains::bsc::{
+    header_milli_timestamp, BscEvm, BscHardfork, BscHardforks, BscTxEnv,
+};
 use revm::bytecode::Bytecode;
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::context_interface::block::BlobExcessGasAndPrice;
@@ -184,6 +187,9 @@ where
     let prague = forks.is_pascal_active_at_timestamp(number, timestamp);
     let prague_transition =
         prague && !forks.is_pascal_active_at_timestamp(number, parent_timestamp);
+    let jenner = forks.is_jenner_active_at_timestamp(number, timestamp);
+    let jenner_transition =
+        jenner && !forks.is_jenner_active_at_timestamp(number, parent_timestamp);
 
     let post = post_state;
     let started = std::time::Instant::now();
@@ -220,6 +226,11 @@ where
         let code = post.code_by_hash_ref(history.code_hash)?;
         replay.set_code(HISTORY_STORAGE_ADDRESS, code, Some(history.nonce))?;
     }
+    if jenner_transition {
+        let code = Bytecode::new_raw(Bytes::from_static(&MARKER_CODE));
+        replay.set_code(ACTIVATION_REGISTRY, code.clone(), None)?;
+        replay.set_code(POLICY_REGISTRY, code, None)?;
+    }
     if prague {
         // EIP-2935 system call: the contract stores the parent hash at
         // `(number - 1) % HISTORY_SERVE_WINDOW`.
@@ -233,6 +244,7 @@ where
 
     // 2. ordinary transactions
     let coinbase = header.beneficiary;
+    let milli_timestamp = Some(header_milli_timestamp(header.timestamp, header.mix_hash));
     let mut system_txs = Vec::new();
     for (index, tx) in transactions.iter().enumerate() {
         let sender = tx.inner.signer();
@@ -245,7 +257,8 @@ where
         if let Some(patch) = patches::find(patches::PATCHES_BEFORE_TX, &tx_hash) {
             replay.apply_patch(patch)?;
         }
-        let tx_env = BscTxEnv::new(TxEnv::from_recovered_tx(envelope, sender));
+        let mut tx_env = BscTxEnv::new(TxEnv::from_recovered_tx(envelope, sender));
+        tx_env.milli_timestamp = milli_timestamp;
         let gas_price = revm::context::Transaction::effective_gas_price(
             &tx_env,
             header.base_fee_per_gas.unwrap_or_default() as u128,
@@ -279,6 +292,7 @@ where
                 ..Default::default()
             },
             is_system_transaction: true,
+            milli_timestamp,
         };
         let index = replay.receipts.len();
         replay.execute(envelope, sender, tx_env, 0, index)?;
@@ -450,6 +464,13 @@ where
         let (result, mut state) = (outcome.result, outcome.state);
         self.record(&state)?;
         delete_touched_empty(&mut state);
+        if traces.is_some() {
+            for (addr, account) in &state {
+                if !account.storage.is_empty() {
+                    self.storage_contracts.insert(*addr);
+                }
+            }
+        }
         self.db.commit(state);
 
         if let Some((arena, sstore)) = traces {

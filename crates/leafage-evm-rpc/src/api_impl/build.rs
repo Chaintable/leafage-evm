@@ -1,4 +1,5 @@
 use super::api_impl::NoneEvmCustomConfig;
+use super::arc::archive_replay::ArcPipeline;
 use super::bsc::trace::BscPipeline;
 use super::mainnet::trace::EthPipeline;
 use super::tempo::api::TempoEvmCustomConfig;
@@ -12,6 +13,7 @@ use crate::api_impl::core::{
     ToJsonRpcError,
 };
 use crate::api_impl::historical_overload::{HistoricalOverloadHttpLayer, HistoricalOverloadRpc};
+use crate::api_impl::hyper::HyperEvmConfig;
 use crate::metrics::{HttpMetricLayer, RpcMetric};
 use crate::pipeline::chain::PipelineChain;
 use crate::pipeline::rpc::{TraceDebank, TraceDebankApiServer};
@@ -20,10 +22,11 @@ use jsonrpsee::{
     http_client::{HttpClient, HttpClientBuilder},
     RpcModule,
 };
+use leafage_evm_chains::arc::ARC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
-use leafage_evm_storage::{BlockIndex, EvmStorageRead};
-use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
+use leafage_evm_storage::{ApeYieldStorage, BlockIndex, EvmStorageRead};
+use leafage_evm_types::{Address, DebankBlock, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -35,6 +38,14 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
+    rpc_block_zero: Option<DebankBlock>,
+    upstream_client: Option<HttpClient>,
+    /// URL the upstream client was built for, kept so the HyperCore read-precompile
+    /// forwarder can be built when the server starts.
+    upstream_url: Option<String>,
+    forward_simulate: bool,
+    forward_estimategas: bool,
+    forward_read_precompiles: bool,
     trace_block_client: Option<HttpClient>,
     trace_block_check_state: bool,
     replay_blocks: Option<Vec<Vec<DebankTransaction>>>,
@@ -58,6 +69,12 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
+            rpc_block_zero: None,
+            upstream_client: None,
+            upstream_url: None,
+            forward_simulate: false,
+            forward_estimategas: false,
+            forward_read_precompiles: false,
             trace_block_client: None,
             trace_block_check_state: true,
             replay_blocks: None,
@@ -80,6 +97,11 @@ where
         self
     }
 
+    pub fn with_rpc_block_zero(mut self, rpc_block_zero: Option<DebankBlock>) -> Self {
+        self.rpc_block_zero = rpc_block_zero;
+        self
+    }
+
     pub fn with_historical_config(
         mut self,
         historical_rpc: Option<String>,
@@ -95,6 +117,29 @@ where
             }
         }
         self.historical_height = historical_height;
+        self
+    }
+
+    pub fn with_upstream_config(
+        mut self,
+        upstream_url: Option<String>,
+        forward_simulate: bool,
+        forward_estimategas: bool,
+        forward_read_precompiles: bool,
+    ) -> Self {
+        if let Some(url) = upstream_url {
+            if let Ok(http_client) = HttpClientBuilder::default()
+                .request_timeout(Duration::from_secs(30))
+                .max_response_size(u32::MAX)
+                .build(&url)
+            {
+                self.upstream_client = Some(http_client);
+            }
+            self.upstream_url = Some(url);
+        }
+        self.forward_simulate = forward_simulate;
+        self.forward_estimategas = forward_estimategas;
+        self.forward_read_precompiles = forward_read_precompiles;
         self
     }
 
@@ -255,9 +300,12 @@ where
             ($cfg:expr, $custom_evm_cfg: expr) => {
                 run_chain_setup!($cfg, $custom_evm_cfg, |_api| {})
             };
-            ($cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {{
+            ($cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {
+                run_chain_setup!(self.db, $cfg, $custom_evm_cfg, |$api| $extra)
+            };
+            ($db:expr, $cfg:expr, $custom_evm_cfg: expr, |$api:ident| $extra:block) => {{
                 let mut api_impl = ApiImpl::new(
-                    self.db,
+                    $db,
                     $cfg,
                     $custom_evm_cfg,
                     self.ovm_address.clone(),
@@ -271,7 +319,12 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.zksync = self.cfg.is_zksync();
+                api_impl.upstream_client = self.upstream_client.clone();
+                api_impl.forward_simulate = self.forward_simulate;
+                api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                api_impl.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -285,18 +338,16 @@ where
             }};
         }
 
-        // trace_debankBlock replays on the archive with the BSC or Ethereum
-        // mainnet fork schedule.
+        // trace_debankBlock uses the selected chain's mainnet replay.
         let mut trace_block_client = self.trace_block_client.take();
         let traced_chain = match &self.cfg {
+            MultiChainCfgEnv::Arc((env, _)) => env.chain_id == ARC_MAINNET_CHAIN_ID,
             MultiChainCfgEnv::Bsc(env) => env.chain_id == BSC_MAINNET_CHAIN_ID,
             MultiChainCfgEnv::Mainnet(env) => env.chain_id == ETH_MAINNET_CHAIN_ID,
             _ => false,
         };
         if trace_block_client.is_some() && !(is_archive && traced_chain) {
-            warn!(
-                "trace_debankBlock needs a BSC or Ethereum mainnet archive database, not serving it"
-            );
+            warn!("trace_debankBlock needs a supported mainnet archive database, not serving it");
             trace_block_client = None;
         }
 
@@ -312,15 +363,76 @@ where
                     )?;
                 })
             }
+            MultiChainCfgEnv::Hyper(env) => {
+                let custom_cfg = HyperEvmConfig::from_upstream(
+                    self.forward_read_precompiles,
+                    self.upstream_url.as_deref(),
+                    tokio::runtime::Handle::current(),
+                );
+                run_chain_setup!(env, Some(custom_cfg))
+            }
+            MultiChainCfgEnv::Zksync(env) => {
+                run_chain_setup!(env, None::<NoneEvmCustomConfig>)
+            }
             MultiChainCfgEnv::Arc((env, custom_evm_cfg)) => {
-                run_chain_setup!(env, Some(custom_evm_cfg))
+                run_chain_setup!(env, Some(custom_evm_cfg), |api| {
+                    merge_trace(
+                        &mut rpc_module,
+                        api,
+                        ArcPipeline,
+                        trace_block_client.take(),
+                        self.trace_block_check_state,
+                    )?;
+                })
             }
             MultiChainCfgEnv::Arbitrum((env, custom_evm_cfg)) => {
-                run_chain_setup!(env, custom_evm_cfg)
+                if custom_evm_cfg.as_ref().is_some_and(|cfg| cfg.ape_yield) {
+                    // ApeChain: resolve balances from the writer's yield slots.
+                    run_chain_setup!(
+                        ApeYieldStorage(self.db),
+                        env,
+                        custom_evm_cfg,
+                        |_api| {}
+                    )
+                } else {
+                    run_chain_setup!(env, custom_evm_cfg)
+                }
             }
             MultiChainCfgEnv::Op(env) => run_chain_setup!(env, None::<NoneEvmCustomConfig>),
-            MultiChainCfgEnv::Celo(env) => {
+            MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L2(env)) => {
                 run_chain_setup!(env, Some(leafage_evm_chains::celo::CeloConfig))
+            }
+            MultiChainCfgEnv::Celo(leafage_evm_chains::celo::CeloCfgEnv::L1(env)) => {
+                let mut api_impl = ApiImpl::new(
+                    self.db,
+                    env,
+                    Some(leafage_evm_chains::celo::l1::CeloL1Config),
+                    self.ovm_address,
+                    self.historical_client.clone(),
+                    self.historical_height,
+                    is_archive,
+                    normalize_state_key,
+                    version.clone(),
+                    estimate_gas_buffer,
+                    self.token_collector.clone(),
+                    exec_limiter.clone(),
+                    state_read_limiter.clone(),
+                );
+                api_impl.evm_cfg.zksync = self.cfg.is_zksync();
+                api_impl.upstream_client = self.upstream_client.clone();
+                api_impl.forward_simulate = self.forward_simulate;
+                api_impl.forward_estimategas = self.forward_estimategas;
+                api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                api_impl.rpc_block_zero = self.rpc_block_zero;
+                let api = Api::new(api_impl);
+                warmup_api(
+                    &api,
+                    self.replay_blocks.take(),
+                    self.warmup_erc20_addresses.take(),
+                )
+                .await;
+                register_api(&mut rpc_module, api.clone())?;
+                super::celo::l1::rpc::register(&mut rpc_module, api)?;
             }
             MultiChainCfgEnv::Base(env) => {
                 run_chain_setup!(env, None::<NoneEvmCustomConfig>)
@@ -372,7 +484,12 @@ where
                     exec_limiter.clone(),
                     state_read_limiter.clone(),
                 );
+                api_impl.evm_cfg.zksync = self.cfg.is_zksync();
+                api_impl.upstream_client = self.upstream_client.clone();
+                api_impl.forward_simulate = self.forward_simulate;
+                api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                api_impl.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,

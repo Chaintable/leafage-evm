@@ -28,6 +28,9 @@ pub struct KafkaS3Config {
     #[serde(default)]
     pub bundle_bucket_name: String,
     pub outer_bucket_name: String,
+    /// No longer used: the updater keeps no offset between runs. Accepted
+    /// so that existing configurations still parse; `standalone` removes
+    /// the offset file an earlier version left there.
     #[serde(default)]
     pub offset_dir: String,
     pub s3_chain_id: String,
@@ -661,7 +664,6 @@ pub async fn s3_get_block_info_and_diff_by_number_for_genesis(
 pub struct EtcdRegisterConfig {
     pub endpoints: Vec<String>,
     pub keep_alive_interval_ms: u64,
-    pub lease_ttl_s: i64,
     #[serde(default)]
     pub meta: String,
 }
@@ -726,6 +728,19 @@ mod tests {
 
         json["s3_read_timeout_secs"] = serde_json::json!(0);
         assert!(parse_kafka_s3_config(&json.to_string()).is_err());
+    }
+
+    /// The registration never had a lease; a config that still carries the
+    /// removed `lease_ttl_s` keeps parsing.
+    #[test]
+    fn etcd_config_ignores_the_removed_lease_ttl() {
+        let config: EtcdRegisterConfig = serde_json::from_str(
+            r#"{"endpoints": ["http://etcd:2379"], "keep_alive_interval_ms": 1000, "lease_ttl_s": 10}"#,
+        )
+        .unwrap();
+        assert_eq!(config.endpoints, ["http://etcd:2379"]);
+        assert_eq!(config.keep_alive_interval_ms, 1000);
+        assert!(config.meta.is_empty());
     }
 
     type DiffServerState = (Vec<u8>, Arc<Mutex<Vec<String>>>);

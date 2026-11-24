@@ -4,7 +4,7 @@ use super::replay::{EthBlock, EthReplayer};
 use crate::pipeline::blocks::FetchedBlock;
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
 use crate::pipeline::changes::LazyState;
-use crate::pipeline::genesis::genesis_output;
+use crate::pipeline::genesis::{genesis_output, GenesisOptions};
 use alloy::primitives::B256;
 use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{anyhow, Result};
@@ -46,7 +46,13 @@ where
         options: ReplayOptions,
     ) -> Result<ReplayOutput> {
         let state = archive_state(db.as_ref(), info)?;
-        genesis_output(eth_mainnet_genesis_alloc(), &state, block, options)
+        genesis_output(
+            eth_mainnet_genesis_alloc(),
+            &state,
+            block,
+            options,
+            GenesisOptions::default(),
+        )
     }
 }
 
@@ -92,9 +98,5 @@ where
         .state_at(BlockId::Hash(info.header.hash.into()))
         .map_err(|err| anyhow!("state of block {number}: {err}"))?
         .ok_or_else(|| anyhow!("the state of block {number} is not in the archive"))?;
-    Ok(EvmStorageWrapper {
-        db: state,
-        ovm_address: None,
-        normalize_state_key: false,
-    })
+    Ok(EvmStorageWrapper::new(state))
 }

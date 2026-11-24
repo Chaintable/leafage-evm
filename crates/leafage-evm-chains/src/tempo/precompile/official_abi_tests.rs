@@ -597,9 +597,9 @@ fn adopted_abis_match_frozen_schema_with_only_reviewed_differences() {
             serde_json::to_value(super::zone_factory::IZonePortal::abi::contract()).unwrap(),
         ),
     ];
-    // Independently frozen, reviewed differences against v1.16.0; not regenerated at test time.
+    // Independently frozen, reviewed differences against tempo/v1.17.0; not regenerated at test time.
     let delta: Value =
-        serde_json::from_str(include_str!("fixtures/abi-v1.16-reviewed-delta.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/abi-v1.17-reviewed-delta.json")).unwrap();
     for (name, abi) in actual {
         let actual = normalized_abi(abi);
         let expected = normalized_abi(baseline[name].clone());
@@ -614,11 +614,15 @@ fn adopted_abis_match_frozen_schema_with_only_reviewed_differences() {
             .cloned()
             .collect();
         let empty = serde_json::json!([]);
-        assert_eq!(
-            added,
-            normalized_abi(delta[name].get("added").unwrap_or(&empty).clone()),
-            "{name} additions"
-        );
+        // Since tempo/v1.17.0 this binding is the whole ZonePortal contract, which runs as EVM
+        // bytecode. Leafage only emits its events, so only removals are checked.
+        if name != "IZonePortal" {
+            assert_eq!(
+                added,
+                normalized_abi(delta[name].get("added").unwrap_or(&empty).clone()),
+                "{name} additions"
+            );
+        }
         assert_eq!(
             removed,
             normalized_abi(delta[name].get("removed").unwrap_or(&empty).clone()),

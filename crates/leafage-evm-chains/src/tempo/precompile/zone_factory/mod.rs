@@ -30,7 +30,8 @@ pub const ZONE_CREATION_GAS: u64 = 15_000_000;
 pub const MAX_SEQUENCERS: usize = 8;
 const MAX_TOKEN_METADATA_BYTES: usize = 31;
 
-pub use tempo_contracts::precompiles::{IZoneFactory, IZonePortal, ZoneInfo};
+pub use tempo_contracts::precompiles::{IZoneFactory, ZoneInfo};
+pub use tempo_contracts::zones::ZonePortal as IZonePortal;
 
 pub(super) fn revert(error: impl SolError) -> TempoPrecompileError {
     TempoPrecompileError::Revert(error.abi_encode().into())
@@ -272,8 +273,8 @@ impl ZoneFactory {
             IZonePortal::LeaderUpdated {
                 previousLeader: Address::ZERO,
                 newLeader: call.params.sequencers[0],
-                leaderEpoch: 1,
-                leaderActivationTempoBlock: self.storage.block_number(),
+                epoch: 1,
+                activationTempoBlock: self.storage.block_number(),
             }
             .into_log_data(),
         )?;

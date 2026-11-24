@@ -95,6 +95,32 @@ where
     }
 }
 
+impl<CTX, INSP, PRECOMPILE> OpEvm<CTX, INSP, EthInstructions<EthInterpreter, CTX>, PRECOMPILE>
+where
+    CTX: OpContextTr + ContextSetters,
+    PRECOMPILE: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    /// Execute `tx` and return only its [`ExecutionResult`], skipping
+    /// post-execution beneficiary and OP fee-vault crediting
+    /// (`reward_beneficiary`).
+    ///
+    /// Intended for read-only RPC calls (`eth_call`, `contractMultiCall`) whose
+    /// resulting state diff is discarded: skipping `reward_beneficiary` avoids
+    /// four hot-account DB reads per call (`beneficiary`, `L1_FEE_RECIPIENT`,
+    /// `BASE_FEE_RECIPIENT`, `OPERATOR_FEE_RECIPIENT`) without changing return
+    /// data, revert status, logs, or gas used.
+    pub fn transact_read_only(
+        &mut self,
+        tx: <CTX as ContextTr>::Tx,
+    ) -> Result<ExecutionResult<OpHaltReason>, OpError<CTX>> {
+        self.0.ctx.set_tx(tx);
+        let mut h = OpHandler::<_, _, EthFrame<EthInterpreter>>::new_without_beneficiary_reward();
+        let res = h.run(self);
+        let _ = self.0.ctx.journal_mut().finalize();
+        res
+    }
+}
+
 /// UPSTREAM-MIRROR(copy): revm-handler@43.0.2 `revm_handler::api::ExecuteCommitEvm`
 ///
 /// Copies the upstream commit implementation for the OP EVM.
