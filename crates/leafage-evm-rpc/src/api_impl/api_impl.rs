@@ -2,7 +2,7 @@ use crate::api_impl::core::{ApiBase, EvmCfg, GetTransactionError, ToJsonRpcError
 use crate::api_impl::token_collector::TokenCollector;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::http_client::HttpClient;
-use leafage_evm_types::{Address, DebankErrorCode};
+use leafage_evm_types::{Address, DebankBlock, DebankErrorCode};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context::CfgEnv;
 use revm::primitives::hardfork::SpecId as EthSpecId;
@@ -15,6 +15,7 @@ pub struct ApiImpl<DB, SpecId, CustomCfg> {
     pub evm_cfg: EvmCfg<SpecId, CustomCfg>,
     pub historical_client: Option<HttpClient>,
     pub historical_height: Option<u64>,
+    pub rpc_block_zero: Option<DebankBlock>,
     pub upstream_client: Option<HttpClient>,
     pub forward_simulate: bool,
     pub forward_estimategas: bool,
@@ -54,6 +55,7 @@ impl<DB, SpecId, CustomCfg> ApiImpl<DB, SpecId, CustomCfg> {
             },
             historical_client,
             historical_height,
+            rpc_block_zero: None,
             upstream_client: None,
             forward_simulate: false,
             forward_estimategas: false,
@@ -86,6 +88,10 @@ where
 
     fn historical_height(&self) -> Option<u64> {
         self.historical_height
+    }
+
+    fn block_zero_at(&self, height: u64) -> Option<&DebankBlock> {
+        self.rpc_block_zero.as_ref().filter(|_| height == 0)
     }
 
     fn upstream_client(&self) -> Option<&HttpClient> {

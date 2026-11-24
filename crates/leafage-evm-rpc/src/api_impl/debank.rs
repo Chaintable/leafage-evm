@@ -202,6 +202,9 @@ where
                 rpc_error_with_code(DebankErrorCode::DataBaseFailed as i32, e.to_string())
             })?;
         if block.is_none() {
+            if let Some(block) = self.inner.block_zero_at(number) {
+                return Ok(block.clone());
+            }
             if self.inner.evm_cfg().is_archive {
                 return Err(rpc_error_with_code(
                     DebankErrorCode::InvalidBlockID as i32,
@@ -2020,7 +2023,18 @@ where
                 return historical_client
                     .get_block_by_height(height)
                     .await
-                    .map_err(|error| map_historical_error(None, error));
+                    .or_else(|error| {
+                        let placeholder = self.inner.block_zero_at(block_number);
+                        match (&error, placeholder) {
+                            (jsonrpsee::core::ClientError::Call(err), Some(block))
+                                if err.code() == DebankErrorCode::BlockNotFound as i32
+                                    || err.code() == DebankErrorCode::InvalidBlockID as i32 =>
+                            {
+                                Ok(block.clone())
+                            }
+                            _ => Err(map_historical_error(None, error)),
+                        }
+                    });
             }
         }
 

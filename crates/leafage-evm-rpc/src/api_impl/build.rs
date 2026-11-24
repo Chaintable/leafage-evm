@@ -26,7 +26,7 @@ use leafage_evm_chains::arc::ARC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::bsc::mainnet::BSC_MAINNET_CHAIN_ID;
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CHAIN_ID;
 use leafage_evm_storage::{ApeYieldStorage, BlockIndex, EvmStorageRead};
-use leafage_evm_types::{Address, DebankErrorCode, DebankTransaction, PreErrorCode};
+use leafage_evm_types::{Address, DebankBlock, DebankErrorCode, DebankTransaction, PreErrorCode};
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -38,6 +38,7 @@ pub struct ApiBuilder<DB> {
     interceptor_cfg: Option<InterceptorConfig>,
     historical_client: Option<HttpClient>,
     historical_height: Option<u64>,
+    rpc_block_zero: Option<DebankBlock>,
     upstream_client: Option<HttpClient>,
     /// URL the upstream client was built for, kept so the HyperCore read-precompile
     /// forwarder can be built when the server starts.
@@ -68,6 +69,7 @@ where
             interceptor_cfg: None,
             historical_client: None,
             historical_height: None,
+            rpc_block_zero: None,
             upstream_client: None,
             upstream_url: None,
             forward_simulate: false,
@@ -92,6 +94,11 @@ where
     #[cfg(target_os = "linux")]
     pub fn with_interceptor_cfg(mut self, interceptor_cfg: Option<InterceptorConfig>) -> Self {
         self.interceptor_cfg = interceptor_cfg;
+        self
+    }
+
+    pub fn with_rpc_block_zero(mut self, rpc_block_zero: Option<DebankBlock>) -> Self {
+        self.rpc_block_zero = rpc_block_zero;
         self
     }
 
@@ -317,6 +324,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                api_impl.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -415,6 +423,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                api_impl.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
@@ -480,6 +489,7 @@ where
                 api_impl.forward_simulate = self.forward_simulate;
                 api_impl.forward_estimategas = self.forward_estimategas;
                 api_impl.evm_cfg.multicall_parallelism = multicall_parallelism;
+                api_impl.rpc_block_zero = self.rpc_block_zero;
                 let api = Api::new(api_impl);
                 warmup_api(
                     &api,
