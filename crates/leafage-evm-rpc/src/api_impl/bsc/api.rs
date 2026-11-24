@@ -1,5 +1,5 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler, TxSetter};
+use crate::api_impl::core::{ApiCore, CallExecutor, EvmExecutor, GasFeeHandler, TxSetter};
 use crate::api_impl::mainnet::evm::create_mainnet_txn_env;
 use crate::api_impl::ApiImpl;
 use alloy_evm::EvmEnv;
@@ -104,6 +104,28 @@ where
         res
     }
 
+    /// Keeps one EVM for the whole run, so its precompile map, instruction
+    /// table and frame stack are built once instead of per call.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let cfg = block_cfg(&self.evm_cfg.cfg, block_env);
+        let evm_env = EvmEnv::new(cfg, block_env.clone());
+        let mut evm = BscEvm::new(evm_env, WrapDatabaseRef(state), NoOpInspector {}, false);
+        f(&mut |tx| {
+            // `transact` finalizes the journal on success and on error, so the
+            // next call starts from the unchanged state.
+            evm.transact(tx).map(|res| res.result)
+        })
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
@@ -151,6 +173,35 @@ mod tests {
             timestamp: U256::from(timestamp),
             ..Default::default()
         }
+    }
+
+    /// A multicall's calls run on one EVM give the same results as a fresh
+    /// EVM per call.
+    #[test]
+    fn call_executor_matches_per_call_transact() {
+        use crate::api_impl::core::call_executor_test::assert_matches_transact;
+
+        let api = BscApiImpl::<()>::new(
+            (),
+            CfgEnv::<BscHardfork>::default(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            String::new(),
+            100,
+            None,
+            None,
+            None,
+        );
+        let block_env = BlockEnv {
+            basefee: 3,
+            beneficiary: leafage_evm_types::Address::repeat_byte(0xbb),
+            ..Default::default()
+        };
+        assert_matches_transact(&api, &block_env, BscTxEnv::new);
     }
 
     #[test]

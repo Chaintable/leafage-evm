@@ -146,29 +146,34 @@ pub(crate) fn strip(v: &[u8]) -> &[u8] {
     &v[z..]
 }
 
+#[inline]
 fn sub256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut o = [0u8; 32];
-    let mut borrow = 0i16;
-    for i in (0..32).rev() {
-        let mut d = a[i] as i16 - b[i] as i16 - borrow;
-        if d < 0 {
-            d += 256;
-            borrow = 1;
-        } else {
-            borrow = 0;
-        }
-        o[i] = d as u8;
+    let mut borrow = false;
+    for i in (0..4).rev() {
+        let off = i * 8;
+        let aw = u64::from_be_bytes(a[off..off + 8].try_into().unwrap());
+        let bw = u64::from_be_bytes(b[off..off + 8].try_into().unwrap());
+        let (d1, b1) = aw.overflowing_sub(bw);
+        let (d2, b2) = d1.overflowing_sub(borrow as u64);
+        borrow = b1 | b2;
+        o[off..off + 8].copy_from_slice(&d2.to_be_bytes());
     }
     o
 }
 
+#[inline]
 fn add256(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let mut o = [0u8; 32];
-    let mut carry = 0u16;
-    for i in (0..32).rev() {
-        let s = a[i] as u16 + b[i] as u16 + carry;
-        o[i] = s as u8;
-        carry = s >> 8;
+    let mut carry = false;
+    for i in (0..4).rev() {
+        let off = i * 8;
+        let aw = u64::from_be_bytes(a[off..off + 8].try_into().unwrap());
+        let bw = u64::from_be_bytes(b[off..off + 8].try_into().unwrap());
+        let (s1, c1) = aw.overflowing_add(bw);
+        let (s2, c2) = s1.overflowing_add(carry as u64);
+        carry = c1 | c2;
+        o[off..off + 8].copy_from_slice(&s2.to_be_bytes());
     }
     o
 }
@@ -625,6 +630,7 @@ pub(crate) fn lookup(
     let mut p_nonce = 0u64;
     let mut best: Option<(u64, Val)> = None;
     let mut j = i * r;
+    let mut c = key_cmp(storage, keys, addr_off, key_off, key);
     while j < n {
         let tag = tags[j];
         if j == i * r {
@@ -646,6 +652,7 @@ pub(crate) fn lookup(
                 p_val = [0; 32];
                 p_nonce = 0;
                 p_code = KECCAK_EMPTY;
+                c = key_cmp(storage, keys, addr_off, key_off, key);
             } else {
                 block += get_varint(blocks, &mut bi);
             }
@@ -654,7 +661,6 @@ pub(crate) fn lookup(
                 p_nonce = 0;
             }
         }
-        let c = key_cmp(storage, keys, addr_off, key_off, key);
         if c == Greater || (c == Equal && block > h) {
             let next = if c == Equal {
                 Next::At(block)

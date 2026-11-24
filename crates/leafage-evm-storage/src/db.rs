@@ -9,7 +9,7 @@ use quick_cache::sync::{Cache as QuickCache, DefaultLifecycle};
 use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, trace};
 
 /// The smallest share of a byte-weighted cache one shard holds. A shard
@@ -131,6 +131,14 @@ pub trait StateDBRead {
 
     /// block hash -> block info
     fn read_block_info(&self, block_hash: H256) -> Result<Option<BlockInfo>, StorageError>;
+
+    /// block hash -> shared block info (avoids cloning when cached as `Arc`).
+    fn read_block_info_arc(
+        &self,
+        block_hash: H256,
+    ) -> Result<Option<Arc<BlockInfo>>, StorageError> {
+        Ok(self.read_block_info(block_hash)?.map(Arc::new))
+    }
 
     /// block num -> block hash
     fn read_block_hash(&self, block_num: u64) -> Result<H256, StorageError>;
@@ -296,6 +304,11 @@ where
     fn block_info(&self) -> Result<BlockInfo, Self::Error> {
         let latest_block_hash = self.0.read_latest_block_hash()?;
         Ok(self.0.read_block_info(latest_block_hash)?.unwrap())
+    }
+
+    fn block_info_arc(&self) -> Result<Arc<BlockInfo>, Self::Error> {
+        let latest_block_hash = self.0.read_latest_block_hash()?;
+        Ok(self.0.read_block_info_arc(latest_block_hash)?.unwrap())
     }
 }
 

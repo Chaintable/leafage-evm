@@ -1,7 +1,8 @@
 use super::utils;
 use crate::api::{DebankApiClient, DebankApiServer};
 use crate::api_impl::core::{
-    Api, ApiCore, EvmExecutor, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    Api, ApiBase, ApiCore, CallExecutor, EvmExecutor, GetHaltReason, GetTransactionError,
+    ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::historical_overload::{
     historical_rpc_overloaded_error, is_historical_rpc_overloaded,
@@ -61,6 +62,10 @@ pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 pub const CALL_STIPEND_GAS: u64 = 2_300;
 
 pub const ESTIMATE_GAS_ERROR_RATIO: f64 = 0.015;
+
+/// The request-scoped read cache every call of one multicall reads through.
+type MulticallDb<C> =
+    utils::RequestCacheDB<EvmStorageWrapper<<<C as ApiBase>::DB as EvmStorageRead>::StateDB>>;
 
 impl<C> Api<C> {
     pub fn new(core: C) -> Self {
@@ -517,7 +522,8 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &MulticallDb<C>,
+        exec: &mut CallExecutor<'_, C, &MulticallDb<C>>,
         request: CallRequest,
     ) -> RpcResult<DebankSingleCallResult> {
         let start = std::time::Instant::now();
@@ -549,7 +555,7 @@ where
             db,
             self.inner.evm_cfg().cfg.chain_id,
         )?;
-        let mut res: DebankSingleCallResult = match self.inner.transact(block_env, db, tx) {
+        let mut res: DebankSingleCallResult = match exec(tx) {
             Ok(result) => result.into(),
             Err(err) => {
                 // Classic capability failures abort this EVM execution, including
@@ -713,31 +719,28 @@ where
             return Ok(DebankMultiCallResp { stats, results });
         }
         let db = utils::RequestCacheDB::new(cache_db);
-        // run in sequence
-        let mut results: Vec<DebankSingleCallResult> = vec![];
-        for request in requests {
-            if cancel_token.is_cancelled() {
-                return Err(internal_rpc_err(
-                    "multicall cancelled by caller".to_string(),
-                ));
-            }
-            if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
-                let res = results.last().unwrap().clone();
+        // run in sequence, on one executor for the whole multicall
+        let results = self.inner.with_call_executor(&block_env, &db, |exec| {
+            let mut results: Vec<DebankSingleCallResult> = vec![];
+            for request in requests {
+                if cancel_token.is_cancelled() {
+                    return Err(internal_rpc_err(
+                        "multicall cancelled by caller".to_string(),
+                    ));
+                }
+                if fast_fail && !results.is_empty() && results.last().unwrap().code != 0 {
+                    let res = results.last().unwrap().clone();
+                    results.push(res);
+                    continue;
+                }
+                let res = self.debank_single_call_from_state_impl_inner(
+                    &state, &block, &block_env, &db, exec, request,
+                )?;
                 results.push(res);
-                continue;
             }
-            let res = self.debank_single_call_from_state_impl_inner(
-                &state,
-                &block,
-                &block_env,
-                &db,
-                request,
-            )?;
-            if res.code != 0 {
-                stats.success = false;
-            }
-            results.push(res);
-        }
+            Ok(results)
+        })?;
+        stats.success = results.iter().all(|res| res.code == 0);
         Ok(DebankMultiCallResp { stats, results })
     }
 
@@ -753,7 +756,7 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &MulticallDb<C>,
         requests: &[CallRequest],
         slots: &[OnceLock<RpcResult<DebankSingleCallResult>>],
         next: &AtomicUsize,
@@ -761,7 +764,10 @@ where
         fast_fail: bool,
         cancel_token: &CancellationToken,
     ) {
-        loop {
+        // A caught panic stores an `Err` and lowers `stop_after` to its index,
+        // so this worker skips every later index and never calls `exec` again,
+        // as `with_call_executor` requires.
+        self.inner.with_call_executor(block_env, db, |exec| loop {
             let index = next.fetch_add(1, Ordering::SeqCst);
             if index >= requests.len() || cancel_token.is_cancelled() {
                 break;
@@ -774,6 +780,7 @@ where
                 block,
                 block_env,
                 db,
+                exec,
                 requests[index].clone(),
             );
             let stops = match &res {
@@ -784,7 +791,7 @@ where
             if stops {
                 stop_after.fetch_min(index, Ordering::SeqCst);
             }
-        }
+        })
     }
 
     /// Runs one call of a parallel multicall, turning a panic into the
@@ -799,11 +806,14 @@ where
         state: &<C::DB as EvmStorageRead>::StateDB,
         block: &BlockInfo,
         block_env: &BlockEnv,
-        db: &utils::RequestCacheDB<EvmStorageWrapper<<C::DB as EvmStorageRead>::StateDB>>,
+        db: &MulticallDb<C>,
+        exec: &mut CallExecutor<'_, C, &MulticallDb<C>>,
         request: CallRequest,
     ) -> RpcResult<DebankSingleCallResult> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.debank_single_call_from_state_impl_inner(state, block, block_env, db, request)
+            self.debank_single_call_from_state_impl_inner(
+                state, block, block_env, db, exec, request,
+            )
         })) {
             Ok(res) => res,
             Err(_) => {
@@ -961,13 +971,19 @@ where
                 Some(res) => res.clone(),
                 // Unreachable by the stop_after invariant above; serial
                 // catch-up keeps the scan total rather than trusting it.
-                None => self.multicall_run_call_catching_panic(
-                    state,
-                    block,
-                    block_env,
-                    &utils::RequestCacheDB::new(base_db.clone()),
-                    requests[index].clone(),
-                ),
+                None => {
+                    let db = utils::RequestCacheDB::new(base_db.clone());
+                    self.inner.with_call_executor(block_env, &db, |exec| {
+                        self.multicall_run_call_catching_panic(
+                            state,
+                            block,
+                            block_env,
+                            &db,
+                            exec,
+                            requests[index].clone(),
+                        )
+                    })
+                }
             };
             let res = res?;
             if fast_fail && res.code != 0 {

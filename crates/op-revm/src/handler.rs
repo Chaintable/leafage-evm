@@ -39,12 +39,22 @@ pub struct OpHandler<EVM, ERROR, FRAME> {
     /// Mainnet handler allows us to use functions from the mainnet handler inside optimism
     /// handler. So we dont duplicate the logic
     pub mainnet: MainnetHandler<EVM, ERROR, FRAME>,
+    /// Skip `reward_beneficiary` (coinbase and the three OP fee vaults).
+    /// Safe for read-only calls whose post-execution state is discarded.
+    pub skip_beneficiary_reward: bool,
 }
 
 impl<EVM, ERROR, FRAME> OpHandler<EVM, ERROR, FRAME> {
     /// Create a new Optimism handler.
     pub fn new() -> Self {
-        Self { mainnet: MainnetHandler::default() }
+        Self { mainnet: MainnetHandler::default(), skip_beneficiary_reward: false }
+    }
+
+    /// Create an Optimism handler that skips post-execution beneficiary and
+    /// fee-vault crediting (`reward_beneficiary`). For read-only calls whose
+    /// state diff is discarded.
+    pub fn new_without_beneficiary_reward() -> Self {
+        Self { mainnet: MainnetHandler::default(), skip_beneficiary_reward: true }
     }
 }
 
@@ -356,6 +366,9 @@ where
         evm: &mut Self::Evm,
         frame_result: &mut <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameResult,
     ) -> Result<(), Self::Error> {
+        if self.skip_beneficiary_reward {
+            return Ok(());
+        }
         let is_deposit = evm.ctx().tx().tx_type() == DEPOSIT_TRANSACTION_TYPE;
 
         // Transfer fee to coinbase/beneficiary.
@@ -1733,5 +1746,228 @@ mod tests {
             ),
             "expected TxGasLimitGreaterThanCap, got {err:?}",
         );
+    }
+
+    /// Read-only calls (`transact_read_only`) skip `reward_beneficiary`,
+    /// avoiding DB lookups for coinbase and the three OP fee vaults while
+    /// producing the exact same `ExecutionResult` as `transact`.
+    #[test]
+    fn transact_read_only_skips_beneficiary_and_fee_vault_reads() {
+        use revm::{
+            database_interface::{Database, DatabaseRef},
+            primitives::{Address, B256, Bytes, StorageKey, StorageValue},
+            state::{AccountInfo, Bytecode},
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct TrackingDb {
+            inner: InMemoryDB,
+            basic_reads: Arc<Mutex<Vec<Address>>>,
+        }
+
+        impl Database for TrackingDb {
+            type Error = core::convert::Infallible;
+            fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+                self.basic_reads.lock().unwrap().push(address);
+                self.inner.basic_ref(address)
+            }
+            fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+                self.inner.code_by_hash_ref(code_hash)
+            }
+            fn storage(
+                &mut self,
+                address: Address,
+                index: StorageKey,
+            ) -> Result<StorageValue, Self::Error> {
+                self.inner.storage_ref(address, index)
+            }
+            fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+                self.inner.block_hash_ref(number)
+            }
+        }
+
+        let caller = Address::repeat_byte(0xAA);
+        let beneficiary = Address::repeat_byte(0xBB);
+        let target = Address::repeat_byte(0xCC);
+        // PUSH1 0x2A PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN (returns 42)
+        let code = Bytecode::new_raw(Bytes::from_static(&[
+            0x60, 0x2A, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3,
+        ]));
+        let mut base_db = InMemoryDB::default();
+        base_db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(10u128.pow(18)), ..Default::default() },
+        );
+        base_db.insert_account_info(target, AccountInfo::from_bytecode(code));
+
+        let block = BlockEnv {
+            number: U256::from(100),
+            beneficiary,
+            basefee: 10,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let cfg = CfgEnv::new_with_spec(OpSpecId::ISTHMUS);
+        let tx = OpTransaction::builder()
+            .base(
+                TxEnv::builder()
+                    .caller(caller)
+                    .call(target)
+                    .gas_limit(100_000)
+                    .gas_price(20),
+            )
+            .enveloped_tx(Some(Bytes::from_static(&[0x01, 0x02])))
+            .build_fill();
+
+        let full_db = TrackingDb { inner: base_db.clone(), basic_reads: Default::default() };
+        let full_reads = full_db.basic_reads.clone();
+        let mut full_evm = Context::op()
+            .with_db(full_db)
+            .with_cfg(cfg.clone())
+            .with_block(block.clone())
+            .build_op();
+        let full_res = full_evm.transact(tx.clone()).unwrap().result;
+
+        let ro_db = TrackingDb { inner: base_db, basic_reads: Default::default() };
+        let ro_reads = ro_db.basic_reads.clone();
+        let mut ro_evm = Context::op()
+            .with_db(ro_db)
+            .with_cfg(cfg)
+            .with_block(block)
+            .build_op();
+        let ro_res = ro_evm.transact_read_only(tx).unwrap();
+
+        assert_eq!(ro_res, full_res);
+        let full_reads = full_reads.lock().unwrap();
+        let ro_reads = ro_reads.lock().unwrap();
+        for addr in [beneficiary, L1_FEE_RECIPIENT, BASE_FEE_RECIPIENT, OPERATOR_FEE_RECIPIENT] {
+            assert!(full_reads.contains(&addr), "full transact should read {addr}");
+            assert!(!ro_reads.contains(&addr), "transact_read_only must not read {addr}");
+        }
+    }
+
+    /// One EVM reused for a run of read-only calls (as a multicall does)
+    /// returns exactly what a fresh EVM per call returns, no call sees another
+    /// call's state changes, a failing call does not leak into the next one,
+    /// and the L1 block info is read once for the run instead of per call.
+    #[test]
+    fn reused_evm_matches_fresh_evm_per_read_only_call() {
+        use revm::{
+            context::result::ExecutionResult,
+            database_interface::{Database, DatabaseRef},
+            primitives::{StorageKey, StorageValue},
+        };
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CountingDb {
+            inner: InMemoryDB,
+            l1_block_reads: Arc<Mutex<usize>>,
+        }
+
+        impl Database for CountingDb {
+            type Error = core::convert::Infallible;
+            fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+                self.inner.basic_ref(address)
+            }
+            fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+                self.inner.code_by_hash_ref(code_hash)
+            }
+            fn storage(
+                &mut self,
+                address: Address,
+                index: StorageKey,
+            ) -> Result<StorageValue, Self::Error> {
+                if address == L1_BLOCK_CONTRACT {
+                    *self.l1_block_reads.lock().unwrap() += 1;
+                }
+                self.inner.storage_ref(address, index)
+            }
+            fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+                self.inner.block_hash_ref(number)
+            }
+        }
+
+        let caller = Address::repeat_byte(0xAA);
+        let counter = Address::repeat_byte(0xC1);
+        let reverter = Address::repeat_byte(0xC2);
+        let payee = Address::repeat_byte(0xC3);
+        // slot0 += 1; return slot0
+        let counter_code = Bytecode::new_raw(bytes!("6000546001018060005560005260206000f3"));
+        // revert(0, 0)
+        let reverter_code = Bytecode::new_raw(bytes!("60006000fd"));
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            caller,
+            AccountInfo { balance: U256::from(10u128.pow(18)), ..Default::default() },
+        );
+        db.insert_account_info(counter, AccountInfo::from_bytecode(counter_code));
+        db.insert_account_info(reverter, AccountInfo::from_bytecode(reverter_code));
+
+        let block = BlockEnv {
+            number: U256::from(100),
+            beneficiary: Address::repeat_byte(0xBB),
+            basefee: 10,
+            gas_limit: 30_000_000,
+            ..Default::default()
+        };
+        let cfg = CfgEnv::new_with_spec(OpSpecId::ISTHMUS);
+        let tx = |to: Address, value: u64, nonce: u64| {
+            OpTransaction::builder()
+                .base(
+                    TxEnv::builder()
+                        .caller(caller)
+                        .call(to)
+                        .value(U256::from(value))
+                        .nonce(nonce)
+                        .gas_limit(100_000)
+                        .gas_price(20),
+                )
+                .enveloped_tx(Some(Bytes::from_static(&[0x01, 0x02])))
+                .build_fill()
+        };
+        // The counter twice (each must see the stored 0), a value transfer, a
+        // revert, a tx rejected before execution (wrong nonce), the counter again.
+        let txs = [
+            tx(counter, 0, 0),
+            tx(counter, 0, 0),
+            tx(payee, 1_000, 0),
+            tx(reverter, 0, 0),
+            tx(counter, 0, 7),
+            tx(counter, 0, 0),
+        ];
+        let build = |db: CountingDb| {
+            Context::op().with_db(db).with_cfg(cfg.clone()).with_block(block.clone()).build_op()
+        };
+        let outcome = |res: Result<ExecutionResult<OpHaltReason>, _>| {
+            res.map_err(|err: EVMError<core::convert::Infallible, OpTransactionError>| {
+                err.to_string()
+            })
+        };
+
+        let fresh_db = CountingDb { inner: db.clone(), ..Default::default() };
+        let fresh_reads = fresh_db.l1_block_reads.clone();
+        let fresh: Vec<_> = txs
+            .iter()
+            .map(|tx| outcome(build(fresh_db.clone()).transact_read_only(tx.clone())))
+            .collect();
+
+        let reused_db = CountingDb { inner: db, ..Default::default() };
+        let reused_reads = reused_db.l1_block_reads.clone();
+        let mut evm = build(reused_db);
+        let reused: Vec<_> =
+            txs.iter().map(|tx| outcome(evm.transact_read_only(tx.clone()))).collect();
+
+        assert_eq!(reused, fresh);
+        let one = Bytes::from(U256::from(1).to_be_bytes::<32>().to_vec());
+        for i in [0, 1, 5] {
+            assert_eq!(reused[i].as_ref().unwrap().output(), Some(&one), "call {i}");
+        }
+        assert!(!reused[3].as_ref().unwrap().is_success(), "the revert stays a revert");
+        assert!(reused[4].is_err(), "a wrong nonce is rejected");
+        let per_run = *reused_reads.lock().unwrap();
+        assert!(per_run > 0, "the L1 block info is read");
+        assert_eq!(*fresh_reads.lock().unwrap(), per_run * txs.len());
     }
 }

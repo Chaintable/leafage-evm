@@ -843,12 +843,13 @@ impl Inner {
         Ok(d)
     }
 
-    fn page(&self, f: &PageFile, c: usize) -> Result<Arc<[u8]>, Error> {
+    fn page(&self, f: &PageFile, c: usize, reads: &mut u64) -> Result<Arc<[u8]>, Error> {
         let ck = ((f.fid as u64) << 32) | c as u64;
         match self.cache.get_value_or_guard(&ck, None) {
             GuardResult::Value(v) => Ok(v),
             GuardResult::Guard(g) => {
                 let page = f.read_page(c)?;
+                *reads += 1;
                 let _ = g.insert(page.clone());
                 Ok(page)
             }
@@ -863,6 +864,7 @@ impl Inner {
         f: &PageFile,
         key: &[u8],
         h: u64,
+        reads: &mut u64,
     ) -> Result<(Option<(u64, Val)>, u64), Error> {
         // "Unknown": the answer is only known to hold at `h` itself.
         let unknown = h.saturating_add(1);
@@ -876,7 +878,7 @@ impl Inner {
         };
         let (mut back, mut fwd) = (false, false);
         loop {
-            let page = self.page(f, c)?;
+            let page = self.page(f, c, reads)?;
             let (look, next) = codec::lookup(&page, f.storage, key, h)?;
             match look {
                 Look::Found(block, val) => {
@@ -927,6 +929,54 @@ impl Inner {
     fn get(&self, storage: bool, key: &[u8], h: u64) -> Result<Read, Error> {
         let v = self.view.load();
         let kind = storage as usize;
+        let base = v.base_index(kind, key).map(|i| &v.base[kind][i]);
+        let mut reads = 0u64;
+
+        // Fast path for historical reads wholly covered by the base file:
+        // when `h <= base.hi` and below every delta layer (segments above
+        // `base.hi`, frozen memtable, active memtable), `found` can only come
+        // from `base`. Checking `base` first avoids memtable shard locks and
+        // segment bloom probes whenever `base` already knows a newer version
+        // `<= delta_lo`, and otherwise scans delta blooms oldest-to-newest
+        // stopping at the first hit.
+        if let Some(base) = base.filter(|b| h <= b.hi) {
+            let first_delta_seg = v.segs[kind].iter().position(|s| s.hi > base.hi);
+            let delta_lo = first_delta_seg
+                .map_or(u64::MAX, |i| v.segs[kind][i].lo)
+                .min(
+                    v.frozen
+                        .as_ref()
+                        .and_then(|m| m.span())
+                        .map_or(u64::MAX, |s| s.0),
+                )
+                .min(v.active.span().map_or(u64::MAX, |s| s.0));
+            if h < delta_lo {
+                let (found, mut next) = self.file_get(&base.file, key, h, &mut reads)?;
+                if next > delta_lo {
+                    if let Some(i) = first_delta_seg {
+                        for s in &v.segs[kind][i..] {
+                            if s.lo >= next {
+                                break;
+                            }
+                            if s.bloom.may_contain(key) {
+                                next = s.lo;
+                                break;
+                            }
+                        }
+                    }
+                    for mem in v.frozen.as_ref().into_iter().chain(std::iter::once(&v.active)) {
+                        if mem.span().is_some_and(|(lo, _)| lo < next) {
+                            next = next.min(mem.get(storage, key, h).next);
+                        }
+                    }
+                }
+                if found.is_none() && reads > 0 {
+                    M.absent_page_reads.increment(reads);
+                }
+                return Ok(Read { found, next });
+            }
+        }
+
         let mut next = u64::MAX;
         for mem in std::iter::once(&v.active).chain(v.frozen.as_ref()) {
             let r = mem.get(storage, key, h);
@@ -939,7 +989,6 @@ impl Inner {
                 });
             }
         }
-        let base = v.base_index(kind, key).map(|i| &v.base[kind][i]);
         for s in v.segs[kind].iter().rev() {
             if base.is_some_and(|b| s.hi <= b.hi) {
                 // This segment and the older ones are in the base file.
@@ -957,7 +1006,7 @@ impl Inner {
                 continue;
             }
             M.segment_probes.increment(1);
-            let (found, n) = self.file_get(&s.file, key, h)?;
+            let (found, n) = self.file_get(&s.file, key, h, &mut reads)?;
             next = next.min(n);
             if found.is_some() {
                 M.segment_hits.increment(1);
@@ -965,10 +1014,16 @@ impl Inner {
             }
         }
         let Some(base) = base else {
+            if reads > 0 {
+                M.absent_page_reads.increment(reads);
+            }
             return Ok(Read { found: None, next });
         };
-        let (found, n) = self.file_get(&base.file, key, h)?;
+        let (found, n) = self.file_get(&base.file, key, h, &mut reads)?;
         next = next.min(n);
+        if found.is_none() && reads > 0 {
+            M.absent_page_reads.increment(reads);
+        }
         Ok(Read { found, next })
     }
 
@@ -3545,6 +3600,137 @@ pub(crate) mod tests {
         // A truncated file fails the open.
         std::fs::write(&path, &bytes[..bytes.len() - 64]).unwrap();
         assert!(Store::open(&dir, small_options()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn base_first_fast_path_preserves_found_and_next_across_delta_layers() {
+        let dir = test_dir("base-first");
+        Store::create(&dir).unwrap();
+        let store = Store::open(&dir, small_options()).unwrap();
+
+        let k_base_only = slot_key(1, 1);
+        let k_in_seg1 = slot_key(1, 2);
+        let k_in_seg2 = slot_key(1, 3);
+        let k_in_frozen = slot_key(1, 4);
+        let k_in_active = slot_key(1, 5);
+        let k_absent = slot_key(1, 99);
+        let val = |v: u8| [v; 32];
+
+        // Base history (blocks 1..=20): every key except k_absent gets a version at 5,
+        // and k_base_only also gets a newer version at 15 inside the base.
+        store
+            .apply(
+                5,
+                &[],
+                &[
+                    (k_base_only, val(1)),
+                    (k_in_seg1, val(2)),
+                    (k_in_seg2, val(3)),
+                    (k_in_frozen, val(4)),
+                    (k_in_active, val(5)),
+                ],
+            )
+            .unwrap();
+        store.apply(15, &[], &[(k_base_only, val(11))]).unwrap();
+        store.apply(20, &[], &[]).unwrap();
+        store.flush().unwrap();
+        store.rewrite_base().unwrap();
+
+        // Delta segment 1 (blocks 21..=30): updates k_in_seg1 at 25.
+        store.apply(21, &[], &[]).unwrap();
+        store.apply(25, &[], &[(k_in_seg1, val(22))]).unwrap();
+        store.apply(30, &[], &[]).unwrap();
+        store.flush().unwrap();
+
+        // Delta segment 2 (blocks 31..=40): updates k_in_seg2 at 35 (and k_in_seg1 again at 38).
+        store.apply(31, &[], &[]).unwrap();
+        store.apply(35, &[], &[(k_in_seg2, val(33))]).unwrap();
+        store.apply(38, &[], &[(k_in_seg1, val(29))]).unwrap();
+        store.apply(40, &[], &[]).unwrap();
+        store.flush().unwrap();
+
+        // Frozen memtable (blocks 41..=50): updates k_in_frozen at 45.
+        store.apply(41, &[], &[]).unwrap();
+        store.apply(45, &[], &[(k_in_frozen, val(44))]).unwrap();
+        store.apply(50, &[], &[]).unwrap();
+        assert!(store.inner.freeze());
+
+        // Active memtable (blocks 51..=60): updates k_in_active at 55.
+        store.apply(51, &[], &[]).unwrap();
+        store.apply(55, &[], &[(k_in_active, val(55))]).unwrap();
+        store.apply(60, &[], &[]).unwrap();
+
+        // Read at h = 10 (<= base.hi = 20 and < delta_lo = 21): hits base-first fast path.
+        // 1) k_base_only has next = 15 <= delta_lo (21): returns immediately from base.
+        let r = store.get(true, &k_base_only, 10).unwrap();
+        assert_eq!(r.found, Some((5, Val::Storage(val(1)))));
+        assert_eq!(r.next, 15);
+
+        // 2) k_in_seg1 has no newer version in base; oldest delta seg (lo=21) bloom matches.
+        let r = store.get(true, &k_in_seg1, 10).unwrap();
+        assert_eq!(r.found, Some((5, Val::Storage(val(2)))));
+        assert_eq!(r.next, 21);
+
+        // 3) k_in_seg2 is only in seg 2 (lo=31); next <= 31 (bloom FP on seg 1 could lower it to 21, never > 31).
+        let r = store.get(true, &k_in_seg2, 10).unwrap();
+        assert_eq!(r.found, Some((5, Val::Storage(val(3)))));
+        assert!(r.next > 10 && r.next <= 31, "next={}", r.next);
+
+        // 4) k_in_frozen is only in frozen memtable (version at 45).
+        let r = store.get(true, &k_in_frozen, 10).unwrap();
+        assert_eq!(r.found, Some((5, Val::Storage(val(4)))));
+        assert!(r.next > 10 && r.next <= 45, "next={}", r.next);
+
+        // 5) k_in_active is only in active memtable (version at 55).
+        let r = store.get(true, &k_in_active, 10).unwrap();
+        assert_eq!(r.found, Some((5, Val::Storage(val(5)))));
+        assert!(r.next > 10 && r.next <= 55, "next={}", r.next);
+
+        // 6) k_absent is absent across all layers; check file_get read accounting directly too.
+        let r = store.get(true, &k_absent, 10).unwrap();
+        assert_eq!(r.found, None);
+        assert!(r.next > 10);
+
+        // Read at h = 20 (boundary == base.hi, still < delta_lo = 21) for k_base_only.
+        let r = store.get(true, &k_base_only, 20).unwrap();
+        assert_eq!(r.found, Some((15, Val::Storage(val(11)))));
+        assert!(r.next > 20);
+
+        // Read in delta range (h = 25, 45, 55) uses normal path and finds newer versions.
+        assert_eq!(
+            store.get(true, &k_in_seg1, 25).unwrap().found,
+            Some((25, Val::Storage(val(22))))
+        );
+        assert_eq!(
+            store.get(true, &k_in_frozen, 45).unwrap().found,
+            Some((45, Val::Storage(val(44))))
+        );
+        assert_eq!(
+            store.get(true, &k_in_active, 55).unwrap().found,
+            Some((55, Val::Storage(val(55))))
+        );
+
+        // Verify file_get page read counting on a cold cache miss vs warm cache hit.
+        // Re-open with fresh empty page cache so the first file_get reads from file.
+        drop(store);
+        let fresh_key = slot_key(1, 200);
+        let store = Store::open(&dir, small_options()).unwrap();
+        let v = store.inner.view.load();
+        let base_file = &v.base[1][0].file;
+        let mut reads = 0u64;
+        let (found, _) = store.inner.file_get(base_file, &fresh_key, 10, &mut reads).unwrap();
+        assert!(found.is_none());
+        assert_eq!(reads, 1, "cold absent lookup reads 1 page");
+        let mut reads_warm = 0u64;
+        let (found, _) = store
+            .inner
+            .file_get(base_file, &fresh_key, 10, &mut reads_warm)
+            .unwrap();
+        assert!(found.is_none());
+        assert_eq!(reads_warm, 0, "warm cache hit reads 0 pages");
+        drop(v);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

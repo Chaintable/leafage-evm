@@ -35,6 +35,12 @@ const BLOCK_PAGES: usize = 64;
 /// The file ends with the CRC32 of everything before it.
 const MAGIC: &[u8; 8] = b"LFV4CI2\0";
 
+/// High bit of an in-memory `hdr_cp` entry: this block stores 4-byte windows
+/// instead of 8-byte windows (only set for `k == 32` or `cp >= 32` when
+/// consecutive distinct pages keep strict ordering under `[..4]`).
+const CP_NARROW: u8 = 0x80;
+const CP_MASK: u8 = 0x7f;
+
 fn lcp(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
@@ -116,15 +122,19 @@ impl IndexBuilder {
         while s < n {
             let mut e = s + 1;
             let mut cp = k;
+            let mut has_run = in_run(s);
             while e < n && e - s < BLOCK_PAGES {
-                // The pages of such a key get index blocks of their own.
-                // Among the pages of other keys they would all have the
-                // window those of their address have, and a lookup of
-                // another slot of it would step through every one of them.
-                if in_run(e) != in_run(s) || (in_run(s) && key(e) != key(s)) {
+                let ncp = lcp(key(s), key(e)).min(cp);
+                // In a storage block spanning contracts (`ncp < 32`), a key
+                // starting many pages cannot share the block with another
+                // contract: its pages share the address window, and a lookup
+                // of another slot of that address would step through every one
+                // of them. Accounts (`k == 32`) and single-contract blocks
+                // (`ncp >= 32`) have `address_part == 0`, so their windows
+                // distinguish distinct keys without splitting the block.
+                if k == 64 && ncp < 32 && (has_run || in_run(e)) {
                     break;
                 }
-                let ncp = lcp(key(s), key(e)).min(cp);
                 // Shortening the prefix changes every window of the block.
                 let ap = address_part(k, ncp);
                 let ordered = (s + 1..=e).all(|j| {
@@ -136,6 +146,7 @@ impl IndexBuilder {
                     break;
                 }
                 cp = ncp;
+                has_run |= in_run(e);
                 e += 1;
             }
             hdr_keys.extend_from_slice(key(s));
@@ -177,18 +188,50 @@ impl IndexBuilder {
     }
 }
 
+/// Block starting offsets in [`UNIT`]s: `u32` covers files up to 256 GiB.
+enum BaseOffs {
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl BaseOffs {
+    #[inline]
+    fn get(&self, b: usize) -> u64 {
+        match self {
+            Self::U32(v) => v[b] as u64,
+            Self::U64(v) => v[b],
+        }
+    }
+
+    fn mem_bytes(&self) -> usize {
+        match self {
+            Self::U32(v) => v.len() * 4,
+            Self::U64(v) => v.len() * 8,
+        }
+    }
+}
+
 /// The index of one page file, held in memory.
 pub(crate) struct Index {
     k: usize,
     /// Pages.
     n: usize,
     hdr_keys: Vec<u8>,
+    /// Low 7 bits: common prefix length `cp` (`0..=k`).
+    /// Bit 7 ([`CP_NARROW`]): block stores 4-byte windows instead of 8-byte.
+    /// Blocks with `cp == k` store 0-byte windows.
     hdr_cp: Vec<u8>,
     hdr_start: Vec<u32>,
-    hdr_base: Vec<u64>,
+    hdr_base: BaseOffs,
+    /// Byte offset into `win` where each block's windows start.
+    hdr_win_off: Vec<u32>,
     win: Vec<u8>,
     blk: Vec<u32>,
-    len: Vec<u16>,
+    /// Stored page length in [`UNIT`]s; `u8::MAX` is an overflow sentinel
+    /// resolved via `len_hi`.
+    len: Vec<u8>,
+    /// Overflow page lengths (`>= 255` units), sorted by page index.
+    len_hi: Vec<(u32, u16)>,
 }
 
 impl Index {
@@ -222,30 +265,92 @@ impl Index {
             s
         };
         let hdr_keys = take(nb * k).to_vec();
-        let hdr_cp = take(nb).to_vec();
+        let mut hdr_cp = take(nb).to_vec();
         let hdr_start: Vec<u32> = take(nb * 4)
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let hdr_base: Vec<u64> = take(nb * 8)
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let win = take(n * W).to_vec();
+        let raw_base = take(nb * 8);
+        let raw_win = take(n * W);
         let blk: Vec<u32> = take(n * 4)
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        let len: Vec<u16> = take(n * 2)
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let raw_len = take(n * 2);
+
         let starts_ok = hdr_start.first().is_none_or(|s| *s == 0)
             && hdr_start.windows(2).all(|w| w[0] < w[1])
             && hdr_start.last().is_none_or(|s| (*s as usize) < n);
         if !starts_ok || hdr_cp.iter().any(|cp| *cp as usize > k) || (n > 0 && nb == 0) {
             return Err(bad());
         }
+
+        let max_base = raw_base
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .max()
+            .unwrap_or(0);
+        let hdr_base = if max_base <= u32::MAX as u64 {
+            BaseOffs::U32(
+                raw_base
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as u32)
+                    .collect(),
+            )
+        } else {
+            BaseOffs::U64(
+                raw_base
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
+        };
+
+        let mut hdr_win_off = Vec::with_capacity(nb);
+        let mut win = Vec::with_capacity(n * 4);
+        let raw_w = |j: usize| &raw_win[j * W..(j + 1) * W];
+        for b in 0..nb {
+            let s = hdr_start[b] as usize;
+            let e = hdr_start.get(b + 1).map_or(n, |&x| x as usize);
+            let cp = hdr_cp[b] as usize;
+            hdr_win_off.push(u32::try_from(win.len()).map_err(|_| bad())?);
+            if cp == k {
+                // Every page in this block shares the full header key.
+                continue;
+            }
+            // Narrow single-contract (`cp >= 32`) and account (`k == 32`)
+            // blocks from 8 to 4 bytes when distinct pages remain strictly
+            // ordered under `[..4]`. Cross-contract blocks (`k == 64 && cp < 32`)
+            // keep full 8-byte windows so `address_part` stays intact.
+            let narrow = (k == 32 || cp >= 32)
+                && (s + 1..e).all(|j| {
+                    let (wa, wb) = (raw_w(j - 1), raw_w(j));
+                    wa == wb || wa[..4] < wb[..4]
+                });
+            if narrow {
+                hdr_cp[b] |= CP_NARROW;
+                for j in s..e {
+                    win.extend_from_slice(&raw_w(j)[..4]);
+                }
+            } else {
+                win.extend_from_slice(&raw_win[s * W..e * W]);
+            }
+        }
+        win.shrink_to_fit();
+
+        let mut len = Vec::with_capacity(n);
+        let mut len_hi = Vec::new();
+        for (i, c) in raw_len.chunks_exact(2).enumerate() {
+            let u = u16::from_le_bytes(c.try_into().unwrap());
+            if u < u8::MAX as u16 {
+                len.push(u as u8);
+            } else {
+                len.push(u8::MAX);
+                len_hi.push((i as u32, u));
+            }
+        }
+        len_hi.shrink_to_fit();
+
         Ok(Self {
             k,
             n,
@@ -253,9 +358,11 @@ impl Index {
             hdr_cp,
             hdr_start,
             hdr_base,
+            hdr_win_off,
             win,
             blk,
             len,
+            len_hi,
         })
     }
 
@@ -264,10 +371,12 @@ impl Index {
         (self.hdr_keys.len()
             + self.hdr_cp.len()
             + self.hdr_start.len() * 4
-            + self.hdr_base.len() * 8
+            + self.hdr_base.mem_bytes()
+            + self.hdr_win_off.len() * 4
             + self.win.len()
             + self.blk.len() * 4
-            + self.len.len() * 2) as u64
+            + self.len.len()
+            + self.len_hi.len() * std::mem::size_of::<(u32, u16)>()) as u64
     }
 
     pub(crate) fn pages(&self) -> usize {
@@ -287,6 +396,23 @@ impl Index {
         &self.hdr_keys[b * self.k..(b + 1) * self.k]
     }
 
+    #[inline]
+    fn cp(&self, b: usize) -> usize {
+        (self.hdr_cp[b] & CP_MASK) as usize
+    }
+
+    #[inline]
+    fn wlen(&self, b: usize) -> usize {
+        let raw = self.hdr_cp[b];
+        if (raw & CP_MASK) as usize == self.k {
+            0
+        } else if raw & CP_NARROW != 0 {
+            4
+        } else {
+            W
+        }
+    }
+
     fn block_of(&self, c: usize) -> usize {
         self.hdr_start.partition_point(|&s| s as usize <= c) - 1
     }
@@ -295,16 +421,37 @@ impl Index {
         self.hdr_start.get(b + 1).map_or(self.n, |s| *s as usize)
     }
 
-    fn w(&self, c: usize) -> &[u8] {
-        &self.win[c * W..(c + 1) * W]
+    #[inline]
+    fn w(&self, b: usize, c: usize) -> &[u8] {
+        let wl = self.wlen(b);
+        let off = self.hdr_win_off[b] as usize + (c - self.hdr_start[b] as usize) * wl;
+        &self.win[off..off + wl]
+    }
+
+    #[inline]
+    fn page_len(&self, c: usize) -> u64 {
+        let l = self.len[c];
+        if l < u8::MAX {
+            l as u64
+        } else {
+            let i = self
+                .len_hi
+                .binary_search_by_key(&(c as u32), |&(p, _)| p)
+                .expect("overflow page length recorded");
+            self.len_hi[i].1 as u64
+        }
     }
 
     /// Byte range of page `c` in the data file.
     pub(crate) fn range(&self, c: usize) -> (u64, u64) {
         let b = self.block_of(c);
         let s = self.hdr_start[b] as usize;
-        let units: u64 = self.hdr_base[b] + self.len[s..c].iter().map(|&x| x as u64).sum::<u64>();
-        (units * UNIT, (units + self.len[c] as u64) * UNIT)
+        let mut units = self.hdr_base.get(b);
+        for i in s..c {
+            units += self.page_len(i);
+        }
+        let len = self.page_len(c);
+        (units * UNIT, (units + len) * UNIT)
     }
 
     /// Bytes of the data file.
@@ -344,16 +491,18 @@ impl Index {
         }
         let b = lo - 1;
         let (s, e) = (self.hdr_start[b] as usize, self.block_end(b));
-        let cp = self.hdr_cp[b] as usize;
+        let cp = self.cp(b);
         if key[..cp] != self.hkey(b)[..cp] {
             // Past every first key of the block.
             return Some(e - 1);
         }
+        let wl = self.wlen(b);
         let qw = window(key, cp);
+        let qw = &qw[..wl];
         let (mut lo, mut hi) = (s, e);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if (self.w(mid), self.blk[mid]) <= (&qw[..], hb) {
+            if (self.w(b, mid), self.blk[mid]) <= (qw, hb) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -369,16 +518,22 @@ impl Index {
         let f = self.floor(key, h)?;
         let b = self.block_of(f);
         let (s, e) = (self.hdr_start[b] as usize, self.block_end(b));
-        let cp = self.hdr_cp[b] as usize;
+        let cp = self.cp(b);
         if key[..cp] != self.hkey(b)[..cp] {
+            return Some((f, f));
+        }
+        let wl = self.wlen(b);
+        if wl == 0 {
+            // Every page of this block starts with `hkey(b) == key`:
+            // `floor` compared the exact full key and block number.
             return Some((f, f));
         }
         let qw = window(key, cp);
         let part = match address_part(self.k, cp) {
-            0 => W,
+            0 => wl,
             ap => ap,
         };
-        let same = |c: usize| self.w(c)[..part] == qw[..part];
+        let same = |c: usize| self.w(b, c)[..part] == qw[..part];
         // The page before the first one with the key's window part...
         let mut first = f;
         while first > s && same(first) {
@@ -406,13 +561,17 @@ impl Index {
         if self.block_of(nc) != b {
             return false;
         }
-        let cp = self.hdr_cp[b] as usize;
+        let cp = self.cp(b);
         if key[..cp] != self.hkey(b)[..cp] {
             return false;
         }
-        let (qw, nw) = (window(key, cp), self.w(nc));
+        let wl = self.wlen(b);
+        if wl == 0 {
+            return true;
+        }
+        let (qw, nw) = (window(key, cp), self.w(b, nc));
         match address_part(self.k, cp) {
-            0 => nw == &qw[..],
+            0 => nw == &qw[..wl],
             ap => nw[..ap] == qw[..ap],
         }
     }
@@ -442,8 +601,12 @@ impl Index {
         if b != nb {
             return (self.hkey(nb) == key).then_some(self.blk[nc] as u64);
         }
-        let cp = self.hdr_cp[b] as usize;
-        (self.w(nc) == &window(key, cp)[..]).then_some(self.blk[nc] as u64)
+        let cp = self.cp(b);
+        if key[..cp] != self.hkey(b)[..cp] {
+            return None;
+        }
+        let wl = self.wlen(b);
+        (wl == 0 || self.w(b, nc) == &window(key, cp)[..wl]).then_some(self.blk[nc] as u64)
     }
 }
 
@@ -636,5 +799,122 @@ mod tests {
         flipped[bytes.len() / 2] ^= 1;
         assert!(Index::parse(&flipped).is_err());
         assert!(Index::parse(&bytes[..bytes.len() - 9]).is_err());
+    }
+
+    fn key32(a: u64) -> Vec<u8> {
+        let mut k = vec![0u8; 32];
+        k[..8].copy_from_slice(&a.to_be_bytes());
+        k[24..32].copy_from_slice(&a.wrapping_mul(17).to_be_bytes());
+        k
+    }
+
+    #[test]
+    fn accounts_and_single_contract_runs_do_not_split_blocks() {
+        // Accounts (k = 32) with interleaved multi-page keys pack into a single
+        // block of up to BLOCK_PAGES pages with 4-byte windows.
+        let mut acct_keys: Vec<(Vec<u8>, u32)> = Vec::new();
+        for a in 1..20u64 {
+            let pages = if a % 3 == 0 { 4 } else { 1 };
+            for p in 0..pages {
+                acct_keys.push((key32(a << 32), 10 + p * 100));
+            }
+        }
+        assert!(acct_keys.len() <= BLOCK_PAGES);
+        let idx = build(&acct_keys);
+        assert_eq!(idx.hdr_start.len(), 1, "accounts should not split on in_run");
+        assert_eq!(idx.wlen(0), 4);
+        for (key, blk) in &acct_keys {
+            for h in [0, *blk as u64 - 1, *blk as u64, *blk as u64 + 1, u64::MAX] {
+                assert_eq!(idx.floor(key, h), floor_ref(&acct_keys, key, h));
+            }
+        }
+
+        // Single-contract storage (cp >= 32) with interleaved multi-page slots
+        // also packs into a single block with 4-byte windows.
+        let mut slot_keys: Vec<(Vec<u8>, u32)> = Vec::new();
+        for s in 1..20u64 {
+            let pages = if s % 4 == 0 { 5 } else { 1 };
+            for p in 0..pages {
+                slot_keys.push((key64(7 << 32, s << 40), 20 + p * 50));
+            }
+        }
+        assert!(slot_keys.len() <= BLOCK_PAGES);
+        let idx = build(&slot_keys);
+        assert_eq!(
+            idx.hdr_start.len(),
+            1,
+            "single-contract storage should not split on in_run"
+        );
+        assert_eq!(idx.wlen(0), 4);
+        for (key, blk) in &slot_keys {
+            for h in [0, *blk as u64 - 1, *blk as u64, *blk as u64 + 1, u64::MAX] {
+                assert_eq!(idx.floor(key, h), floor_ref(&slot_keys, key, h));
+            }
+        }
+    }
+
+    #[test]
+    fn compact_index_handles_len_overflow_and_window_widths() {
+        // 1) Page lengths >= 255 units (including exact 255 sentinel).
+        let mut b = IndexBuilder::new(32);
+        let lens = [1u64, 254, 255, 256, 1024, 3];
+        let mut off = 0u64;
+        for (i, &u) in lens.iter().enumerate() {
+            b.push(&key32((i as u64 + 1) << 32), 10, off);
+            off += u * UNIT;
+        }
+        let idx = Index::parse(&b.finish(off).unwrap()).unwrap();
+        assert_eq!(idx.len_hi.len(), 3);
+        let mut expected = 0u64;
+        for (i, &u) in lens.iter().enumerate() {
+            assert_eq!(idx.range(i), (expected, expected + u * UNIT));
+            expected += u * UNIT;
+        }
+        assert_eq!(idx.data_len(), off);
+
+        // 2) Pure run block (`cp == k`) uses 0-byte windows (`wlen == 0`) and
+        //    distinguishes `key == hkey(b)` from `key != hkey(b)` in `continues_at`.
+        let hot = key64(5 << 32, 9 << 40);
+        let run: Vec<(Vec<u8>, u32)> = (0..10u32).map(|i| (hot.clone(), 100 + i * 50)).collect();
+        let idx = build(&run);
+        assert_eq!(idx.hdr_start.len(), 1);
+        assert_eq!(idx.wlen(0), 0);
+        assert!(idx.win.is_empty());
+        assert_eq!(idx.continues_at(0, &hot), Some(150));
+        assert_eq!(idx.continues_at(0, &key64(5 << 32, 10 << 40)), None);
+        assert!(idx.may_continue(0, &hot));
+        assert!(!idx.may_continue(0, &key64(5 << 32, 10 << 40)));
+        assert_eq!(idx.floor(&hot, 220), Some(2));
+        assert_eq!(idx.floor_range(&hot, 220), Some((2, 2)));
+
+        // 3) Two distinct keys inside one contract sharing the first 4 bytes of
+        //    their window keep `wlen == 8` so ordering stays exact.
+        let mut s1 = vec![0u8; 64];
+        s1[0] = 1;
+        s1[32..36].copy_from_slice(&[0x10, 0x20, 0x30, 0x40]);
+        s1[36..40].copy_from_slice(&[0, 0, 0, 1]);
+        let mut s2 = s1.clone();
+        s2[36..40].copy_from_slice(&[0, 0, 0, 2]);
+        let mut s3 = s1.clone();
+        s3[32] = 0x11; // ensures `cp == 32`, so window starts at byte 32
+        let keys = vec![(s1.clone(), 10), (s2.clone(), 10), (s3.clone(), 10)];
+        let idx = build(&keys);
+        assert_eq!(idx.hdr_start.len(), 1);
+        assert_eq!(idx.wlen(0), 8);
+        for (k, blk) in &keys {
+            assert_eq!(idx.floor(k, *blk as u64), floor_ref(&keys, k, *blk as u64));
+        }
+
+        // 4) Memory accounting reflects the narrower in-memory encoding.
+        let big: Vec<(Vec<u8>, u32)> = (1..=512u64)
+            .map(|s| (key64(1 << 32, s << 40), 10))
+            .collect();
+        let idx = build(&big);
+        // Uncompressed would be >= 512 * 14 = 7168 B; compact is 9 B/page + headers (~5200 B).
+        assert!(
+            idx.mem_bytes() < 512 * 11,
+            "expected compact index < 5632 B, got {}",
+            idx.mem_bytes()
+        );
     }
 }
