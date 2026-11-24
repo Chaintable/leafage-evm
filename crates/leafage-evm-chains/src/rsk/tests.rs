@@ -43,7 +43,7 @@ fn transact(code: &[u8]) -> Result<ExecutionResult, EVMError<Infallible>> {
     cfg.disable_base_fee = true;
     cfg.disable_nonce_check = true;
     let block = BlockEnv {
-        basefee: MINIMUM_GAS_PRICE,
+        basefee: MINIMUM_GAS_PRICE.into(),
         ..Default::default()
     };
 

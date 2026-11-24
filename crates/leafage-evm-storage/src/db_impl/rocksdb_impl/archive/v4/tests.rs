@@ -59,6 +59,7 @@ fn block_info(number: u64, fork: u8) -> BlockInfo {
             hash,
             inner: RawHeader {
                 number,
+                base_fee_per_gas: Some(1_000_000_000_000_000_000_001 + u128::from(number)),
                 ..Default::default()
             },
             ..Default::default()
@@ -173,6 +174,10 @@ fn answers(db: &Arc<DataBaseRef>, head: u64) -> Answers {
     let heights: Vec<u64> = (1..=head).filter(|h| h % 7 == 1 || *h + 3 > head).collect();
     for &h in &heights {
         let state = at(db, h);
+        assert_eq!(
+            state.block_info.as_ref().unwrap().header.base_fee_per_gas,
+            Some(1_000_000_000_000_000_000_001 + u128::from(h))
+        );
         for (i, a) in addrs().into_iter().enumerate() {
             out.accounts.insert((i, h), state.read_account(a).unwrap());
             // Slots written and slots never written.

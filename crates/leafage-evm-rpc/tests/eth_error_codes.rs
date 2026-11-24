@@ -105,7 +105,26 @@ async fn serve(
     cfg.disable_balance_check = true;
     cfg.disable_base_fee = true;
     cfg.chain_id = 1;
-    let handle = ApiBuilder::new(tree, MultiChainCfgEnv::Mainnet(cfg))
+    serve_configured(
+        tree,
+        is_archive,
+        block_zero,
+        historical_rpc,
+        addr,
+        MultiChainCfgEnv::Mainnet(cfg),
+    )
+    .await
+}
+
+async fn serve_configured(
+    tree: Arc<StateTree<MultiStorage>>,
+    is_archive: bool,
+    block_zero: Option<DebankBlock>,
+    historical_rpc: Option<String>,
+    addr: std::net::SocketAddr,
+    cfg: MultiChainCfgEnv,
+) -> (ServerHandle, HttpClient) {
+    let handle = ApiBuilder::new(tree, cfg)
         .with_rpc_block_zero(block_zero)
         .with_historical_config(historical_rpc, Some(1))
         .build_and_run(
@@ -235,6 +254,7 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
     let real_tree = open_tree(&db_path.join("real"), 0);
     let placeholder = DebankBlock {
         timestamp: 1_653_498_000,
+        base_fee_per_gas: 1_000_000_000_000_000_000_001,
         ..Default::default()
     };
     let expected = serde_json::to_value(&placeholder).unwrap();
@@ -278,28 +298,50 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
     }
 
     let zero = BlockNumberOrTag::Number(0);
-    let (handle, client) = serve(missing_tree.clone(), false, Some(placeholder.clone()), None).await;
+    let (handle, client) =
+        serve(missing_tree.clone(), false, Some(placeholder.clone()), None).await;
     let block = client.get_block_by_height(U256::ZERO).await.unwrap();
     assert_eq!(serde_json::to_value(block).unwrap(), expected);
     for full in [false, true] {
-        let block = client.get_block_by_number(zero, full).await.unwrap().unwrap();
+        let block = client
+            .get_block_by_number(zero, full)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(block["number"], "0x0");
         assert_eq!(block["hash"], expected["id"]);
         assert_eq!(block["parentHash"], expected["parent_id"]);
         assert_eq!(block["miner"], expected["miner"]);
         assert_eq!(block["timestamp"], format!("0x{:x}", placeholder.timestamp));
-        assert_eq!(block["baseFeePerGas"], "0x0");
+        assert_eq!(
+            block["baseFeePerGas"],
+            format!("0x{:x}", placeholder.base_fee_per_gas)
+        );
         assert_eq!(block["gasLimit"], "0x0");
         assert_eq!(block["gasUsed"], "0x0");
         assert_eq!(block["transactions"], serde_json::json!([]));
     }
-    assert_eq!(error_code(client.get_block_by_hash(H256::ZERO, false).await), -39006);
-    assert_eq!(error_code(client.get_block_by_number(BlockNumberOrTag::Number(99), false).await), -39006);
+    assert_eq!(
+        error_code(client.get_block_by_hash(H256::ZERO, false).await),
+        -39006
+    );
+    assert_eq!(
+        error_code(
+            client
+                .get_block_by_number(BlockNumberOrTag::Number(99), false)
+                .await
+        ),
+        -39006
+    );
     handle.stop().unwrap();
     handle.stopped().await;
 
     let (handle, client) = serve(real_tree, false, Some(placeholder), None).await;
-    let block = client.get_block_by_number(zero, false).await.unwrap().unwrap();
+    let block = client
+        .get_block_by_number(zero, false)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(block["hash"], serde_json::json!(H256::repeat_byte(0xaa)));
     assert_eq!(
         client.get_block_by_height(U256::ZERO).await.unwrap().id,
@@ -309,7 +351,10 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
     handle.stopped().await;
 
     let (handle, client) = serve(missing_tree, false, None, None).await;
-    assert_eq!(error_code(client.get_block_by_number(zero, false).await), -39006);
+    assert_eq!(
+        error_code(client.get_block_by_number(zero, false).await),
+        -39006
+    );
     assert_eq!(
         error_code(client.get_block_by_height(U256::ZERO).await),
         -39006
@@ -319,5 +364,84 @@ async fn rpc_block_zero_only_fills_missing_height_zero() {
 
     historical.stop().unwrap();
     upstream.stop().unwrap();
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn celo_l1_rejects_oversized_block_fee_overrides() {
+    use leafage_evm_chains::celo::{l1::GINGERBREAD_BLOCK, CeloCfgEnv, CELO_CHAIN_ID};
+    use leafage_evm_types::BlockOverrides;
+
+    let db_path = std::env::temp_dir().join(format!("leafage-celo-fee-{}", std::process::id()));
+    let tree = open_tree(&db_path, GINGERBREAD_BLOCK);
+    let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::LONDON);
+    cfg.chain_id = CELO_CHAIN_ID;
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    drop(socket);
+    let (handle, client) = serve_configured(
+        tree,
+        false,
+        None,
+        None,
+        addr,
+        MultiChainCfgEnv::Celo(CeloCfgEnv::L1(cfg)),
+    )
+    .await;
+    let overrides = BlockOverrides {
+        base_fee: Some(U256::from(u128::MAX) + U256::ONE),
+        ..Default::default()
+    };
+    let call = EthApiClient::call(
+        &client,
+        call_to(0x01),
+        BlockId::Number(BlockNumberOrTag::Latest),
+        None,
+        Some(overrides.clone()),
+    )
+    .await;
+    let estimate =
+        DebankApiClient::estimate_gas(&client, call_to(0x01), None, Some(overrides)).await;
+    for error in [call.unwrap_err(), estimate.unwrap_err()] {
+        let ClientError::Call(error) = error else {
+            panic!("expected a JSON-RPC error")
+        };
+        assert_eq!(error.code(), -32602);
+        assert!(error.message().contains("baseFeePerGas exceeds u128"));
+    }
+    handle.stop().unwrap();
+    handle.stopped().await;
+    let _ = std::fs::remove_dir_all(db_path);
+}
+
+#[tokio::test]
+async fn zksync_estimate_rejects_base_fees_outside_its_native_width() {
+    use leafage_evm_types::BlockOverrides;
+
+    let db_path = std::env::temp_dir().join(format!("leafage-era-fee-{}", std::process::id()));
+    let tree = open_tree(&db_path, 0);
+    let mut cfg = CfgEnv::new_with_spec(MainnetSpecId::OSAKA);
+    cfg.chain_id = 324;
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    drop(socket);
+    let (handle, client) =
+        serve_configured(tree, false, None, None, addr, MultiChainCfgEnv::Zksync(cfg)).await;
+    let overrides = BlockOverrides {
+        base_fee: Some(U256::from(u64::MAX) + U256::ONE),
+        ..Default::default()
+    };
+    let error = DebankApiClient::estimate_gas(&client, call_to(0x01), None, Some(overrides))
+        .await
+        .unwrap_err();
+    let ClientError::Call(error) = error else {
+        panic!("expected a JSON-RPC error")
+    };
+    assert_eq!(error.code(), -32602);
+    assert!(error
+        .message()
+        .contains("ZKsync Era baseFeePerGas exceeds u64"));
+    handle.stop().unwrap();
+    handle.stopped().await;
     let _ = std::fs::remove_dir_all(db_path);
 }

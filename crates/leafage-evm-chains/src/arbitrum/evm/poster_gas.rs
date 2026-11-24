@@ -171,7 +171,7 @@ fn brotli_len(input: &[u8], level: u64) -> Option<usize> {
 impl ArbPricing {
     /// Nitro's RPCPostingGasHook reserves posting gas in addition to the
     /// default compute cap, using the call's gas field and estimation padding.
-    pub fn rpc_posting_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
+    pub fn rpc_posting_gas(&self, tx: &TxEnv, l2_base_fee: u128) -> u64 {
         let cost = self
             .poster_data_cost(tx, PosterDataMode::CurrentTx)
             .unwrap_or_default();
@@ -184,7 +184,7 @@ impl ArbPricing {
 
     /// Replicate Nitro's gas-estimation posterGas for `tx`. `l2_base_fee` is the
     /// block base fee. Returns 0 if the fake tx can't be compressed.
-    pub fn poster_gas(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
+    pub fn poster_gas(&self, tx: &TxEnv, l2_base_fee: u128) -> u64 {
         let cost = match self.poster_data_cost(tx, PosterDataMode::Estimate) {
             Some(cost) => self.pad_estimation_cost(cost),
             None => return 0,
@@ -196,7 +196,7 @@ impl ArbPricing {
     /// uses the fake tx with random gas and L1 price padding, but divides by the
     /// current L2 base fee directly instead of applying gas-estimation's 7/8
     /// price adjustment.
-    pub fn gas_estimate_l1_component(&self, tx: &TxEnv, l2_base_fee: u64) -> u64 {
+    pub fn gas_estimate_l1_component(&self, tx: &TxEnv, l2_base_fee: u128) -> u64 {
         let cost = match self.poster_data_cost(tx, PosterDataMode::Estimate) {
             Some(cost) => self.pad_estimation_cost(cost),
             None => return 0,
@@ -552,7 +552,7 @@ mod tests {
     fn gas_estimate_l1_component_does_not_apply_price_adjustment() {
         let p = robinhood_pricing();
         let tx = sample_tx(vec![0xabu8; 128]);
-        let high_base_fee = 1_000_000_000u64;
+        let high_base_fee = 1_000_000_000u128;
 
         assert!(
             p.gas_estimate_l1_component(&tx, high_base_fee) < p.poster_gas(&tx, high_base_fee),

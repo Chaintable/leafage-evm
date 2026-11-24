@@ -41,7 +41,7 @@ pub fn create_txn_env<DB: DatabaseRef>(
     } else if block.number >= U256::from(GINGERBREAD_BLOCK) {
         let cap = request.max_fee_per_gas.unwrap_or_default();
         let tip = request.max_priority_fee_per_gas.unwrap_or_default();
-        (cap.min(tip.saturating_add(block.basefee as u128)), cap, tip)
+        (cap.min(tip.saturating_add(block.basefee)), cap, tip)
     } else {
         (0, 0, 0)
     };

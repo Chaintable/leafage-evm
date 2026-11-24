@@ -161,6 +161,8 @@ RUST_LOG=info ./target/release/leafage-evm standalone \
 
 For HyperEVM, use `--evm-type=hyper --chain-cfg=999`. Add `--upstream-url` and `--forward-read-precompiles` to resolve the chain's HyperCore read precompiles (`0x800..=0x814`) during `eth_call`, `estimateGas`, `simulateTransactions` and the `pre_*` traces; the state behind them lives in HyperCore and never reaches the EVM archive, so the upstream is always queried at its latest block and forwarded reads in historical simulations are approximate.
 
+For Stable, see [Stable deployment and fee support](docs/Stable.md) for large base fees and the block-zero RPC configuration.
+
 For Cosmos chains, configure additional native precompile addresses with:
 
 ```bash

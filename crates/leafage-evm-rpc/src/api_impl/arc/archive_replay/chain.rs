@@ -174,7 +174,7 @@ mod tests {
             block.header.receipts_root = alloy::consensus::constants::EMPTY_ROOT_HASH;
             block.transactions = alloy::rpc::types::BlockTransactions::Full(vec![]);
             let mut info = BlockInfo::default();
-            info.header = block.header.clone();
+            info.header = block.header.clone().map(Into::into);
             let result = replay.replay(
                 &info,
                 FetchedBlock {

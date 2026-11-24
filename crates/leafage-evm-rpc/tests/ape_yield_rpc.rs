@@ -253,7 +253,7 @@ async fn ape_balances_and_precompiles_follow_yield_fields() {
                         .to(to)
                         .value(value)
                         .input(TransactionInput::new(Bytes::from(data))),
-                    tempo: None,
+                    other: Default::default(),
                 },
                 latest,
                 None,
@@ -319,7 +319,7 @@ async fn ape_balances_and_precompiles_follow_yield_fields() {
                 .from(auto)
                 .to(Address::repeat_byte(0x99))
                 .value(U256::from(1_000_000)),
-            tempo: None,
+            other: Default::default(),
         },
         None,
         None,

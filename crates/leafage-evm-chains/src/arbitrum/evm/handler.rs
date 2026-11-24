@@ -75,7 +75,7 @@ where
     fn l2_basefee(ctx: &ArbitrumContext<DB>) -> u128 {
         ctx.chain()
             .current_l2_basefee()
-            .unwrap_or_else(|| ctx.block().basefee()) as u128
+            .unwrap_or_else(|| ctx.block().basefee())
     }
 
     fn collect_tips(

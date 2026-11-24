@@ -1,11 +1,10 @@
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
 use super::hl_read_precompile::ReadPrecompileForwarder;
+use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
 use crate::api_impl::mainnet::api::apply_blockhashes_contract_call;
 use crate::api_impl::mainnet::evm::{
     create_main_evm_from_state_with_precompiles, create_mainnet_txn_env,
 };
 use crate::api_impl::ApiImpl;
-use alloy::consensus::BlockHeader;
 use alloy_evm::precompiles::PrecompilesMap;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_types::{BlockEnv, BlockInfo, CallRequest, MainnetSpecId};
@@ -135,7 +134,7 @@ where
 
     fn apply_pre_execution_changes<StateDB>(
         &self,
-        header: impl BlockHeader,
+        parent_hash: leafage_evm_types::H256,
         block_env: &BlockEnv,
         state: &mut StateDB,
     ) -> RpcResult<()>
@@ -143,7 +142,7 @@ where
         StateDB: DatabaseCommit + DatabaseRef + Debug,
         StateDB::Error: Sync + Send + 'static,
     {
-        apply_blockhashes_contract_call(&self.evm_cfg.cfg, header.parent_hash(), block_env, state)
+        apply_blockhashes_contract_call(&self.evm_cfg.cfg, parent_hash, block_env, state)
     }
 
     /// Backs `simulateTransactions`, `pre_traceCall` and `pre_traceMany`.

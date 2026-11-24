@@ -154,7 +154,7 @@ where
         let compressed = diff_size * BROTLI_COMPRESSION_PERCENTAGE / 100 + L1_FEE_OVERHEAD;
         let l1_fee = l1_fee_rate * compressed as u128;
 
-        let base_fee = block_env.basefee as u128;
+        let base_fee = block_env.basefee;
         let effective_price = base_fee.max(1);
 
         let overhead = (l1_fee + effective_price - 1) / effective_price;

@@ -128,7 +128,7 @@ where
                     &mut db,
                     &mut block_env,
                     block.header.clone(),
-                );
+                )?;
             }
             if let Some(overrides) = state_override {
                 utils::apply_state_overrides(overrides, &mut db)?;
@@ -187,7 +187,7 @@ where
                     &mut db,
                     &mut block_env,
                     block.header.clone(),
-                );
+                )?;
             }
             let db = utils::RequestCacheDB::new(db);
             estimate(

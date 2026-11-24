@@ -1380,6 +1380,7 @@ mod tests {
     async fn rpc_block_zero_requires_nonzero_genesis_and_zero_height() {
         let mut block = serde_json::to_value(DebankBlock {
             timestamp: 1_636_333_200,
+            base_fee_per_gas: 1_000_000_000_000_000_000_001,
             ..Default::default()
         })
         .unwrap();
@@ -1387,7 +1388,9 @@ mod tests {
         let json = block.to_string();
 
         let command = parse_command(&["--genesis-number", "1", "--rpc-block-zero", &json]);
-        assert_eq!(command.rpc_block_zero.unwrap().timestamp, 1_636_333_200);
+        let placeholder = command.rpc_block_zero.unwrap();
+        assert_eq!(placeholder.timestamp, 1_636_333_200);
+        assert_eq!(placeholder.base_fee_per_gas, 1_000_000_000_000_000_000_001);
 
         let error = parse_command(&["--rpc-block-zero", &json])
             .run()

@@ -2,9 +2,9 @@
 //! headers are node errors, never a successful empty validator set or seal.
 
 use super::{crypto, precompile::Failure, EPOCH_SIZE};
-use alloy::consensus::BlockHeader;
 use alloy_rlp::{Decodable, Encodable};
 use alloy_rlp_derive::{RlpDecodable, RlpEncodable};
+use leafage_evm_types::RawHeader;
 use revm::primitives::{keccak256, Address, Bytes, B256, U256};
 use std::sync::{Arc, OnceLock};
 
@@ -87,51 +87,41 @@ fn integer(value: U256) -> Bytes {
 }
 
 impl CeloHeader {
-    pub fn from_header(header: &impl BlockHeader) -> Self {
+    pub fn from_header(header: &RawHeader) -> Self {
         // Legacy archive headers can contain Ethereum RPC compatibility
         // defaults (notably EMPTY_OMMER_ROOT_HASH). The consensus encoding is
         // selected by Celo's fork height, never by those synthetic fields.
-        let fields = if header.number() < super::GINGERBREAD_BLOCK {
+        let fields = if header.number < super::GINGERBREAD_BLOCK {
             vec![
-                header.parent_hash().as_slice().to_vec().into(),
-                header.beneficiary().as_slice().to_vec().into(),
-                header.state_root().as_slice().to_vec().into(),
-                header.transactions_root().as_slice().to_vec().into(),
-                header.receipts_root().as_slice().to_vec().into(),
-                header.logs_bloom().as_slice().to_vec().into(),
-                integer(U256::from(header.number())),
-                integer(U256::from(header.gas_used())),
-                integer(U256::from(header.timestamp())),
-                header.extra_data().clone(),
+                header.parent_hash.as_slice().to_vec().into(),
+                header.beneficiary.as_slice().to_vec().into(),
+                header.state_root.as_slice().to_vec().into(),
+                header.transactions_root.as_slice().to_vec().into(),
+                header.receipts_root.as_slice().to_vec().into(),
+                header.logs_bloom.as_slice().to_vec().into(),
+                integer(U256::from(header.number)),
+                integer(U256::from(header.gas_used)),
+                integer(U256::from(header.timestamp)),
+                header.extra_data.clone(),
             ]
         } else {
             vec![
-                header.parent_hash().as_slice().to_vec().into(),
-                header.ommers_hash().as_slice().to_vec().into(),
-                header.beneficiary().as_slice().to_vec().into(),
-                header.state_root().as_slice().to_vec().into(),
-                header.transactions_root().as_slice().to_vec().into(),
-                header.receipts_root().as_slice().to_vec().into(),
-                header.logs_bloom().as_slice().to_vec().into(),
-                integer(header.difficulty()),
-                integer(U256::from(header.number())),
-                integer(U256::from(header.gas_limit())),
-                integer(U256::from(header.gas_used())),
-                integer(U256::from(header.timestamp())),
-                header.extra_data().clone(),
-                header
-                    .mix_hash()
-                    .unwrap_or_default()
-                    .as_slice()
-                    .to_vec()
-                    .into(),
-                header
-                    .nonce()
-                    .unwrap_or_default()
-                    .as_slice()
-                    .to_vec()
-                    .into(),
-                integer(U256::from(header.base_fee_per_gas().unwrap_or_default())),
+                header.parent_hash.as_slice().to_vec().into(),
+                header.ommers_hash.as_slice().to_vec().into(),
+                header.beneficiary.as_slice().to_vec().into(),
+                header.state_root.as_slice().to_vec().into(),
+                header.transactions_root.as_slice().to_vec().into(),
+                header.receipts_root.as_slice().to_vec().into(),
+                header.logs_bloom.as_slice().to_vec().into(),
+                integer(header.difficulty),
+                integer(U256::from(header.number)),
+                integer(U256::from(header.gas_limit)),
+                integer(U256::from(header.gas_used)),
+                integer(U256::from(header.timestamp)),
+                header.extra_data.clone(),
+                header.mix_hash.as_slice().to_vec().into(),
+                header.nonce.as_slice().to_vec().into(),
+                integer(U256::from(header.base_fee_per_gas.unwrap_or_default())),
             ]
         };
         Self { fields }

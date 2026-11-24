@@ -101,7 +101,7 @@ where
                 beneficiary: header.beneficiary,
                 timestamp: U256::from(header.timestamp),
                 gas_limit: header.gas_limit,
-                basefee: header.base_fee_per_gas.unwrap_or_default(),
+                basefee: header.base_fee_per_gas.unwrap_or_default().into(),
                 difficulty: header.difficulty,
                 prevrandao: Some(header.mix_hash),
                 blob_excess_gas_and_price: header.excess_blob_gas.map(|excess_blob_gas| {
