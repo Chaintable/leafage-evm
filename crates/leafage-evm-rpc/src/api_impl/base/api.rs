@@ -1,6 +1,6 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::base::evm::{create_base_evm_from_state, create_base_txn_env};
-use crate::api_impl::core::{ApiCore, EvmExecutor, GasFeeHandler};
+use crate::api_impl::core::{ApiCore, CallExecutor, EvmExecutor, GasFeeHandler};
 use crate::api_impl::ApiImpl;
 use jsonrpsee::core::RpcResult;
 use leafage_evm_chains::base::BaseHardfork;
@@ -62,6 +62,42 @@ where
             NoOpInspector {},
         );
         evm.transact_read_only(tx).map(Into::into)
+    }
+
+    /// Keeps one EVM for the whole run: the L1 block info it fetches for the
+    /// block on the first call is reused by the later ones, and its frame stack
+    /// and instruction table are built once instead of per call.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + std::fmt::Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        let build = || {
+            create_base_evm_from_state(
+                block_env.clone(),
+                self.evm_cfg.cfg.clone(),
+                state.clone(),
+                NoOpInspector {},
+            )
+        };
+        let mut evm = build();
+        // A call that unwound (a panic the caller caught) may have left the
+        // journal mid-transaction: the next call starts on a fresh EVM.
+        let mut interrupted = false;
+        f(&mut |tx| {
+            if interrupted {
+                evm = build();
+            }
+            interrupted = true;
+            let res = evm.transact_read_only(tx);
+            interrupted = false;
+            res
+        })
     }
 
     fn inspect_tx_commit<

@@ -220,6 +220,25 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         self.transact(block_env, state, tx)
     }
 
+    /// Runs `f` with an executor for a run of independent read-only calls that
+    /// share `block_env` and `state`, such as the calls of one multicall. Each
+    /// call behaves exactly like [`Self::transact`] and never sees another
+    /// call's state changes. The default builds a fresh EVM for every call;
+    /// chains whose EVM is costly to set up per call override it to keep one
+    /// EVM for the whole run.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        f(&mut |tx| self.transact(block_env, state.clone(), tx))
+    }
+
     fn inspect_tx_commit<StateDB, R, F>(
         &self,
         block_env: &BlockEnv,
@@ -236,6 +255,14 @@ pub(crate) trait EvmExecutor: Sync + Send + 'static {
         StateDB::Error: Sync + Send + 'static,
         F: FnOnce(TracingInspector) -> R;
 }
+
+/// One read-only call of a [`EvmExecutor::with_call_executor`] run.
+pub(crate) type CallExecutor<'a, E, StateDB> = dyn FnMut(
+        <E as EvmExecutor>::Tx,
+    ) -> Result<
+        ExecutionResult<<E as EvmExecutor>::EvmHaltReason>,
+        EVMError<<StateDB as DatabaseRef>::Error, <E as EvmExecutor>::TransactionError>,
+    > + 'a;
 
 pub(crate) trait TxSetter {
     fn set_gas_limit(&mut self, gas_limit: u64);

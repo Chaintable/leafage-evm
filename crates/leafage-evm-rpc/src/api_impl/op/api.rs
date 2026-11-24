@@ -1,6 +1,7 @@
 use crate::api_impl::api_impl::NoneEvmCustomConfig;
 use crate::api_impl::core::{
-    ApiCore, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError, ToJsonRpcError, TxSetter,
+    ApiCore, CallExecutor, EvmExecutor, GasFeeHandler, GetHaltReason, GetTransactionError,
+    ToJsonRpcError, TxSetter,
 };
 use crate::api_impl::op::evm::{create_op_evm_from_state, create_op_txn_env};
 use crate::api_impl::op::legacy;
@@ -98,6 +99,46 @@ where
         );
 
         evm.transact_read_only(tx).map(Into::into)
+    }
+
+    /// Keeps one EVM for the whole run (see the Base executor): the L1 block
+    /// info is fetched once per run instead of per call. Pre-Bedrock blocks
+    /// keep the per-call legacy path.
+    fn with_call_executor<StateDB, R>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        f: impl FnOnce(&mut CallExecutor<'_, Self, StateDB>) -> R,
+    ) -> R
+    where
+        StateDB: DatabaseRef + std::fmt::Debug + Clone,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        if legacy::is_legacy(&self.evm_cfg.cfg, block_env) {
+            return f(&mut |tx| legacy::transact(&self.evm_cfg.cfg, block_env, state.clone(), tx));
+        }
+        let cfg = block_cfg(&self.evm_cfg.cfg, block_env);
+        let build = || {
+            create_op_evm_from_state(
+                block_env.clone(),
+                cfg.clone(),
+                state.clone(),
+                NoOpInspector {},
+            )
+        };
+        let mut evm = build();
+        // A call that unwound (a panic the caller caught) may have left the
+        // journal mid-transaction: the next call starts on a fresh EVM.
+        let mut interrupted = false;
+        f(&mut |tx| {
+            if interrupted {
+                evm = build();
+            }
+            interrupted = true;
+            let res = evm.transact_read_only(tx);
+            interrupted = false;
+            res
+        })
     }
 
     fn inspect_tx_commit<
