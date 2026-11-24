@@ -411,6 +411,17 @@ pub struct Command {
     #[arg(long, default_value = "")]
     pprof_addr: String,
 
+    /// Keep jemalloc heap-profile sampling on from startup.
+    /// Default: false
+    ///
+    /// When `MALLOC_CONF` enables `prof`, every sampled allocation records a
+    /// stack trace, which costs CPU on a busy node. Sampling is therefore
+    /// switched off at startup unless this flag is set; it can be switched at
+    /// runtime on the pprof server with `POST /debug/pprof/allocs/activate`
+    /// and `POST /debug/pprof/allocs/deactivate`.
+    #[arg(long)]
+    heap_profiling: bool,
+
     /// Disables db automatic compactions.
     /// Default: false
     /// This value is used when `db_type` is Rocksdb.
@@ -997,6 +1008,15 @@ impl Command {
                     .await
                     .expect("Failed to serve readiness");
             });
+        }
+
+        match crate::pprof::set_heap_profiling(self.heap_profiling).await {
+            Ok(Some(on)) => info!("jemalloc heap profiling {}", if on { "on" } else { "off" }),
+            Ok(None) if self.heap_profiling => {
+                error!("--heap-profiling needs prof:true in MALLOC_CONF; heap profiling stays off")
+            }
+            Ok(None) => {}
+            Err(err) => error!("could not switch jemalloc heap profiling: {err:#}"),
         }
 
         if !self.pprof_addr.is_empty() {
