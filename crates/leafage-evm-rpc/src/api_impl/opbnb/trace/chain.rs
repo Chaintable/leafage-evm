@@ -2,7 +2,10 @@
 
 use super::replay::{decode_block, OpBnbBlock, OpBnbReplayBlock, OpBnbReplayer};
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
-use anyhow::{anyhow, bail, Result};
+use crate::pipeline::genesis::{genesis_output, GenesisOptions};
+use alloy::rpc::types::Block as RpcBlock;
+use anyhow::{anyhow, Result};
+use leafage_evm_chains::opbnb::opbnb_mainnet_genesis_alloc;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{BlockId, BlockInfo, H256};
 use std::sync::Arc;
@@ -38,12 +41,22 @@ where
 
     fn genesis(
         &self,
-        _db: &Arc<DB>,
-        _info: &BlockInfo,
-        _block: &OpBnbBlock,
-        _options: ReplayOptions,
+        db: &Arc<DB>,
+        info: &BlockInfo,
+        block: &OpBnbBlock,
+        options: ReplayOptions,
     ) -> Result<ReplayOutput> {
-        bail!("the opBNB genesis block is not exported (its block file is already right)")
+        // The genesis block has no transactions: only its header is used.
+        let mut genesis = RpcBlock::default();
+        genesis.header = block.header.clone();
+        let state = archive_state(db.as_ref(), info)?;
+        genesis_output(
+            opbnb_mainnet_genesis_alloc(),
+            &state,
+            &genesis,
+            options,
+            GenesisOptions::default(),
+        )
     }
 }
 

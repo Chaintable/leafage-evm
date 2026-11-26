@@ -1,6 +1,6 @@
 use anyhow::{bail, ensure, Result};
 use leafage_evm_rpc::{
-    bundle_range, export_bundles, Chain, ExportConfig, Layout, Resource, S3Target, BUNDLE_SIZE,
+    bundle_range, export_bundles, Chain, ExportConfig, Resource, S3Target, BUNDLE_SIZE,
 };
 use leafage_evm_storage::{MultiStorage, StateTree, StateTreeConfig, StorageKind};
 use std::collections::BTreeSet;
@@ -21,10 +21,6 @@ use tracing::info;
 ///
 /// Run it **offline**: the DB can only be opened by one process. Bundles
 /// it already uploaded are skipped, so it is safe to re-run.
-///
-/// `--layout per-block` uploads every block's file and validation as the
-/// objects the pipeline writers upload live, for chains without compacted
-/// bundles (opBNB); `--progress-file` then records the bundles done.
 #[derive(Debug, clap::Parser)]
 #[command(
     group(clap::ArgGroup::new("start").required(true)),
@@ -145,17 +141,6 @@ pub struct Command {
     /// Also compare the replayed state changes with the archive (slow).
     #[arg(long, default_value = "false")]
     check_state: bool,
-
-    /// How blocks are uploaded: `bundle` (pipeline-compactor bundles) or
-    /// `per-block` (one block file and one validation object per block, at
-    /// `{prefix}/{hash}` and `{prefix}/{height}/{hash}`).
-    #[arg(long, default_value = "bundle", value_parser = ["bundle", "per-block"])]
-    layout: String,
-
-    /// With `--layout per-block`: file recording the bundles uploaded, one
-    /// ID per line; a rerun skips them unless `--overwrite`.
-    #[arg(long, value_name = "PATH")]
-    progress_file: Option<PathBuf>,
 }
 
 impl Command {
@@ -246,21 +231,6 @@ impl Command {
         })
     }
 
-    fn layout(&self) -> Result<Layout> {
-        match self.layout.as_str() {
-            "per-block" => Ok(Layout::PerBlock {
-                progress: self.progress_file.clone(),
-            }),
-            _ => {
-                ensure!(
-                    self.progress_file.is_none(),
-                    "--progress-file needs --layout per-block"
-                );
-                Ok(Layout::Bundle)
-            }
-        }
-    }
-
     pub async fn run(&mut self) -> Result<()> {
         leafage_evm_storage::set_inverted_block_encoding(self.inverted_block_encoding);
         std::env::set_var(
@@ -268,7 +238,6 @@ impl Command {
             self.archive_code_cache_mb.to_string(),
         );
         let (from_bundle, to_bundle) = self.bundles()?;
-        let layout = self.layout()?;
         let resources: BTreeSet<Resource> = self.resources.iter().copied().collect();
         let s3 = self.s3_target(&resources).await?;
         // A typo'd path would otherwise create an empty DB.
@@ -313,7 +282,6 @@ impl Command {
                 chunk: self.chunk,
                 rebase_every: self.rebase_every,
                 check_state: self.check_state,
-                layout,
             },
         )
         .await
