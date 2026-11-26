@@ -15,6 +15,7 @@ use crate::api_impl::core::{
 use crate::api_impl::historical_overload::{HistoricalOverloadHttpLayer, HistoricalOverloadRpc};
 use crate::api_impl::hyper::HyperEvmConfig;
 use crate::metrics::{HttpMetricLayer, RpcMetric};
+use crate::pipeline::blocks::FetchedBlock;
 use crate::pipeline::chain::PipelineChain;
 use crate::pipeline::rpc::{TraceDebank, TraceDebankApiServer};
 use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder, ServerHandle};
@@ -544,7 +545,7 @@ fn merge_trace<C, P>(
 where
     C: ApiBase,
     C::DB: BlockIndex + EvmStorageRead + Clone + Sync + Send + 'static,
-    P: PipelineChain<C::DB>,
+    P: PipelineChain<C::DB, Block = FetchedBlock>,
 {
     let Some(block_client) = block_client else {
         return Ok(());

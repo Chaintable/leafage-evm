@@ -99,13 +99,14 @@ async fn fetch_ommers(
     Ok(ommers)
 }
 
-/// [`fetch_blocks`] from `debug_getRawBlock`: the upstream only reads the
-/// stored RLP, and the senders are recovered here, in parallel with the
-/// replay, instead of by the upstream for its JSON.
-pub(crate) async fn fetch_raw_blocks(
+/// The RLP of the blocks `hashes` from the upstream's `debug_getRawBlock`:
+/// the upstream only reads the stored RLP, and the chain decodes it (and
+/// recovers the senders) here, in parallel with the replay, instead of the
+/// upstream doing it for its JSON.
+pub(crate) async fn fetch_raw(
     client: &HttpClient,
     hashes: &[leafage_evm_types::H256],
-) -> anyhow::Result<Vec<FetchedBlock>> {
+) -> anyhow::Result<Vec<alloy::primitives::Bytes>> {
     // geth's errcodeResponseTooLarge: a batch past its response size limit
     // (25MB by default) answers the rest of it with this error.
     const RESPONSE_TOO_LARGE: i32 = -32003;
@@ -136,15 +137,14 @@ pub(crate) async fn fetch_raw_blocks(
             "upstream returned fewer blocks than asked"
         );
     }
-    tokio::task::spawn_blocking(move || {
-        raws.into_iter()
-            .map(|(hash, raw)| decode_raw_block(hash, &raw))
-            .collect()
-    })
-    .await?
+    Ok(raws.into_iter().map(|(_, raw)| raw).collect())
 }
 
-fn decode_raw_block(hash: leafage_evm_types::H256, raw: &[u8]) -> anyhow::Result<FetchedBlock> {
+/// An Ethereum-typed block from its RLP, the senders recovered.
+pub(crate) fn decode_raw_block(
+    hash: leafage_evm_types::H256,
+    raw: &[u8],
+) -> anyhow::Result<FetchedBlock> {
     use alloy::consensus::transaction::SignerRecoverable;
     use alloy::rlp::Decodable;
 

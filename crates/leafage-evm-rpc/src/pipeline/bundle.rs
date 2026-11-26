@@ -74,6 +74,23 @@ impl FromStr for Resource {
 }
 
 /// pipeline `BlockValidation`, summed over a bundle as the compactor does.
+/// The two objects of one block in the per-block layout, gzip JSON like the
+/// pipeline writers upload them live (`processor.SerializeFile` and
+/// `SerializeFileValidation`): its block file and its validation.
+pub(crate) fn block_objects(file: &BlockFile, level: u32) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut validation = BundleValidation::default();
+    validation.add(file);
+    Ok((gzip_json(file, level)?, gzip_json(&validation, level)?))
+}
+
+fn gzip_json<T: Serialize>(value: &T, level: u32) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(level));
+    serde_json::to_writer(&mut encoder, value)?;
+    Ok(encoder.finish()?)
+}
+
+/// A bundle's validation, or one block's in the per-block layout (Go
+/// `types.BlockValidation`).
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct BundleValidation {
     validation_hash: i64,

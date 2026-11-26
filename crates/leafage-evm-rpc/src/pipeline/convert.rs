@@ -11,6 +11,12 @@
 //! - output order follows `addTraceAndLog`: a frame's descendants first, then
 //!   its own events, then its direct child traces;
 //! - a log without topics has `topics = null`.
+//!
+//! [`TraceStyle::OpBnb`] follows the opBNB writer's pipeline branch instead
+//! (op-geth 1.13 legacy tracer plus the writer's early-exit hook): the output
+//! is pre-order with events in place, CREATE2 frames are typed `create2`,
+//! failed frames keep their output and `to`, errors use its short texts, and
+//! the top frame's gas is the transaction's gas limit.
 
 use super::types::{addr_hex, hash_hex, to_hash, BlockFile, PipelineEvent, PipelineTrace};
 use alloy::primitives::{Address, Bytes, B256, U256};
@@ -23,6 +29,15 @@ use revm_inspectors::tracing::{
 use std::collections::BTreeSet;
 
 const PARENT_CALL_FAILED: &str = "parent call failed";
+
+/// Whose conventions the traces follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceStyle {
+    /// `github.com/Chaintable/pipeline` v0.0.69 (bsc-x, go-ethereum-x).
+    Geth,
+    /// The opBNB writer (`Chaintable/op-geth` `opbnb`, pipeline e53af72).
+    OpBnb,
+}
 
 enum Member {
     Call(usize),
@@ -55,6 +70,8 @@ struct Frame {
 enum FrameKind {
     Call(CallKind),
     Create,
+    /// Only in [`TraceStyle::OpBnb`]; the geth style types it `create`.
+    Create2,
     Selfdestruct,
 }
 
@@ -71,12 +88,42 @@ pub(crate) fn append_tx_traces(
     storage_contracts: &mut BTreeSet<Address>,
     block_file: &mut BlockFile,
 ) {
+    append_styled_tx_traces(
+        TraceStyle::Geth,
+        tx_hash,
+        0,
+        arena,
+        sstore,
+        log_index,
+        storage_contracts,
+        block_file,
+    );
+}
+
+/// [`append_tx_traces`] in `style`; `tx_gas_limit` is the transaction's gas
+/// limit, the top frame's gas in [`TraceStyle::OpBnb`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_styled_tx_traces(
+    style: TraceStyle,
+    tx_hash: &B256,
+    tx_gas_limit: u64,
+    arena: &CallTraceArena,
+    sstore: &[bool],
+    log_index: &mut u64,
+    storage_contracts: &mut BTreeSet<Address>,
+    block_file: &mut BlockFile,
+) {
     let nodes = arena.nodes();
     if nodes.is_empty() {
         return;
     }
     let tx_id = hash_hex(tx_hash);
-    let mut top = build_frame(nodes, sstore, 0);
+    let mut top = build_frame(style, nodes, sstore, 0);
+    // op-geth's CaptureStart takes the transaction's gas limit; a creation
+    // rejected before it ran (the early-exit hook) keeps the gas it was given.
+    if style == TraceStyle::OpBnb && !is_early_exit(nodes[0].trace.status) {
+        top.gas = tx_gas_limit;
+    }
     set_parent_failed(&mut top, false);
     assign_log_index(&mut top, log_index);
     set_storage_change(&mut top, storage_contracts);
@@ -88,31 +135,49 @@ pub(crate) fn append_tx_traces(
     } else {
         block_file.traces.push(top_trace);
     }
-    add_trace_and_log(&mut top, &tx_id, &[], block_file);
+    match style {
+        TraceStyle::Geth => add_trace_and_log(&mut top, &tx_id, &[], block_file),
+        TraceStyle::OpBnb => add_trace_and_log_in_order(&mut top, &tx_id, &[], block_file),
+    }
 }
 
-fn build_frame(nodes: &[CallTraceNode], sstore: &[bool], idx: usize) -> Frame {
+/// A frame rejected by the checks done before it runs, which the opBNB
+/// writer records through its early-exit hook.
+fn is_early_exit(status: Option<InstructionResult>) -> bool {
+    matches!(
+        status,
+        Some(
+            InstructionResult::CallTooDeep
+                | InstructionResult::OutOfFunds
+                | InstructionResult::NonceOverflow
+                | InstructionResult::CreateCollision
+        )
+    )
+}
+
+fn build_frame(style: TraceStyle, nodes: &[CallTraceNode], sstore: &[bool], idx: usize) -> Frame {
     let node = &nodes[idx];
     let trace = &node.trace;
     let failed = !trace.success;
-    let kind = if trace.kind.is_any_create() {
-        FrameKind::Create
-    } else {
-        FrameKind::Call(trace.kind)
+    let kind = match trace.kind {
+        CallKind::Create2 if style == TraceStyle::OpBnb => FrameKind::Create2,
+        kind if kind.is_any_create() => FrameKind::Create,
+        kind => FrameKind::Call(kind),
     };
     let is_revert = trace.status == Some(InstructionResult::Revert);
-    let error = if failed {
-        error_message(trace.status, &trace.output)
-    } else {
-        String::new()
+    let error = match (failed, style) {
+        (false, _) => String::new(),
+        (true, TraceStyle::Geth) => error_message(trace.status, &trace.output),
+        (true, TraceStyle::OpBnb) => opbnb_error_message(trace.status),
     };
-    // Go keeps the output of successful frames and of reverts only.
-    let output = if !failed || is_revert {
+    // Go keeps the output of successful frames and of reverts only; the
+    // opBNB writer keeps every frame's output and `to`.
+    let output = if !failed || is_revert || style == TraceStyle::OpBnb {
         trace.output.clone()
     } else {
         Bytes::new()
     };
-    let to = if failed && kind == FrameKind::Create {
+    let to = if failed && kind == FrameKind::Create && style == TraceStyle::Geth {
         None
     } else {
         Some(trace.address)
@@ -163,7 +228,7 @@ fn build_frame(nodes: &[CallTraceNode], sstore: &[bool], idx: usize) -> Frame {
         let pos = frame.calls.len() + frame.logs.len();
         match member {
             TraceMemberOrder::Call(i) => {
-                let mut child = build_frame(nodes, sstore, node.children[*i]);
+                let mut child = build_frame(style, nodes, sstore, node.children[*i]);
                 child.pos_in_parent = pos;
                 frame.order.push(Member::Call(frame.calls.len()));
                 frame.calls.push(child);
@@ -298,6 +363,44 @@ fn add_trace_and_log(
     }
 }
 
+/// The opBNB writer's `addTraceAndLog`: members in position order, a child
+/// trace followed by its subtree, an event where it was emitted.
+fn add_trace_and_log_in_order(
+    frame: &mut Frame,
+    tx_id: &str,
+    trace_address: &[i64],
+    block_file: &mut BlockFile,
+) {
+    let parent_id = frame.id.clone();
+    let dropped = frame.failed || frame.parent_failed;
+    for member in std::mem::take(&mut frame.order) {
+        match member {
+            Member::Call(i) => {
+                let address = child_address(trace_address, i);
+                let child = &mut frame.calls[i];
+                child.id = to_hash(&[tx_id, &parent_id, &child.pos_in_parent.to_string()]);
+                let trace = to_trace(child, tx_id, &parent_id, address.clone());
+                if child.failed || child.parent_failed {
+                    block_file.error_traces.push(trace);
+                } else {
+                    block_file.traces.push(trace);
+                }
+                add_trace_and_log_in_order(child, tx_id, &address, block_file);
+            }
+            Member::Log(i) => {
+                let log = &mut frame.logs[i];
+                log.parent_trace_id = parent_id.clone();
+                log.id = to_hash(&[&parent_id, &log.pos_in_parent_trace.to_string()]);
+                if dropped {
+                    block_file.error_events.push(log.clone());
+                } else {
+                    block_file.events.push(log.clone());
+                }
+            }
+        }
+    }
+}
+
 fn child_address(trace_address: &[i64], i: usize) -> Vec<i64> {
     let mut child = Vec::with_capacity(trace_address.len() + 1);
     child.extend_from_slice(trace_address);
@@ -309,6 +412,7 @@ fn child_address(trace_address: &[i64], i: usize) -> Vec<i64> {
 fn to_trace(frame: &Frame, tx_id: &str, parent_id: &str, trace_address: Vec<i64>) -> PipelineTrace {
     let (call_create_type, call_type) = match frame.kind {
         FrameKind::Create => ("create", ""),
+        FrameKind::Create2 => ("create2", ""),
         FrameKind::Selfdestruct => ("suicide", ""),
         FrameKind::Call(kind) => ("call", call_type(kind)),
     };
@@ -393,6 +497,43 @@ fn error_message(status: Option<InstructionResult>, output: &Bytes) -> String {
         // Not a frame result, or one go-ethereum has no text for.
         _ => "execution failed".to_string(),
     }
+}
+
+/// The opBNB writer's `formatTraceError` for the revm result of a frame.
+fn opbnb_error_message(status: Option<InstructionResult>) -> String {
+    let Some(status) = status else {
+        return "execution failed".to_string();
+    };
+    match status {
+        InstructionResult::Revert => "Reverted",
+        InstructionResult::OutOfGas
+        | InstructionResult::MemoryOOG
+        | InstructionResult::MemoryLimitOOG
+        | InstructionResult::PrecompileOOG
+        | InstructionResult::InvalidOperandOOG => "Out of gas",
+        // A plain error in op-geth 1.13, not ErrOutOfGas.
+        InstructionResult::ReentrancySentryOOG => "not enough gas for reentrancy sentry",
+        InstructionResult::OutOfFunds => "Insufficient balance for transfer",
+        InstructionResult::InvalidJump => "Bad jump destination",
+        InstructionResult::CallTooDeep => "CallTooDeep",
+        InstructionResult::CreateCollision => "CreateCollision",
+        InstructionResult::StateChangeDuringStaticCall
+        | InstructionResult::CallNotAllowedInsideStatic => "StateChangeDuringStaticCall",
+        InstructionResult::OutOfOffset => "OutOfOffset",
+        InstructionResult::NonceOverflow => "NonceOverflow",
+        InstructionResult::CreateContractSizeLimit => "CreateContractSizeLimit",
+        InstructionResult::CreateInitCodeSizeLimit => "CreateInitCodeSizeLimit",
+        InstructionResult::CreateContractStartingWithEF => "CreateContractStartingWithEF",
+        InstructionResult::OpcodeNotFound
+        | InstructionResult::InvalidFEOpcode
+        | InstructionResult::NotActivated => "Bad instruction",
+        InstructionResult::StackOverflow => "Out of stack",
+        InstructionResult::StackUnderflow => "StackUnderflow",
+        // Any other error of a precompile.
+        InstructionResult::PrecompileError => "Built-in failed",
+        _ => return error_message(Some(status), &Bytes::new()),
+    }
+    .to_string()
 }
 
 /// `abi.UnpackRevert`: `Error(string)` or a `Panic(uint256)` description.

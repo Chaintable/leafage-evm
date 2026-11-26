@@ -1,12 +1,10 @@
 //! What a chain provides to regenerate its pipeline outputs: the replay of
 //! consecutive blocks on its archive state, and the genesis block.
 
-use super::blocks::FetchedBlock;
 use super::types::{BlockFile, PipelineHeader};
 use alloy::primitives::Bytes;
-use alloy::rpc::types::Block as RpcBlock;
 use anyhow::Result;
-use leafage_evm_types::BlockInfo;
+use leafage_evm_types::{BlockInfo, H256};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -45,7 +43,13 @@ pub(crate) struct ReplayOptions {
 /// A chain whose blocks can be replayed on an archive `DB` into pipeline
 /// outputs.
 pub(crate) trait PipelineChain<DB>: Send + Sync + 'static {
-    type Replay: ChainReplay + Send + 'static;
+    /// A block body from the upstream, decoded for this chain's replay.
+    type Block: Send + 'static;
+    type Replay: ChainReplay<Block = Self::Block> + Send + 'static;
+
+    /// Decode the RLP of block `hash` that the upstream's
+    /// `debug_getRawBlock` returned, checking that it hashes to `hash`.
+    fn decode_raw(&self, hash: H256, raw: &[u8]) -> Result<Self::Block>;
 
     /// Start replaying after block `parent`, on its archive state.
     fn start(
@@ -61,7 +65,7 @@ pub(crate) trait PipelineChain<DB>: Send + Sync + 'static {
         &self,
         db: &Arc<DB>,
         info: &BlockInfo,
-        block: &RpcBlock,
+        block: &Self::Block,
         options: ReplayOptions,
     ) -> Result<ReplayOutput>;
 }
@@ -70,8 +74,10 @@ pub(crate) trait PipelineChain<DB>: Send + Sync + 'static {
 /// one block to the next, so a key is read from the archive only the first
 /// time the replay touches it.
 pub(crate) trait ChainReplay {
+    type Block;
+
     /// Replay the block after the last one; `info` is its archive entry.
-    fn replay(&mut self, info: &BlockInfo, block: FetchedBlock) -> Result<ReplayOutput>;
+    fn replay(&mut self, info: &BlockInfo, block: Self::Block) -> Result<ReplayOutput>;
 
     /// Go on from the archive state after `info`, the last block replayed,
     /// dropping the state built so far to bound its memory.
@@ -92,16 +98,19 @@ pub enum Chain {
     Eth,
     /// Arc mainnet.
     Arc,
+    /// opBNB mainnet.
+    OpBnb,
 }
 
 impl Chain {
-    pub const ALL: [Chain; 3] = [Chain::Bsc, Chain::Eth, Chain::Arc];
+    pub const ALL: [Chain; 4] = [Chain::Bsc, Chain::Eth, Chain::Arc, Chain::OpBnb];
 
     pub fn name(self) -> &'static str {
         match self {
             Chain::Bsc => "bsc",
             Chain::Eth => "eth",
             Chain::Arc => "arc",
+            Chain::OpBnb => "opbnb",
         }
     }
 
@@ -111,6 +120,7 @@ impl Chain {
             Chain::Bsc => 56,
             Chain::Eth => 1,
             Chain::Arc => 5042,
+            Chain::OpBnb => 204,
         }
     }
 }

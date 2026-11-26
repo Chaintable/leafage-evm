@@ -2,13 +2,12 @@
 
 use super::genesis::genesis_output;
 use super::replay::{ArcBlock, ArcReplayer};
-use crate::pipeline::blocks::FetchedBlock;
+use crate::pipeline::blocks::{decode_raw_block, FetchedBlock};
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
 use alloy::primitives::B256;
-use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{anyhow, Result};
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrapper};
-use leafage_evm_types::{BlockId, BlockInfo};
+use leafage_evm_types::{BlockId, BlockInfo, H256};
 use std::sync::Arc;
 
 pub(crate) struct ArcPipeline;
@@ -21,6 +20,11 @@ where
     DB::StateDB: Send + 'static,
 {
     type Replay = ArcReplay<DB>;
+    type Block = FetchedBlock;
+
+    fn decode_raw(&self, hash: H256, raw: &[u8]) -> Result<FetchedBlock> {
+        decode_raw_block(hash, raw)
+    }
 
     fn start(
         &self,
@@ -41,11 +45,11 @@ where
         &self,
         db: &Arc<DB>,
         info: &BlockInfo,
-        block: &RpcBlock,
+        block: &FetchedBlock,
         options: ReplayOptions,
     ) -> Result<ReplayOutput> {
         let state = archive_state(db.as_ref(), info)?;
-        genesis_output(&state, block, options)
+        genesis_output(&state, &block.block, options)
     }
 }
 
@@ -61,6 +65,8 @@ impl<DB> ChainReplay for ArcReplay<DB>
 where
     DB: EvmStorageRead + Send + Sync + 'static,
 {
+    type Block = FetchedBlock;
+
     fn replay(&mut self, info: &BlockInfo, block: FetchedBlock) -> Result<ReplayOutput> {
         let state_root = block.block.header.state_root;
         let output = self.replayer.replay(ArcBlock {
@@ -97,6 +103,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::rpc::types::Block as RpcBlock;
     use leafage_evm_storage::{BlockContext, StateDB};
     use leafage_evm_types::{AccountInfo, BlockStorageDiff, Bytecode, U256};
     use std::sync::atomic::{AtomicUsize, Ordering};

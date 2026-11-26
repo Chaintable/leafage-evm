@@ -17,6 +17,10 @@ mod iavl;
 pub(crate) mod milli_timestamp;
 mod tendermint;
 mod tm_secp256k1;
+
+/// Shared with opBNB, which added both at its Fermat fork.
+pub(crate) use bls::BLS_SIGNATURE_VALIDATION;
+pub(crate) use cometbft::COMETBFT_LIGHT_BLOCK_VALIDATION;
 // BSC precompile provider
 #[derive(Debug, Clone)]
 pub struct BscPrecompiles {

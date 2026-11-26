@@ -22,5 +22,5 @@ pub(crate) mod types;
 
 pub use bundle::{Resource, BUNDLE_SIZE};
 pub use chain::Chain;
-pub use export::{bundle_range, export_bundles, ExportConfig};
+pub use export::{bundle_range, export_bundles, ExportConfig, Layout};
 pub use s3::S3Target;

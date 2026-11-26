@@ -6,8 +6,9 @@ use alloy::consensus::{
     Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom, Transaction as _, TxEnvelope, TxType,
 };
 use alloy::eips::Typed2718;
-use alloy::primitives::{Address, U256, U64};
+use alloy::primitives::{Address, Log, U256, U64};
 use alloy::rpc::types::Block as RpcBlock;
+use op_alloy_consensus::{OpDepositReceipt, OpReceiptEnvelope, OpTxEnvelope};
 use revm::context_interface::result::ExecutionResult;
 
 /// The receipt of a transaction, `cumulative_gas_used` in its block.
@@ -65,6 +66,78 @@ pub(crate) fn pipeline_transaction(
     }
 }
 
+/// The receipt of an OP-stack transaction, `cumulative_gas_used` in its
+/// block. A deposit carries the sender's nonce before it (from Regolith on)
+/// and the receipt version (from Canyon on), both in the receipts root.
+pub(crate) fn op_receipt_envelope(
+    tx: &OpTxEnvelope,
+    success: bool,
+    logs: Vec<Log>,
+    cumulative_gas_used: u64,
+    deposit_nonce: Option<u64>,
+    deposit_receipt_version: Option<u64>,
+) -> OpReceiptEnvelope {
+    let receipt = Receipt {
+        status: Eip658Value::Eip658(success),
+        cumulative_gas_used,
+        logs,
+    };
+    match tx {
+        OpTxEnvelope::Deposit(_) => OpReceiptEnvelope::Deposit(
+            OpDepositReceipt {
+                inner: receipt,
+                deposit_nonce,
+                deposit_receipt_version,
+            }
+            .with_bloom(),
+        ),
+        OpTxEnvelope::Legacy(_) => OpReceiptEnvelope::Legacy(ReceiptWithBloom::from(receipt)),
+        OpTxEnvelope::Eip2930(_) => OpReceiptEnvelope::Eip2930(ReceiptWithBloom::from(receipt)),
+        OpTxEnvelope::Eip1559(_) => OpReceiptEnvelope::Eip1559(ReceiptWithBloom::from(receipt)),
+        OpTxEnvelope::Eip7702(_) => OpReceiptEnvelope::Eip7702(ReceiptWithBloom::from(receipt)),
+        OpTxEnvelope::PostExec(_) => OpReceiptEnvelope::PostExec(ReceiptWithBloom::from(receipt)),
+    }
+}
+
+/// The opBNB writer's `util.BuildPipelineTransaction`: a creation has the
+/// zero address as `to`, a legacy or access-list transaction reports its gas
+/// price as `max_fee_per_gas`, and `nonce` is the deposit nonce for a deposit
+/// (whose own nonce field is zero).
+pub(crate) fn opbnb_pipeline_transaction(
+    tx: &OpTxEnvelope,
+    sender: Address,
+    status: bool,
+    gas_used: u64,
+    gas_price: u128,
+    nonce: u64,
+    index: usize,
+) -> PipelineTransaction {
+    let (max_fee_per_gas, max_priority_fee_per_gas) = match tx {
+        OpTxEnvelope::Eip1559(signed) => (
+            signed.tx().max_fee_per_gas,
+            signed.tx().max_priority_fee_per_gas,
+        ),
+        OpTxEnvelope::Legacy(signed) => (signed.tx().gas_price, 0),
+        OpTxEnvelope::Eip2930(signed) => (signed.tx().gas_price, 0),
+        _ => (0, 0),
+    };
+    PipelineTransaction {
+        id: hash_hex(&tx.tx_hash()),
+        from_addr: addr_hex(&sender),
+        to_addr: addr_hex(&tx.to().unwrap_or_default()),
+        gas_limit: tx.gas_limit() as i64,
+        gas_price,
+        gas_used: gas_used as i64,
+        status,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        input: tx.input().clone(),
+        nonce: nonce as i64,
+        idx: index as i64,
+        value: tx.value(),
+    }
+}
+
 /// `util.BuildPipelineBlock`.
 pub(crate) fn pipeline_block(header: &alloy::rpc::types::Header) -> PipelineBlock {
     PipelineBlock {
@@ -85,7 +158,11 @@ pub(crate) fn pipeline_block(header: &alloy::rpc::types::Header) -> PipelineBloc
 
 /// `util.BuildPilelineBlockHeader`.
 pub(crate) fn pipeline_header(block: &RpcBlock) -> PipelineHeader {
-    let header = &block.header;
+    pipeline_header_of(&block.header)
+}
+
+/// [`pipeline_header`] from the header alone.
+pub(crate) fn pipeline_header_of(header: &alloy::rpc::types::Header) -> PipelineHeader {
     PipelineHeader {
         number: U256::from(header.number),
         hash: header.hash,

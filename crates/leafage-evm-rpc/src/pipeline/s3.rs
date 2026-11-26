@@ -129,6 +129,36 @@ impl S3Target {
 
     /// Upload `data` as `resource` of bundle `id` in `export`, in parts if
     /// it is large.
+    /// Upload `data` to `{prefix}/{key}` of the block file bucket: one object
+    /// of the per-block layout, a block file or a block validation.
+    pub(crate) async fn put_block_object(
+        &self,
+        key: &str,
+        export: &str,
+        data: Bytes,
+    ) -> Result<()> {
+        let bucket = self
+            .chain_table_bucket
+            .as_deref()
+            .context("no target bucket for the block objects")?;
+        let key = format!("{}/{key}", self.prefix);
+        retry(&format!("put s3://{bucket}/{key}"), || async {
+            self.client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .metadata(PRODUCER_KEY, PRODUCER)
+                .metadata(EXPORT_KEY, export)
+                .content_length(data.len() as i64)
+                .body(ByteStream::from(data.clone()))
+                .send()
+                .await
+                .map_err(sdk_error)
+        })
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn put(
         &self,
         id: u64,

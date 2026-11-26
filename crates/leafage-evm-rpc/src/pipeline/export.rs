@@ -14,24 +14,33 @@
 //! by one export. A bundle that fails is logged and the export
 //! moves on; the export fails at the end, naming them.
 //!
+//! Chains without compacted bundles (opBNB) take the per-block layout
+//! instead ([`Layout::PerBlock`]): every block's file and validation are
+//! uploaded as the objects the pipeline writers upload live, and a local
+//! progress file records the bundles (block ranges) done.
+//!
 //! Workers replay runs of consecutive bundles. The bodies of the next chunk
 //! of blocks are fetched while the current one is replayed, and the replay
 //! state carries over from one bundle of a run to the next, rebased on the
 //! archive every `rebase_every` blocks to bound its memory: keys a run read
 //! once are not read from the archive again.
 
-use super::blocks::{fetch_raw_blocks, FetchedBlock};
-use super::bundle::{BundleObjects, BundleWriter, Resource, BUNDLE_SIZE};
-use super::chain::{Chain, ChainReplay, PipelineChain, ReplayOptions};
+use super::blocks::fetch_raw;
+use super::bundle::{block_objects, BundleObjects, BundleWriter, Resource, BUNDLE_SIZE};
+use super::chain::{Chain, ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
 use super::s3::{MultipartUpload, S3Target};
 use crate::api_impl::arc::archive_replay::ArcPipeline;
 use crate::api_impl::bsc::trace::BscPipeline;
 use crate::api_impl::mainnet::trace::EthPipeline;
+use crate::api_impl::opbnb::trace::OpBnbPipeline;
 use anyhow::{anyhow, Context as _, Result};
+use futures::{StreamExt as _, TryStreamExt as _};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
 use leafage_evm_types::{BlockId, BlockInfo, BlockNumberOrTag};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,6 +73,65 @@ pub struct ExportConfig {
     pub rebase_every: u64,
     /// Compare the replayed state changes with the archive (slow).
     pub check_state: bool,
+    /// How the blocks are uploaded.
+    pub layout: Layout,
+}
+
+/// How an export uploads the replayed blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layout {
+    /// `pipeline-compactor` bundles of [`BUNDLE_SIZE`] blocks.
+    Bundle,
+    /// One object per block and resource, as the pipeline writers upload them
+    /// live, for chains without compacted bundles: the block file at
+    /// `{prefix}/{block hash}`, its validation at
+    /// `{prefix}/{height}/{block hash}`. Only the block file and validation
+    /// resources exist in this layout.
+    PerBlock {
+        /// Records the bundles (block ranges) uploaded, one ID per line, so
+        /// that a rerun skips them; without it every bundle is exported.
+        progress: Option<PathBuf>,
+    },
+}
+
+/// The bundles a per-block export has finished, kept in its progress file.
+struct DoneBundles {
+    done: HashSet<u64>,
+    file: Mutex<std::fs::File>,
+}
+
+impl DoneBundles {
+    fn open(path: &Path) -> Result<Self> {
+        let done = match std::fs::read_to_string(path) {
+            Ok(text) => text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    line.parse()
+                        .with_context(|| format!("bad bundle ID {line:?} in {path:?}"))
+                })
+                .collect::<Result<_>>()?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(err) => return Err(err).with_context(|| format!("read {path:?}")),
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("open {path:?}"))?;
+        Ok(Self {
+            done,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn add(&self, id: u64) -> Result<()> {
+        let mut file = self.file.lock().expect("not poisoned");
+        writeln!(file, "{id}")?;
+        file.sync_data()?;
+        Ok(())
+    }
 }
 
 impl ExportConfig {
@@ -77,10 +145,17 @@ impl ExportConfig {
         }
     }
 
+    fn per_block(&self) -> bool {
+        matches!(self.layout, Layout::PerBlock { .. })
+    }
+
     /// Whether bundle `id` needs no export.
-    async fn is_done(&self, id: u64) -> bool {
+    async fn is_done(&self, id: u64, done: Option<&DoneBundles>) -> bool {
         if self.overwrite {
             return false;
+        }
+        if self.per_block() {
+            return done.is_some_and(|done| done.done.contains(&id));
         }
         match self.s3.is_uploaded(id, &self.resources).await {
             Ok(uploaded) => uploaded,
@@ -121,6 +196,7 @@ where
         Chain::Arc => export_chain(db, Arc::new(ArcPipeline), config).await,
         Chain::Bsc => export_chain(db, Arc::new(BscPipeline), config).await,
         Chain::Eth => export_chain(db, Arc::new(EthPipeline), config).await,
+        Chain::OpBnb => export_chain(db, Arc::new(OpBnbPipeline), config).await,
     }
 }
 
@@ -133,7 +209,17 @@ where
     anyhow::ensure!(!config.resources.is_empty(), "no resource to export");
     for &resource in &config.resources {
         config.s3.object(1, resource)?;
+        anyhow::ensure!(
+            !config.per_block() || matches!(resource, Resource::BlockFile | Resource::Validation),
+            "the per-block layout has no {resource} objects"
+        );
     }
+    let done = match &config.layout {
+        Layout::PerBlock {
+            progress: Some(path),
+        } => Some(Arc::new(DoneBundles::open(path)?)),
+        _ => None,
+    };
     anyhow::ensure!(
         config.s3.part_size >= 5 << 20,
         "the part size must be at least 5 MiB"
@@ -178,13 +264,14 @@ where
     };
     let workers: Vec<_> = (0..config.workers)
         .map(|_| {
-            let (db, chain, client, config, next, progress) = (
+            let (db, chain, client, config, next, progress, done) = (
                 db.clone(),
                 chain.clone(),
                 client.clone(),
                 config.clone(),
                 next.clone(),
                 progress.clone(),
+                done.clone(),
             );
             tokio::spawn(async move {
                 loop {
@@ -195,14 +282,17 @@ where
                     let end = (start + config.run_bundles - 1).min(config.to_bundle);
                     let mut carry = None;
                     for id in start..=end {
-                        if config.is_done(id).await {
+                        if config.is_done(id, done.as_deref()).await {
                             progress.skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let result = export_bundle(
-                            &db, &*chain, &client, &config, id, &progress, &mut carry,
-                        )
-                        .await;
+                        let result =
+                            export_bundle(&db, &chain, &client, &config, id, &progress, &mut carry)
+                                .await
+                                .and_then(|()| match &done {
+                                    Some(done) => done.add(id),
+                                    None => Ok(()),
+                                });
                         if let Err(err) = result {
                             error!(target: "export", bundle = id, "bundle failed: {err:#}");
                             progress.failed.lock().expect("not poisoned").push(id);
@@ -258,7 +348,7 @@ struct Carry<R> {
 /// with this bundle's replay, or empty if it fails.
 async fn export_bundle<DB, C>(
     db: &Arc<DB>,
-    chain: &C,
+    chain: &Arc<C>,
     client: &HttpClient,
     config: &ExportConfig,
     id: u64,
@@ -289,7 +379,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn replay_and_upload<DB, C>(
     db: &Arc<DB>,
-    chain: &C,
+    chain: &Arc<C>,
     client: &HttpClient,
     config: &ExportConfig,
     id: u64,
@@ -313,7 +403,9 @@ where
     };
     let counters_before = replay.counters();
     let mut replay = Some(replay);
-    let mut writer = Some(BundleWriter::new(id, &config.resources, config.gzip_level));
+    // The per-block layout uploads every block as it is replayed instead.
+    let mut writer =
+        (!config.per_block()).then(|| BundleWriter::new(id, &config.resources, config.gzip_level));
     let (mut txs, mut bytes) = (0u64, 0u64);
     let (mut fetch_wait, mut execute, mut write, mut upload_wait) = (
         Duration::ZERO,
@@ -327,8 +419,8 @@ where
         .map(|lo| (lo, (lo + config.chunk - 1).min(last)))
         .collect();
     let fetch = |(lo, hi): (u64, u64)| {
-        let (db, client) = (db.clone(), client.clone());
-        tokio::spawn(async move { fetch_chunk(db, &client, lo, hi).await })
+        let (db, chain, client) = (db.clone(), chain.clone(), client.clone());
+        tokio::spawn(async move { fetch_chunk(db, chain, &client, lo, hi).await })
     };
     let mut pending = Some(fetch(chunks[0]));
     for (index, &(lo, hi)) in chunks.iter().enumerate() {
@@ -349,12 +441,11 @@ where
         if rebase {
             since_rebase = 0;
         }
-        let (mut chunk_replay, mut chunk_writer) = (
-            replay.take().expect("replay"),
-            writer.take().expect("writer"),
-        );
+        let (mut chunk_replay, mut chunk_writer) = (replay.take().expect("replay"), writer.take());
+        let (resources, gzip_level) = (config.resources.clone(), config.gzip_level);
         let done = tokio::task::spawn_blocking(move || -> Result<_> {
             let (mut txs, mut execute, mut write) = (0, Duration::ZERO, Duration::ZERO);
+            let mut objects = Vec::new();
             for (info, block) in infos.iter().zip(blocks) {
                 let number = info.header.number;
                 let t = Instant::now();
@@ -363,18 +454,29 @@ where
                     .with_context(|| format!("replay block {number}"))?;
                 execute += t.elapsed();
                 let t = Instant::now();
-                chunk_writer.push(&output)?;
+                match &mut chunk_writer {
+                    Some(writer) => writer.push(&output)?,
+                    None => objects.extend(block_objects_of(&output, &resources, gzip_level)?),
+                }
                 txs += output.block_file.txs.len() as u64;
                 write += t.elapsed();
             }
             if rebase {
                 chunk_replay.rebase(infos.last().expect("chunk"))?;
             }
-            Ok((chunk_replay, chunk_writer, txs, execute, write))
+            Ok((chunk_replay, chunk_writer, objects, txs, execute, write))
         })
         .await??;
-        let (chunk_replay, mut chunk_writer, chunk_txs, chunk_execute, chunk_write) = done;
-        if let Some(part) = chunk_writer.take_block_file_part(config.s3.part_size) {
+        let (chunk_replay, mut chunk_writer, objects, chunk_txs, chunk_execute, chunk_write) = done;
+        if !objects.is_empty() {
+            let t = Instant::now();
+            bytes += upload_block_objects(config, &export, objects).await?;
+            upload_wait += t.elapsed();
+        }
+        let part = chunk_writer
+            .as_mut()
+            .and_then(|writer| writer.take_block_file_part(config.s3.part_size));
+        if let Some(part) = part {
             let t = Instant::now();
             bytes += part.len() as u64;
             if upload.is_none() {
@@ -393,7 +495,7 @@ where
             upload_wait += t.elapsed();
         }
         replay = Some(chunk_replay);
-        writer = Some(chunk_writer);
+        writer = chunk_writer;
         txs += chunk_txs;
         execute += chunk_execute;
         write += chunk_write;
@@ -401,11 +503,12 @@ where
         progress.txs.fetch_add(chunk_txs, Ordering::Relaxed);
     }
 
-    let writer = writer.expect("writer");
-    let objects = tokio::task::spawn_blocking(move || writer.finish()).await??;
-    let t = Instant::now();
-    bytes += upload_objects(config, id, &export, objects, upload).await?;
-    upload_wait += t.elapsed();
+    if let Some(writer) = writer {
+        let objects = tokio::task::spawn_blocking(move || writer.finish()).await??;
+        let t = Instant::now();
+        bytes += upload_objects(config, id, &export, objects, upload).await?;
+        upload_wait += t.elapsed();
+    }
 
     progress.bytes.fetch_add(bytes, Ordering::Relaxed);
     progress.bundles.fetch_add(1, Ordering::Relaxed);
@@ -448,6 +551,40 @@ fn export_id() -> String {
             .unwrap_or_default()
             .as_nanos()
     )
+}
+
+/// The per-block objects of a replayed block among `resources`: its block
+/// file at its hash, its validation at `{height}/{hash}`.
+fn block_objects_of(
+    output: &ReplayOutput,
+    resources: &BTreeSet<Resource>,
+    gzip_level: u32,
+) -> Result<Vec<(String, bytes::Bytes)>> {
+    let block = &output.block_file.block;
+    let (file, validation) = block_objects(&output.block_file, gzip_level)?;
+    let mut objects = Vec::with_capacity(2);
+    if resources.contains(&Resource::BlockFile) {
+        objects.push((block.id.clone(), file.into()));
+    }
+    if resources.contains(&Resource::Validation) {
+        objects.push((format!("{}/{}", block.height, block.id), validation.into()));
+    }
+    Ok(objects)
+}
+
+/// Upload per-block `objects`, `--s3-concurrency` at a time; the bytes sent.
+async fn upload_block_objects(
+    config: &ExportConfig,
+    export: &str,
+    objects: Vec<(String, bytes::Bytes)>,
+) -> Result<u64> {
+    let bytes = objects.iter().map(|(_, data)| data.len() as u64).sum();
+    futures::stream::iter(objects)
+        .map(|(key, data)| async move { config.s3.put_block_object(&key, export, data).await })
+        .buffer_unordered(config.s3.concurrency)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(bytes)
 }
 
 /// Upload the finished `objects` of bundle `id` in the compactor's order,
@@ -506,7 +643,7 @@ async fn upload_objects(
 /// Export bundle 0, the genesis block.
 async fn export_genesis<DB, C>(
     db: &Arc<DB>,
-    chain: &C,
+    chain: &Arc<C>,
     client: &HttpClient,
     config: &ExportConfig,
     progress: &Progress,
@@ -515,18 +652,23 @@ where
     DB: Send + Sync + BlockIndex + 'static,
     C: PipelineChain<DB>,
 {
-    let (infos, blocks) = fetch_chunk(db.clone(), client, 0, 0)
+    let (infos, blocks) = fetch_chunk(db.clone(), chain.clone(), client, 0, 0)
         .await
         .context("fetch the genesis block")?;
     let (info, block) = infos
         .first()
         .zip(blocks.first())
         .context("no genesis block")?;
-    let output = chain.genesis(db, info, &block.block, config.replay_options())?;
-    let mut writer = BundleWriter::new(0, &config.resources, config.gzip_level);
-    writer.push(&output)?;
+    let output = chain.genesis(db, info, block, config.replay_options())?;
     let txs = output.block_file.txs.len() as u64;
-    let bytes = upload_objects(config, 0, &export_id(), writer.finish()?, &mut None).await?;
+    let bytes = if config.per_block() {
+        let objects = block_objects_of(&output, &config.resources, config.gzip_level)?;
+        upload_block_objects(config, &export_id(), objects).await?
+    } else {
+        let mut writer = BundleWriter::new(0, &config.resources, config.gzip_level);
+        writer.push(&output)?;
+        upload_objects(config, 0, &export_id(), writer.finish()?, &mut None).await?
+    };
     progress.blocks.fetch_add(1, Ordering::Relaxed);
     progress.txs.fetch_add(txs, Ordering::Relaxed);
     progress.bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -541,12 +683,17 @@ fn block_info<DB: BlockIndex>(db: &DB, number: u64) -> Result<Arc<BlockInfo>> {
         .ok_or_else(|| anyhow!("block {number} is not in the archive"))
 }
 
-async fn fetch_chunk<DB: BlockIndex + Send + Sync + 'static>(
+async fn fetch_chunk<DB, C>(
     db: Arc<DB>,
+    chain: Arc<C>,
     client: &HttpClient,
     lo: u64,
     hi: u64,
-) -> Result<(Vec<Arc<BlockInfo>>, Vec<FetchedBlock>)> {
+) -> Result<(Vec<Arc<BlockInfo>>, Vec<C::Block>)>
+where
+    DB: BlockIndex + Send + Sync + 'static,
+    C: PipelineChain<DB>,
+{
     // Archive reads block; keep them off the async workers.
     let infos = tokio::task::spawn_blocking(move || {
         (lo..=hi)
@@ -555,6 +702,15 @@ async fn fetch_chunk<DB: BlockIndex + Send + Sync + 'static>(
     })
     .await??;
     let hashes: Vec<_> = infos.iter().map(|info| info.header.hash).collect();
-    let blocks = fetch_raw_blocks(client, &hashes).await?;
+    let raws = fetch_raw(client, &hashes).await?;
+    // Decoding recovers the senders: keep it off the async workers too.
+    let blocks = tokio::task::spawn_blocking(move || {
+        hashes
+            .iter()
+            .zip(raws)
+            .map(|(hash, raw)| chain.decode_raw(*hash, &raw))
+            .collect::<Result<Vec<_>>>()
+    })
+    .await??;
     Ok((infos, blocks))
 }

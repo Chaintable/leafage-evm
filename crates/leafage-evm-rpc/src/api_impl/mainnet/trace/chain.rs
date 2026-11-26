@@ -1,16 +1,15 @@
 //! Ethereum mainnet as a [`PipelineChain`] for the bundle export.
 
 use super::replay::{EthBlock, EthReplayer};
-use crate::pipeline::blocks::FetchedBlock;
+use crate::pipeline::blocks::{decode_raw_block, FetchedBlock};
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
 use crate::pipeline::changes::LazyState;
 use crate::pipeline::genesis::{genesis_output, GenesisOptions};
 use alloy::primitives::B256;
-use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{anyhow, Result};
 use leafage_evm_chains::eth::mainnet::eth_mainnet_genesis_alloc;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrapper};
-use leafage_evm_types::{BlockId, BlockInfo};
+use leafage_evm_types::{BlockId, BlockInfo, H256};
 use std::sync::Arc;
 
 pub(crate) struct EthPipeline;
@@ -23,6 +22,11 @@ where
     DB::StateDB: Send + 'static,
 {
     type Replay = EthReplay<DB>;
+    type Block = FetchedBlock;
+
+    fn decode_raw(&self, hash: H256, raw: &[u8]) -> Result<FetchedBlock> {
+        decode_raw_block(hash, raw)
+    }
 
     fn start(
         &self,
@@ -42,14 +46,14 @@ where
         &self,
         db: &Arc<DB>,
         info: &BlockInfo,
-        block: &RpcBlock,
+        block: &FetchedBlock,
         options: ReplayOptions,
     ) -> Result<ReplayOutput> {
         let state = archive_state(db.as_ref(), info)?;
         genesis_output(
             eth_mainnet_genesis_alloc(),
             &state,
-            block,
+            &block.block,
             options,
             GenesisOptions::default(),
         )
@@ -67,6 +71,8 @@ impl<DB> ChainReplay for EthReplay<DB>
 where
     DB: EvmStorageRead + Send + Sync + 'static,
 {
+    type Block = FetchedBlock;
+
     fn replay(&mut self, info: &BlockInfo, block: FetchedBlock) -> Result<ReplayOutput> {
         let state_root = block.block.header.state_root;
         let output = self.replayer.replay(EthBlock {
