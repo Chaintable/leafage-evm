@@ -67,8 +67,8 @@ pub(crate) fn pipeline_transaction(
 }
 
 /// The receipt of an OP-stack transaction, `cumulative_gas_used` in its
-/// block. A deposit carries the sender's nonce before it (from Regolith on)
-/// and the receipt version (from Canyon on), both in the receipts root.
+/// block, as the receipts root hashes it: a deposit's nonce and receipt
+/// version are only encoded from Canyon on.
 pub(crate) fn op_receipt_envelope(
     tx: &OpTxEnvelope,
     success: bool,

@@ -84,8 +84,14 @@ pub(crate) fn block_objects(file: &BlockFile, level: u32) -> Result<(Vec<u8>, Ve
 }
 
 fn gzip_json<T: Serialize>(value: &T, level: u32) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(level));
-    serde_json::to_writer(&mut encoder, value)?;
+    // Serialize first: serde_json's many small writes are slow through the
+    // encoder.
+    let json = serde_json::to_vec(value)?;
+    let mut encoder = GzEncoder::new(
+        Vec::with_capacity(json.len() / 8),
+        flate2::Compression::new(level),
+    );
+    encoder.write_all(&json)?;
     Ok(encoder.finish()?)
 }
 

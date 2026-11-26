@@ -506,13 +506,14 @@ fn opbnb_error_message(status: Option<InstructionResult>) -> String {
     };
     match status {
         InstructionResult::Revert => "Reverted",
+        // op-geth's interpreter wraps a dynamic gas error, the reentrancy
+        // sentry's included, in ErrOutOfGas.
         InstructionResult::OutOfGas
         | InstructionResult::MemoryOOG
         | InstructionResult::MemoryLimitOOG
         | InstructionResult::PrecompileOOG
-        | InstructionResult::InvalidOperandOOG => "Out of gas",
-        // A plain error in op-geth 1.13, not ErrOutOfGas.
-        InstructionResult::ReentrancySentryOOG => "not enough gas for reentrancy sentry",
+        | InstructionResult::InvalidOperandOOG
+        | InstructionResult::ReentrancySentryOOG => "Out of gas",
         InstructionResult::OutOfFunds => "Insufficient balance for transfer",
         InstructionResult::InvalidJump => "Bad jump destination",
         InstructionResult::CallTooDeep => "CallTooDeep",

@@ -500,7 +500,9 @@ where
             success,
             result.logs().to_vec(),
             self.gas_used,
-            deposit.then_some(sender_before.nonce),
+            // Before Canyon the deposit nonce is in the receipt but not in its
+            // consensus encoding, so it stays out of the receipts root.
+            (deposit && canyon).then_some(sender_before.nonce),
             (deposit && canyon).then_some(DEPOSIT_RECEIPT_VERSION),
         ));
         Ok(())
