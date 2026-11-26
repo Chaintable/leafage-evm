@@ -43,6 +43,15 @@ pub const OPBNB_MAINNET_HABER_TIMESTAMP: u64 = 1_718_872_200;
 pub const OPBNB_MAINNET_WRIGHT_TIMESTAMP: u64 = 1_724_738_400;
 /// Fjord (2024-09-24 06:00 UTC), the last OP fork opBNB runs.
 pub const OPBNB_MAINNET_FJORD_TIMESTAMP: u64 = 1_727_157_600;
+/// The first block at the Cancun timestamp: from it on SELFDESTRUCT no longer
+/// destroys a contract created earlier (EIP-6780).
+pub const OPBNB_MAINNET_CANCUN_BLOCK: u64 = 27_117_877;
+/// The create2 deployer predeploy, whose code op-geth sets in place at the
+/// Canyon activation.
+pub const OPBNB_MAINNET_CREATE2_DEPLOYER: [u8; 20] = [
+    0x13, 0xb0, 0xd8, 0x5c, 0xcb, 0x8b, 0xf8, 0x60, 0xb6, 0xb7, 0x9a, 0xf3, 0x02, 0x9f, 0xca, 0x08,
+    0x1a, 0xe9, 0xbe, 0xf2,
+];
 
 /// The OP fork rules of a block at `timestamp`. opBNB stops at Fjord.
 pub fn opbnb_mainnet_spec_at(timestamp: u64) -> OpSpecId {
@@ -243,6 +252,14 @@ mod tests {
             opbnb_mainnet_precompiles(200_000_000, OPBNB_MAINNET_FJORD_TIMESTAMP + 1)
                 .addresses_set(),
             haber.addresses_set()
+        );
+    }
+
+    #[test]
+    fn create2_deployer_address() {
+        assert_eq!(
+            Address::from(OPBNB_MAINNET_CREATE2_DEPLOYER),
+            revm::primitives::address!("13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2")
         );
     }
 
