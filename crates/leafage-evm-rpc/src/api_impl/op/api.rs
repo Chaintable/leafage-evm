@@ -5,9 +5,11 @@ use crate::api_impl::core::{
 };
 use crate::api_impl::op::evm::{create_op_evm_from_state, create_op_txn_env};
 use crate::api_impl::op::legacy;
+use crate::api_impl::op::mantle;
 use crate::api_impl::ApiImpl;
 use crate::error::rpc_error_with_code;
 use jsonrpsee::core::RpcResult;
+use leafage_evm_chains::op::mantle::MANTLE_CHAIN_ID;
 use leafage_evm_chains::op::schedule::op_stack_spec_at;
 use leafage_evm_types::{BlockInfo, CallRequest, CfgEnv, DebankErrorCode, OpSpecId};
 use op_revm::{OpHaltReason, OpTransaction, OpTransactionError};
@@ -18,6 +20,7 @@ use revm::primitives::hardfork::SpecId;
 use revm::InspectCommitEvm;
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
+use std::fmt::Debug;
 
 type OpApiImpl<DB> = ApiImpl<DB, OpSpecId, NoneEvmCustomConfig>;
 
@@ -44,13 +47,27 @@ where
     type Tx = OpTransaction<TxEnv>;
 
     /// EIP-7825 (Karst) follows the executing block's fork, not the configured spec.
+    /// Mantle never has it: its op-geth skips the cap on OP Stack chains.
     fn consensus_tx_gas_limit_cap(&self, _spec: SpecId, block_env: &BlockEnv) -> u64 {
+        if self.evm_cfg.cfg.chain_id == MANTLE_CHAIN_ID {
+            return u64::MAX;
+        }
         let spec: SpecId = block_cfg(&self.evm_cfg.cfg, block_env).spec.into();
         if spec.is_enabled_in(SpecId::OSAKA) {
             revm::primitives::eip7825::TX_GAS_LIMIT_CAP
         } else {
             u64::MAX
         }
+    }
+
+    /// A Mantle gas limit before Arsia is in token-ratio units, and so is the cap.
+    fn rpc_tx_gas_limit_cap<StateDB: DatabaseRef>(
+        &self,
+        configured: Option<u64>,
+        block_env: &BlockEnv,
+        db: StateDB,
+    ) -> Option<u64> {
+        mantle::rpc_gas_cap(&self.evm_cfg.cfg, block_env, &db, configured)
     }
 }
 
@@ -70,13 +87,10 @@ where
         db: StateDB,
         chain_id: u64,
     ) -> RpcResult<Self::Tx> {
-        create_op_txn_env(
-            block_env,
-            block_cfg(&self.evm_cfg.cfg, block_env),
-            request,
-            db,
-            chain_id,
-        )
+        let mut cfg = block_cfg(&self.evm_cfg.cfg, block_env);
+        cfg.tx_gas_limit_cap =
+            mantle::rpc_gas_cap(&self.evm_cfg.cfg, block_env, &db, cfg.tx_gas_limit_cap);
+        create_op_txn_env(block_env, cfg, request, db, chain_id)
     }
 
     fn transact<StateDB: DatabaseRef>(
@@ -90,6 +104,29 @@ where
     > {
         if legacy::is_legacy(&self.evm_cfg.cfg, block_env) {
             return legacy::transact(&self.evm_cfg.cfg, block_env, state, tx);
+        }
+        match mantle::fork_at(&self.evm_cfg.cfg, block_env) {
+            Some(fork) if fork.scales_gas() => {
+                return mantle::transact(
+                    &self.evm_cfg.cfg,
+                    fork,
+                    block_env,
+                    state,
+                    tx,
+                    mantle::L1Fee::Skip,
+                );
+            }
+            Some(_) => {
+                let mut evm = create_op_evm_from_state(
+                    block_env.clone(),
+                    mantle::arsia_cfg(&self.evm_cfg.cfg),
+                    state,
+                    NoOpInspector {},
+                )
+                .with_precompiles(mantle::arsia_precompiles());
+                return evm.transact(tx).map(|res| res.result.into());
+            }
+            None => {}
         }
         let mut evm = create_op_evm_from_state(
             block_env.clone(),
@@ -122,6 +159,34 @@ where
         f(&mut |tx| evm.transact_read_only(tx))
     }
 
+    /// A Mantle estimate before Arsia also has to cover the L1 data fee, which
+    /// comes out of the gas limit.
+    fn transact_for_estimation<StateDB>(
+        &self,
+        block_env: &BlockEnv,
+        state: StateDB,
+        tx: Self::Tx,
+    ) -> Result<
+        ExecutionResult<Self::EvmHaltReason>,
+        EVMError<StateDB::Error, Self::TransactionError>,
+    >
+    where
+        StateDB: DatabaseRef + Debug,
+        StateDB::Error: Sync + Send + 'static,
+    {
+        if let Some(fork) = mantle::scaled_fork_at(&self.evm_cfg.cfg, block_env) {
+            return mantle::transact(
+                &self.evm_cfg.cfg,
+                fork,
+                block_env,
+                state,
+                tx,
+                mantle::L1Fee::Estimate,
+            );
+        }
+        self.transact(block_env, state, tx)
+    }
+
     fn inspect_tx_commit<
         StateDB: DatabaseRef + DatabaseCommit,
         R,
@@ -142,6 +207,31 @@ where
             let res =
                 legacy::inspect_tx_commit(&self.evm_cfg.cfg, block_env, state, &mut inspector, tx);
             return res.map(|res| (res, inspector_collect(inspector)));
+        }
+        match mantle::fork_at(&self.evm_cfg.cfg, block_env) {
+            Some(fork) if fork.scales_gas() => {
+                let res = mantle::inspect_tx_commit(
+                    &self.evm_cfg.cfg,
+                    fork,
+                    block_env,
+                    state,
+                    &mut inspector,
+                    tx,
+                );
+                return res.map(|res| (res, inspector_collect(inspector)));
+            }
+            Some(_) => {
+                let mut evm = create_op_evm_from_state(
+                    block_env.clone(),
+                    mantle::arsia_cfg(&self.evm_cfg.cfg),
+                    state,
+                    &mut inspector,
+                )
+                .with_precompiles(mantle::arsia_precompiles());
+                let res = evm.inspect_tx_commit(tx);
+                return res.map(|res| (res.into(), inspector_collect(inspector)));
+            }
+            None => {}
         }
         let mut evm = create_op_evm_from_state(
             block_env.clone(),

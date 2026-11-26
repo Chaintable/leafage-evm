@@ -114,6 +114,18 @@ pub(crate) trait GasFeeHandler: Sync + Send + 'static {
         }
     }
 
+    /// The configured RPC gas cap in the gas unit of `block_env`'s transactions.
+    /// Chains that count gas in another unit at some heights convert it from
+    /// the state behind `db`.
+    fn rpc_tx_gas_limit_cap<StateDB: DatabaseRef>(
+        &self,
+        configured: Option<u64>,
+        _block_env: &BlockEnv,
+        _db: StateDB,
+    ) -> Option<u64> {
+        configured
+    }
+
     fn virtual_balance(&self) -> Option<alloy::primitives::U256> {
         None
     }
