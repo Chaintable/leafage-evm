@@ -26,26 +26,10 @@ use revm::{
     primitives::{hardfork::SpecId, Address, AddressSet},
 };
 use std::boxed::Box;
-use std::sync::LazyLock;
 
 use crate::bsc::precompile::{BLS_SIGNATURE_VALIDATION, COMETBFT_LIGHT_BLOCK_VALIDATION};
 
 pub const OPBNB_MAINNET_CHAIN_ID: u64 = 204;
-
-/// The addresses of the opBNB mainnet genesis alloc (`bnb-chain/op-geth`
-/// `core/assets/mainnet/genesis.json`), 20 bytes each: 2064 predeploys, all
-/// with code and none with a balance.
-static GENESIS_ALLOC: &[u8] = include_bytes!("mainnet_genesis_alloc.bin");
-
-pub fn opbnb_mainnet_genesis_alloc() -> &'static [Address] {
-    static ALLOC: LazyLock<Vec<Address>> = LazyLock::new(|| {
-        GENESIS_ALLOC
-            .chunks_exact(20)
-            .map(Address::from_slice)
-            .collect()
-    });
-    &ALLOC
-}
 
 /// opBNB Fermat, by block number.
 pub const OPBNB_MAINNET_FERMAT_BLOCK: u64 = 9_397_477;
@@ -260,15 +244,6 @@ mod tests {
                 .addresses_set(),
             haber.addresses_set()
         );
-    }
-
-    #[test]
-    fn genesis_alloc_lists_the_predeploys() {
-        let alloc = opbnb_mainnet_genesis_alloc();
-        assert_eq!(alloc.len(), 2064);
-        assert!(alloc.contains(&revm::primitives::address!(
-            "4200000000000000000000000000000000000015"
-        )));
     }
 
     #[test]

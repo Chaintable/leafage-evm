@@ -24,13 +24,16 @@
 //!
 //! The result is checked before it is returned: gas used and receipts root
 //! must match the header and, optionally, every account and slot the replay
-//! changed must equal the archive state of the block.
+//! changed must equal the archive state of the block. The state diff is made
+//! from the replay's state changes, like the BSC and Ethereum replays.
 
 use crate::pipeline::build::{
     op_receipt_envelope, opbnb_pipeline_transaction, pipeline_block, pipeline_header_of,
 };
 use crate::pipeline::chain::{ReplayOptions, ReplayOutput, ReplayTimings};
-use crate::pipeline::changes::{check, delete_touched_empty, AccountChange, ChangeSet};
+use crate::pipeline::changes::{
+    check, delete_touched_empty, AccountChange, ChangeSet, StorageSlots,
+};
 use crate::pipeline::convert::{append_styled_tx_traces, TraceStyle};
 use crate::pipeline::inspector::PipelineInspector;
 use crate::pipeline::types::{addr_hex, hash_hex, to_hash, BlockFile, PipelineTrace};
@@ -137,6 +140,9 @@ pub(crate) fn decode_block(hash: B256, raw: &[u8]) -> Result<OpBnbBlock> {
 pub(crate) struct OpBnbReplayBlock<D> {
     /// State after the block, for the state check and the create2 deployer.
     pub post_state: D,
+    /// State before the block, for the storage of the accounts it destroys.
+    pub parent_state: Option<Box<dyn StorageSlots + Send>>,
+    pub parent_state_root: B256,
     pub block: OpBnbBlock,
 }
 
@@ -191,7 +197,12 @@ where
     D: DatabaseRef + Debug,
     D::Error: Send + Sync + 'static,
 {
-    let OpBnbReplayBlock { post_state, block } = input;
+    let OpBnbReplayBlock {
+        post_state,
+        parent_state,
+        parent_state_root,
+        block,
+    } = input;
     let header = &block.header;
     let number = header.number;
     let timestamp = header.timestamp;
@@ -209,7 +220,7 @@ where
         number,
         timestamp,
         db,
-        track: options.check_state,
+        track: options.check_state || options.state_diff,
         traces: options.traces,
         changes: ChangeSet::default(),
         l1_info: None,
@@ -266,14 +277,30 @@ where
     }
     timings.verify = started.elapsed();
 
+    let started = std::time::Instant::now();
+    let state_diff = if !options.state_diff {
+        None
+    } else if header.state_root == parent_state_root {
+        Some(Bytes::new())
+    } else {
+        let parent_state = parent_state
+            .as_deref()
+            .map(|state| state as &dyn StorageSlots);
+        let diff = replay.changes.to_storage_diff(
+            &replay.db,
+            parent_state,
+            header.state_root,
+            parent_state_root,
+        )?;
+        Some(alloy::rlp::encode(diff).into())
+    };
     let mut block_file = replay.block_file;
     block_file.storage_contracts = replay.storage_contracts.iter().map(addr_hex).collect();
+    timings.diff = started.elapsed();
     let output = ReplayOutput {
         block_file,
         header: pipeline_header_of(header),
-        // The opBNB state diffs in S3 are right; regenerating them would need
-        // the writer's state diff conventions.
-        state_diff: None,
+        state_diff,
         timings,
     };
     Ok((output, replay.db))
@@ -319,7 +346,7 @@ struct Replayer<D: DatabaseRef> {
     number: u64,
     timestamp: u64,
     db: CacheDB<D>,
-    /// Record `changes` for the state check.
+    /// Record `changes`; only the state check and the state diff use them.
     track: bool,
     /// Run the transactions under [`PipelineInspector`].
     traces: bool,

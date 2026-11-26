@@ -2,13 +2,24 @@
 
 use super::replay::{decode_block, OpBnbBlock, OpBnbReplayBlock, OpBnbReplayer};
 use crate::pipeline::chain::{ChainReplay, PipelineChain, ReplayOptions, ReplayOutput};
+use crate::pipeline::changes::LazyState;
 use crate::pipeline::genesis::{genesis_output, GenesisOptions};
+use alloy::primitives::{Address, B256};
 use alloy::rpc::types::Block as RpcBlock;
 use anyhow::{anyhow, Result};
-use leafage_evm_chains::opbnb::opbnb_mainnet_genesis_alloc;
 use leafage_evm_storage::{EvmStorageRead, EvmStorageWrapper};
 use leafage_evm_types::{BlockId, BlockInfo, H256};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock};
+
+/// The opBNB mainnet genesis alloc (`bnb-chain/op-geth`
+/// `core/assets/mainnet/genesis.json`): every account, 2064 predeploys with
+/// code, and the original keys of its storage. Values, code and storage are
+/// read from the archive state of block 0.
+static GENESIS_KEYS: LazyLock<BTreeMap<Address, Vec<B256>>> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("mainnet_genesis_keys.json"))
+        .expect("valid pinned opBNB genesis keys")
+});
 
 pub(crate) struct OpBnbPipeline;
 
@@ -36,6 +47,7 @@ where
         Ok(OpBnbReplay {
             db: db.clone(),
             replayer: OpBnbReplayer::new(state, options),
+            parent_state_root: parent.header.state_root,
         })
     }
 
@@ -50,12 +62,19 @@ where
         let mut genesis = RpcBlock::default();
         genesis.header = block.header.clone();
         let state = archive_state(db.as_ref(), info)?;
+        let addresses: Vec<_> = GENESIS_KEYS.keys().copied().collect();
         genesis_output(
-            opbnb_mainnet_genesis_alloc(),
+            &addresses,
             &state,
             &genesis,
             options,
-            GenesisOptions::default(),
+            // Like the opBNB writer's `GenesisAllocToStateDiff`: one code
+            // entry per account with code, the predeploys' shared code too.
+            GenesisOptions {
+                storage_keys: Some(&GENESIS_KEYS),
+                strict: true,
+                deduplicate_code: false,
+            },
         )
     }
 }
@@ -63,6 +82,8 @@ where
 pub(crate) struct OpBnbReplay<DB: EvmStorageRead> {
     db: Arc<DB>,
     replayer: OpBnbReplayer<State<DB>>,
+    /// Of the last block replayed.
+    parent_state_root: B256,
 }
 
 impl<DB> ChainReplay for OpBnbReplay<DB>
@@ -72,10 +93,18 @@ where
     type Block = OpBnbBlock;
 
     fn replay(&mut self, info: &BlockInfo, block: OpBnbBlock) -> Result<ReplayOutput> {
-        self.replayer.replay(OpBnbReplayBlock {
+        let state_root = block.header.state_root;
+        let output = self.replayer.replay(OpBnbReplayBlock {
             post_state: archive_state(self.db.as_ref(), info)?,
+            parent_state: Some(Box::new(LazyState::new(
+                self.db.clone(),
+                info.header.parent_hash,
+            ))),
+            parent_state_root: self.parent_state_root,
             block,
-        })
+        })?;
+        self.parent_state_root = state_root;
+        Ok(output)
     }
 
     fn rebase(&mut self, info: &BlockInfo) -> Result<()> {
@@ -95,4 +124,19 @@ where
         .map_err(|err| anyhow!("state of block {number}: {err}"))?
         .ok_or_else(|| anyhow!("the state of block {number} is not in the archive"))?;
     Ok(EvmStorageWrapper::new(state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn genesis_keys_cover_the_alloc() {
+        assert_eq!(GENESIS_KEYS.len(), 2064);
+        assert_eq!(GENESIS_KEYS.values().map(Vec::len).sum::<usize>(), 2079);
+        let l1_block: Address = "0x4200000000000000000000000000000000000015"
+            .parse()
+            .unwrap();
+        assert!(GENESIS_KEYS.contains_key(&l1_block));
+    }
 }
