@@ -44,7 +44,6 @@ use quick_cache::Weighter;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use zstd::zstd_safe;
@@ -245,9 +244,9 @@ pub(crate) struct Blocks {
 impl Blocks {
     pub(crate) fn open(dir: &Path, meta: BlocksMeta, cache_bytes: u64) -> Result<Self, Error> {
         let dat = open_rw(&dir.join(BLOCKS_DAT), meta.dat_len)?;
-        // Lookups read individual chunks all over `blocks.dat`: disable kernel
-        // readahead so random reads do not pull extra device pages. Advice only.
-        unsafe { libc::posix_fadvise(dat.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        // Kernel readahead stays on (no FADV_RANDOM, unlike the page files):
+        // neighbouring chunks are often read soon after, and on IOPS-bound
+        // volumes a few larger reads cost less than many page-sized ones.
         let off = open_rw(&dir.join(BLOCKS_OFF), meta.full_chunks() * 8)?;
         let pfx = open_rw(&dir.join(BLOCKS_PFX), meta.count * 8)?;
         let mut bytes = vec![0u8; (meta.full_chunks() * 8) as usize];
@@ -621,9 +620,7 @@ fn compress_codes(codes: &[&[u8]], dict: &Dict, level: i32) -> Result<Vec<Vec<u8
 impl Codes {
     pub(crate) fn open(dir: &Path, meta: CodesMeta) -> Result<Self, Error> {
         let dat = open_rw(&dir.join(CODE_DAT), meta.dat_len)?;
-        // Lookups read single codes all over `code.dat`: disable kernel
-        // readahead. Advice only.
-        unsafe { libc::posix_fadvise(dat.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+        // Kernel readahead stays on, as for `blocks.dat`.
         let idx = open_rw(&dir.join(CODE_IDX), meta.count * CODE_ENTRY)?;
         let mut sorted = Vec::with_capacity(meta.count as usize);
         let mut buf = vec![0u8; (CODE_ENTRY as usize) << 14];
