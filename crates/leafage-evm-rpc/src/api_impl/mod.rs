@@ -31,6 +31,7 @@ pub(crate) mod arc;
 mod arbitrum;
 mod base;
 pub(crate) mod bsc;
+pub(crate) mod opbnb;
 mod celo;
 mod citrea;
 mod op;

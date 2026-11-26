@@ -1,7 +1,7 @@
 pub mod cas20;
 pub mod hardforks;
 pub mod mainnet;
-mod precompile;
+pub(crate) mod precompile;
 pub use hardforks::{bsc::BscHardfork, BscHardforks};
 pub use precompile::milli_timestamp::header_milli_timestamp;
 

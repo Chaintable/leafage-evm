@@ -13,6 +13,7 @@ pub mod mantle;
 pub mod monad;
 pub mod moonbeam;
 pub mod op;
+pub mod opbnb;
 pub mod polygon;
 pub mod rsk;
 pub mod tempo;

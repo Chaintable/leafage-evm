@@ -12,11 +12,11 @@
 //! a contract created and destroyed within it.
 //!
 //! A contract destroyed and created again within one block leaves no deletion
-//! at all, only a new account version. With `--bsc-mainnet` or
-//! `--eth-mainnet` such a block also counts as a deletion before Cancun
+//! at all, only a new account version. With `--bsc-mainnet`, `--eth-mainnet`
+//! or `--opbnb-mainnet` such a block also counts as a deletion before Cancun
 //! (EIP-6780), told by the code hash changing or the nonce going down, which
-//! nothing else does to a contract then; BSC's system contracts, upgraded in
-//! place, aside. Slots written by such a block stand: they are the new
+//! nothing else does to a contract then; BSC's system contracts and opBNB's
+//! create2 deployer, whose code changes in place, aside. Slots written by such a block stand: they are the new
 //! contract's.
 //!
 //! It runs in two steps. The scan opens the archive read-only, so it can run
@@ -32,6 +32,7 @@ use leafage_evm_chains::bsc::mainnet::{
     BSC_MAINNET_CANCUN_BLOCK, BSC_MAINNET_UPGRADABLE_CONTRACTS,
 };
 use leafage_evm_chains::eth::mainnet::ETH_MAINNET_CANCUN_BLOCK;
+use leafage_evm_chains::opbnb::{OPBNB_MAINNET_CANCUN_BLOCK, OPBNB_MAINNET_CREATE2_DEPLOYER};
 use leafage_evm_storage::rocksdb::{DBRawIteratorWithThreadMode, Options, ReadOptions, DB};
 use leafage_evm_storage::{ArchiveRocksDBStorage, StateDBProvider, StateDBRead, StateDBWrite};
 use leafage_evm_types::{BlockId, BlockNumberOrTag, SlimAccount, H256, KECCAK256_EMPTY};
@@ -78,6 +79,10 @@ pub struct Command {
     /// destroyed and created again within one block before Cancun.
     #[arg(long, default_value = "false", conflicts_with = "bsc_mainnet")]
     eth_mainnet: bool,
+    /// The archive is opBNB mainnet's: also plan the zeros for contracts
+    /// destroyed and created again within one block before Cancun.
+    #[arg(long, default_value = "false", conflicts_with_all = ["bsc_mainnet", "eth_mainnet"])]
+    opbnb_mainnet: bool,
 
     /// Scan threads.
     #[arg(long, default_value_t = 16)]
@@ -112,6 +117,8 @@ impl Command {
             Some(Recreations::bsc_mainnet())
         } else if self.eth_mainnet {
             Some(Recreations::eth_mainnet())
+        } else if self.opbnb_mainnet {
+            Some(Recreations::opbnb_mainnet())
         } else {
             None
         };
@@ -273,6 +280,13 @@ impl Recreations {
         Self {
             before: ETH_MAINNET_CANCUN_BLOCK,
             upgradable: HashSet::new(),
+        }
+    }
+
+    fn opbnb_mainnet() -> Self {
+        Self {
+            before: OPBNB_MAINNET_CANCUN_BLOCK,
+            upgradable: HashSet::from([keccak256(OPBNB_MAINNET_CREATE2_DEPLOYER).0]),
         }
     }
 
@@ -676,6 +690,7 @@ mod tests {
             archive_zstd_compression: false,
             bsc_mainnet: false,
             eth_mainnet: false,
+            opbnb_mainnet: false,
         };
         let recreations = Recreations {
             before: 5,

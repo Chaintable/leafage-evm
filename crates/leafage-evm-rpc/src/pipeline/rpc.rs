@@ -8,7 +8,7 @@
 //! are not stored in the archive and come from an upstream RPC of the chain
 //! (`--trace-block-rpc`).
 
-use super::blocks::fetch_blocks;
+use super::blocks::{fetch_blocks, FetchedBlock};
 use super::chain::{PipelineChain, ReplayOptions};
 pub(crate) use super::types::DebankBlockOutput;
 use crate::api_impl::core::{Api, ApiBase};
@@ -85,7 +85,7 @@ impl<C, P> TraceDebankApiServer for TraceDebank<C, P>
 where
     C: ApiBase,
     C::DB: EvmStorageRead + BlockIndex + Clone + Sync + Send + 'static,
-    P: PipelineChain<C::DB>,
+    P: PipelineChain<C::DB, Block = FetchedBlock>,
 {
     async fn debank_block(
         &self,
@@ -142,7 +142,7 @@ where
         let output = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             match parent {
-                None => chain.genesis(&db, &info, &block.block, options),
+                None => chain.genesis(&db, &info, &block, options),
                 Some(parent) => {
                     let mut replay = chain.start(&db, &parent, options)?;
                     crate::pipeline::chain::ChainReplay::replay(&mut replay, &info, block)

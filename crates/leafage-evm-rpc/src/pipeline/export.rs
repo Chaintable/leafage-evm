@@ -20,13 +20,14 @@
 //! archive every `rebase_every` blocks to bound its memory: keys a run read
 //! once are not read from the archive again.
 
-use super::blocks::{fetch_raw_blocks, FetchedBlock};
+use super::blocks::fetch_raw;
 use super::bundle::{BundleObjects, BundleWriter, Resource, BUNDLE_SIZE};
 use super::chain::{Chain, ChainReplay, PipelineChain, ReplayOptions};
 use super::s3::{MultipartUpload, S3Target};
 use crate::api_impl::arc::archive_replay::ArcPipeline;
 use crate::api_impl::bsc::trace::BscPipeline;
 use crate::api_impl::mainnet::trace::EthPipeline;
+use crate::api_impl::opbnb::trace::OpBnbPipeline;
 use anyhow::{anyhow, Context as _, Result};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use leafage_evm_storage::{BlockIndex, EvmStorageRead};
@@ -121,6 +122,7 @@ where
         Chain::Arc => export_chain(db, Arc::new(ArcPipeline), config).await,
         Chain::Bsc => export_chain(db, Arc::new(BscPipeline), config).await,
         Chain::Eth => export_chain(db, Arc::new(EthPipeline), config).await,
+        Chain::OpBnb => export_chain(db, Arc::new(OpBnbPipeline), config).await,
     }
 }
 
@@ -199,10 +201,9 @@ where
                             progress.skipped.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        let result = export_bundle(
-                            &db, &*chain, &client, &config, id, &progress, &mut carry,
-                        )
-                        .await;
+                        let result =
+                            export_bundle(&db, &chain, &client, &config, id, &progress, &mut carry)
+                                .await;
                         if let Err(err) = result {
                             error!(target: "export", bundle = id, "bundle failed: {err:#}");
                             progress.failed.lock().expect("not poisoned").push(id);
@@ -258,7 +259,7 @@ struct Carry<R> {
 /// with this bundle's replay, or empty if it fails.
 async fn export_bundle<DB, C>(
     db: &Arc<DB>,
-    chain: &C,
+    chain: &Arc<C>,
     client: &HttpClient,
     config: &ExportConfig,
     id: u64,
@@ -289,7 +290,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn replay_and_upload<DB, C>(
     db: &Arc<DB>,
-    chain: &C,
+    chain: &Arc<C>,
     client: &HttpClient,
     config: &ExportConfig,
     id: u64,
@@ -327,8 +328,8 @@ where
         .map(|lo| (lo, (lo + config.chunk - 1).min(last)))
         .collect();
     let fetch = |(lo, hi): (u64, u64)| {
-        let (db, client) = (db.clone(), client.clone());
-        tokio::spawn(async move { fetch_chunk(db, &client, lo, hi).await })
+        let (db, chain, client) = (db.clone(), chain.clone(), client.clone());
+        tokio::spawn(async move { fetch_chunk(db, chain, &client, lo, hi).await })
     };
     let mut pending = Some(fetch(chunks[0]));
     for (index, &(lo, hi)) in chunks.iter().enumerate() {
@@ -506,7 +507,7 @@ async fn upload_objects(
 /// Export bundle 0, the genesis block.
 async fn export_genesis<DB, C>(
     db: &Arc<DB>,
-    chain: &C,
+    chain: &Arc<C>,
     client: &HttpClient,
     config: &ExportConfig,
     progress: &Progress,
@@ -515,14 +516,14 @@ where
     DB: Send + Sync + BlockIndex + 'static,
     C: PipelineChain<DB>,
 {
-    let (infos, blocks) = fetch_chunk(db.clone(), client, 0, 0)
+    let (infos, blocks) = fetch_chunk(db.clone(), chain.clone(), client, 0, 0)
         .await
         .context("fetch the genesis block")?;
     let (info, block) = infos
         .first()
         .zip(blocks.first())
         .context("no genesis block")?;
-    let output = chain.genesis(db, info, &block.block, config.replay_options())?;
+    let output = chain.genesis(db, info, block, config.replay_options())?;
     let mut writer = BundleWriter::new(0, &config.resources, config.gzip_level);
     writer.push(&output)?;
     let txs = output.block_file.txs.len() as u64;
@@ -541,12 +542,17 @@ fn block_info<DB: BlockIndex>(db: &DB, number: u64) -> Result<Arc<BlockInfo>> {
         .ok_or_else(|| anyhow!("block {number} is not in the archive"))
 }
 
-async fn fetch_chunk<DB: BlockIndex + Send + Sync + 'static>(
+async fn fetch_chunk<DB, C>(
     db: Arc<DB>,
+    chain: Arc<C>,
     client: &HttpClient,
     lo: u64,
     hi: u64,
-) -> Result<(Vec<Arc<BlockInfo>>, Vec<FetchedBlock>)> {
+) -> Result<(Vec<Arc<BlockInfo>>, Vec<C::Block>)>
+where
+    DB: BlockIndex + Send + Sync + 'static,
+    C: PipelineChain<DB>,
+{
     // Archive reads block; keep them off the async workers.
     let infos = tokio::task::spawn_blocking(move || {
         (lo..=hi)
@@ -555,6 +561,15 @@ async fn fetch_chunk<DB: BlockIndex + Send + Sync + 'static>(
     })
     .await??;
     let hashes: Vec<_> = infos.iter().map(|info| info.header.hash).collect();
-    let blocks = fetch_raw_blocks(client, &hashes).await?;
+    let raws = fetch_raw(client, &hashes).await?;
+    // Decoding recovers the senders: keep it off the async workers too.
+    let blocks = tokio::task::spawn_blocking(move || {
+        hashes
+            .iter()
+            .zip(raws)
+            .map(|(hash, raw)| chain.decode_raw(*hash, &raw))
+            .collect::<Result<Vec<_>>>()
+    })
+    .await??;
     Ok((infos, blocks))
 }
